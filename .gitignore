@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+
+# QtCreator / VS Code
+.vscode/
+.idea/
+
+# Local SQLite (user data; regenerate via app / init_db)
+gex_suite/data/stocks.db
+
+# Suite data — credentials and per-user state
+gex_suite/data/service_account.json
+gex_suite/data/scraper/state.json
+gex_suite/data/scraper/logs/
+gex_suite/data/scraper/.stop_requested
+gex_suite/data/suite_config.json
+
+# Built / dist artefacts
+build/
+dist/
+*.egg-info/

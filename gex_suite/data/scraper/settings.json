@@ -1,0 +1,21 @@
+{
+  "ticker_filepath": "G:\\其他電腦\\My Mac (1)\\Desktop\\GEX scratcher\\ticker_list_index.txt",
+  "cme_ticker_filepath": "D:\\Code\\Git\\GEX scratcher\\ticker_list_index_CME.txt",
+  "download_folder": "D:\\Code\\Git\\GEX scratcher",
+  "selected_models": [
+    "Gamma",
+    "Term",
+    "Smile",
+    "TV Code"
+  ],
+  "selected_cme_models": [
+    "Gamma",
+    "Smile",
+    "Term",
+    "TV Code"
+  ],
+  "parallel": true,
+  "browser": "chrome",
+  "schedule_enabled": false,
+  "schedule_time": "21:00"
+}

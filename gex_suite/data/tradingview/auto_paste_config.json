@@ -1,0 +1,15 @@
+{
+  "weeks_mode": "last_4_weeks",
+  "layout_scope": "active",
+  "ticker_scope": "all",
+  "skip_filled_days": true,
+  "apply_visibility_preset": true,
+  "organize_indicators": true,
+  "ticker": "VIX",
+  "cdp_url": "http://127.0.0.1:9222",
+  "start_time_rules": {
+    "VIX": "03:15",
+    "SPX": "09:30",
+    "default": "04:00"
+  }
+}

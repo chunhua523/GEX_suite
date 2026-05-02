@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gex-suite"
+version = "0.1.0"
+description = "Integrated GEX desktop suite: scraper + chart + tradingview auto-paste."
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+include = ["gex_suite*"]
