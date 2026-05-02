@@ -27,6 +27,7 @@ _TRADINGVIEW_DEFAULT: dict[str, Any] = {
     "skip_filled_days": True,
     "apply_visibility_preset": True,
     "organize_indicators": False,
+    "browser": "chrome",
     "ticker": "",
     "cdp_url": "http://127.0.0.1:9222",
     "start_time_rules": {

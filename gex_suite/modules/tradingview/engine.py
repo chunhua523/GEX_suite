@@ -22,6 +22,7 @@ class BatchOptions:
     skip_filled_days: bool = True
     apply_visibility_preset: bool = True
     organize_indicators: bool = False
+    dry_run: bool = False  # preview: same scan path, no chart/DB writes
     market_open_time: str = "04:00"
 
     @property
@@ -42,6 +43,7 @@ class WorkItem:
     subchart_symbol: str | None = None
     chart_url: str | None = None
     note: str | None = None
+    preview_status: str | None = None
 
 
 @dataclass(frozen=True)

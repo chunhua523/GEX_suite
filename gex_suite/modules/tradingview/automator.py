@@ -276,6 +276,33 @@ class PlaywrightCDPAutomator(TVAutomator):
             self._page = None
             self._pw = None
 
+    async def open_chart_urls_via_cdp(self, urls: list[str]) -> None:
+        """Open chart URLs in the browser attached to ``self.cdp_url`` (e.g. 9222).
+
+        Reuses the current tab for the first URL, then opens one new tab per
+        additional URL in the same CDP context.
+        """
+        cleaned = [str(u).strip() for u in urls if str(u).strip()]
+        if not cleaned:
+            return
+        await self.connect()
+        ctx = self._context
+        if ctx is None:
+            raise RuntimeError("CDP context missing after connect")
+        page = self._page
+        if page is None:
+            page = await self._pick_or_open_page(ctx)
+            self._page = page
+        for i, url in enumerate(cleaned):
+            low = url.lower()
+            if not (low.startswith("http://") or low.startswith("https://")):
+                continue
+            if i > 0:
+                page = await ctx.new_page()
+                self._page = page
+            await page.bring_to_front()
+            await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+
     def set_apply_visibility_preset(self, enabled: bool) -> None:
         self.apply_visibility_preset = bool(enabled)
 
@@ -2320,12 +2347,14 @@ class PlaywrightCDPAutomator(TVAutomator):
         title_keyword: str = "Daily & Weekly GEX",
         favorite_name: str = "Daily & Weekly GEX by daniel56_trade",
         subchart_cache: WeeklyGexSubchartCache | None = None,
+        dry_run: bool = False,
     ) -> str:
         """Open settings for matching week indicator, or create a new one.
 
         Returns:
             "existing" when matched indicator found
             "created" when new indicator added for this week
+            "would_create" when ``dry_run`` and the week would be added (no favorite/add)
 
         When ``subchart_cache`` is supplied (from :meth:`build_weekly_gex_subchart_cache`),
         a full per-row probe is skipped for **add** if the live legend still matches
@@ -2529,6 +2558,14 @@ class PlaywrightCDPAutomator(TVAutomator):
                 return "existing"
         elif before_count > 0 and probe_complete:
             self._log("[open_or_create] pre-add skip_target_rescan probe_complete=1")
+
+        if dry_run:
+            self._log("[open_or_create] dry_run: would add indicator for week; skipping add_favorite")
+            try:
+                await self.close_settings(save=False)
+            except Exception:
+                pass
+            return "would_create"
 
         marker_attr = f"data-gex-existing-{secrets.token_hex(4)}"
         if not use_cache:
@@ -4539,177 +4576,122 @@ class PlaywrightCDPAutomator(TVAutomator):
         await page.keyboard.type(value, delay=0)
         await page.keyboard.press("Enter")
 
-    async def _open_layout_dialog(self) -> bool:
-        """Open TradingView Layouts dialog via '.' shortcut first.
+    async def _try_click_open_layout_menuitem(self) -> bool:
+        """In the manage-layout dropdown, click the row that opens saved layouts (Dot)."""
+        page = self._require_page()
+        roots = (
+            page.locator("[data-qa-id='popup-menu-container'] [role='menuitem']"),
+            page.locator("#overlap-manager-root [role='menuitem']"),
+        )
+        label_rx = re.compile(
+            r"(open\s*layout|開啟版面|打开布局|開啟版面配置|開啟版面…)",
+            re.I,
+        )
+        for root in roots:
+            try:
+                n = await root.count()
+            except Exception:
+                n = 0
+            for i in range(min(n, 48)):
+                item = root.nth(i)
+                try:
+                    txt = ((await item.inner_text(timeout=500)) or "").strip()
+                except Exception:
+                    continue
+                if not txt or not label_rx.search(txt):
+                    continue
+                try:
+                    await item.click(timeout=1400)
+                    self._log(f"[open_layout_dialog] clicked Open layout menuitem: {txt[:72]!r}")
+                    return True
+                except Exception as exc:
+                    self._log(f"[open_layout_dialog] Open layout menuitem click err: {exc!r}")
+        return False
 
-        Note: do NOT press Escape here -- in some flows it cancels the prior
-        layout switch and causes the visible layout to revert.
+    async def _open_layout_dialog_via_header_layout_dropdown(self) -> bool:
+        """Header layout name / #header-toolbar-layouts → 'Open layout...' (not chart properties)."""
+        page = self._require_page()
+        await page.bring_to_front()
+        triggers = page.locator("#header-toolbar-layouts, [data-name='header-toolbar-layouts']")
+        try:
+            cnt = await triggers.count()
+        except Exception:
+            cnt = 0
+        self._log(f"[open_layout_dialog] header-layout-dropdown candidates={cnt}")
+        for i in range(cnt):
+            el = triggers.nth(i)
+            try:
+                if not await el.is_visible():
+                    continue
+                await el.click(timeout=1600)
+            except Exception as exc:
+                self._log(f"[open_layout_dialog] header-layout-dropdown click err i={i} {exc!r}")
+                continue
+            await page.wait_for_timeout(280)
+            if await self._is_layout_dialog_open():
+                self._log("[open_layout_dialog] header toolbar layouts opened dialog directly")
+                return True
+            if await self._try_click_open_layout_menuitem():
+                await page.wait_for_timeout(360)
+                if await self._is_layout_dialog_open():
+                    self._log("[open_layout_dialog] opened via header dropdown → Open layout...")
+                    return True
+            await self._focus_chart_for_shortcuts()
+            await page.wait_for_timeout(100)
+        return False
+
+    async def _open_layout_dialog(self) -> bool:
+        """Open saved-layouts list: '.' first; if only manage menu appears, use Open layout…
+
+        Do NOT press Escape here -- in some flows it cancels the prior layout switch.
         """
         page = self._require_page()
         await page.bring_to_front()
         if await self._is_layout_dialog_open():
             return True
-        # If any popup menu is already open, avoid typing '.' into its search box.
+        # Menu already open (e.g. user left manage-layout dropdown): try Open layout…
         if await self._is_any_popup_menu_open():
+            if await self._try_click_open_layout_menuitem():
+                await page.wait_for_timeout(340)
+                if await self._is_layout_dialog_open():
+                    self._log("[open_layout_dialog] opened via Open layout... (pre-existing menu)")
+                    return True
             self._log("[open_layout_dialog] popup already open; skip '.' shortcut typing")
             return False
         await page.wait_for_timeout(50)
 
-        # Primary path: force chart focus, then use "." shortcut variants.
-        # IMPORTANT: after each keypress, wait a short settle window and stop
-        # immediately once any popup appears (avoid typing next key into search box).
         await self._focus_chart_for_shortcuts()
         for key in (".", "Period", "NumpadDecimal"):
             try:
                 await page.keyboard.press(key)
             except Exception:
                 continue
-            opened_popup = False
-            for _ in range(6):
-                await page.wait_for_timeout(120)
+            for _ in range(12):
+                await page.wait_for_timeout(130)
                 if await self._is_layout_dialog_open():
                     self._log(f"[open_layout_dialog] opened via key={key}")
                     return True
                 if await self._is_any_popup_menu_open():
-                    opened_popup = True
-                    break
-            if opened_popup:
-                self._log(
-                    "[open_layout_dialog] shortcut opened non-target popup; "
-                    "stop shortcut sequence"
-                )
-                return False
-
-        # Conservative mode: do not run aggressive click fallbacks here.
-        # They may trigger unrelated UI (layout setup/account menu) on some TV builds.
-        self._log("[open_layout_dialog] shortcut failed; aggressive fallbacks disabled")
-        return False
-
-        # Fallback to toolbar "Layout setup" button.
-        selector = (
-            "[data-name='header-toolbar-layouts'], "
-            "#header-toolbar-layouts, "
-            "button[title*='Layout setup'], "
-            "button[title*='版面設定'], "
-            "button[data-tooltip*='Layout setup'], "
-            "button[data-tooltip*='版面設定'], "
-            "button[aria-label*='Layout setup'], "
-            "button[aria-label*='版面設定'], "
-            "button[aria-label*='佈局設定']"
-        )
-        buttons = page.locator(selector)
-        count = await buttons.count()
-        if count == 0:
-            return False
-
-        # 1) Prefer normal click on visible candidates.
-        for idx in range(count):
-            btn = buttons.nth(idx)
-            try:
-                if await btn.is_visible():
-                    await btn.click(timeout=2000)
-                    await page.wait_for_timeout(220)
-                    if await self._is_layout_dialog_open():
-                        return True
-            except Exception:
-                continue
-
-        # 2) Fallback: DOM click first matching element (can be offscreen/hidden to PW).
-        try:
-            await page.evaluate(
-                """
-                (sel) => {
-                  const el = document.querySelector(sel);
-                  if (el) el.click();
-                }
-                """,
-                selector,
-            )
-            await page.wait_for_timeout(250)
-            if await self._is_layout_dialog_open():
-                return True
-        except Exception:
-            pass
-
-        # 3) Last-resort: search probable layout controls and click one-by-one.
-        broad_selector = (
-            "[data-name*='layout'], [id*='layout'], [aria-label*='Layout'], [aria-label*='版面設定'], "
-            "[aria-label*='佈局設定'], [title*='Layout setup'], [title*='版面設定'], [title*='佈局設定'], "
-            "button, [role='button']"
-        )
-        candidates = page.locator(broad_selector)
-        try:
-            broad_count = min(await candidates.count(), 120)
-        except Exception:
-            broad_count = 0
-        for idx in range(broad_count):
-            node = candidates.nth(idx)
-            try:
-                if not await node.is_visible():
-                    continue
-                txt = ((await node.inner_text()) or "").strip().lower()
-                aria = ((await node.get_attribute("aria-label")) or "").strip().lower()
-                title = ((await node.get_attribute("title")) or "").strip().lower()
-                data_name = ((await node.get_attribute("data-name")) or "").strip().lower()
-                data_tooltip = ((await node.get_attribute("data-tooltip")) or "").strip().lower()
-                hint = " ".join((txt, aria, title))
-                if any(k in hint for k in ("目前登入", "當前版面", "current layout", "logged in")):
-                    continue
-                strong = " ".join((hint, data_name, data_tooltip))
-                if not any(
-                    k in strong
-                    for k in ("layout setup", "版面設定", "佈局設定", "header-toolbar-layouts")
-                ):
-                    continue
-                await node.click(timeout=1200)
-                await page.wait_for_timeout(240)
-                if await self._is_layout_dialog_open():
-                    return True
-            except Exception:
-                continue
-
-        # 4) DOM-level direct click by strongest known markers.
-        try:
-            await page.evaluate(
-                """
-                () => {
-                  const candidates = Array.from(
-                    document.querySelectorAll(
-                      "[data-name='header-toolbar-layouts'], #header-toolbar-layouts, button, [role='button']"
+                    # '.' often opens the manage menu first; that menu is still [role=menu],
+                    # so we must click Open layout… instead of aborting as non-target.
+                    if await self._try_click_open_layout_menuitem():
+                        await page.wait_for_timeout(300)
+                        if await self._is_layout_dialog_open():
+                            self._log(f"[open_layout_dialog] opened via Open layout... after key={key}")
+                            return True
+                    self._log(
+                        f"[open_layout_dialog] popup menu after key={key} but not Layouts dialog; "
+                        "stopping further keys (avoid typing into search)"
                     )
-                  );
-                  const isGood = (el) => {
-                    const aria = (el.getAttribute("aria-label") || "").toLowerCase();
-                    const title = (el.getAttribute("title") || "").toLowerCase();
-                    const dn = (el.getAttribute("data-name") || "").toLowerCase();
-                    const dt = (el.getAttribute("data-tooltip") || "").toLowerCase();
-                    const txt = (el.textContent || "").toLowerCase();
-                    const all = `${aria} ${title} ${dn} ${dt} ${txt}`;
-                    if (/目前登入|當前版面|current layout|logged in/.test(all)) return false;
-                    return /layout setup|版面設定|佈局設定|header-toolbar-layouts/.test(all);
-                  };
-                  const el = candidates.find(isGood);
-                  if (el) el.click();
-                }
-                """
-            )
-            await page.wait_for_timeout(260)
-            if await self._is_layout_dialog_open():
-                return True
-        except Exception:
-            pass
+                    break
 
-        # 5) Some TV variants expose saved layouts behind the top-left
-        # "current layout" menu (aria-label includes 当前版面).
+        if await self._open_layout_dialog_via_header_layout_dropdown():
+            return True
         if await self._open_layout_dialog_via_current_layout_menu():
             return True
-
-        # 6) Some builds use save/load menu in header toolbar.
         if await self._open_layout_dialog_via_save_load_menu():
             return True
-
         await self._log_layout_open_candidates()
-
         await self._dump_dom("layout_dialog_open_failed")
         return False
 
@@ -4750,7 +4732,9 @@ class PlaywrightCDPAutomator(TVAutomator):
         page = self._require_page()
         current_btn = page.locator(
             "button[aria-label*='當前版面'], button[aria-label*='当前版面'], "
-            "button[data-tooltip*='當前版面'], button[data-tooltip*='当前版面']"
+            "button[data-tooltip*='當前版面'], button[data-tooltip*='当前版面'], "
+            "button[aria-label*='Current layout'], button[aria-label*='Current Layout'], "
+            "button[data-tooltip*='Current layout'], button[data-tooltip*='Current Layout']"
         ).first
         if await current_btn.count() == 0:
             return False
@@ -4759,6 +4743,12 @@ class PlaywrightCDPAutomator(TVAutomator):
             await page.wait_for_timeout(220)
         except Exception:
             return False
+
+        if await self._try_click_open_layout_menuitem():
+            await page.wait_for_timeout(300)
+            if await self._is_layout_dialog_open():
+                self._log("[open_layout_dialog] via-current-layout-btn → Open layout...")
+                return True
 
         # Try likely menu actions that open saved-layout list.
         items = page.locator(

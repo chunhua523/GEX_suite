@@ -7,11 +7,14 @@ to a user-launched browser via CDP.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import date, timedelta
+import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from urllib import request
@@ -21,6 +24,7 @@ from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QGroupBox,
@@ -33,6 +37,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QSplitter,
     QTabWidget,
     QTableWidget,
@@ -65,6 +70,10 @@ _DAY_ABBR = {
     "Thursday": "四",
     "Friday": "五",
 }
+
+_PREVIEW_COL_CHART_URL = 1
+# Narrow columns clip the left side of long URLs; keep this small so "…/chart/<id>/" tail stays visible.
+_PREVIEW_URL_DISPLAY_MAX = 36
 
 
 class _PhaseBScanThread(QThread):
@@ -163,6 +172,17 @@ class TradingViewPage(QWidget):
         batch_root.addWidget(grp_opts)
 
         row_launch = QHBoxLayout()
+        row_launch.addWidget(QLabel("瀏覽器："))
+        self.radio_chrome = QRadioButton("Chrome")
+        self.radio_brave = QRadioButton("Brave")
+        self.radio_chrome.setChecked(True)
+        self._browser_group = QButtonGroup(self)
+        self._browser_group.addButton(self.radio_chrome)
+        self._browser_group.addButton(self.radio_brave)
+        self.radio_chrome.toggled.connect(self._save_tv_prefs)
+        self.radio_brave.toggled.connect(self._save_tv_prefs)
+        row_launch.addWidget(self.radio_chrome)
+        row_launch.addWidget(self.radio_brave)
         self.b_launch_tv = QPushButton("啟動 Chrome／Brave（9222）")
         self.b_launch_tv.setToolTip("以 --remote-debugging-port=9222 啟動並開啟 TradingView")
         self.b_launch_tv.clicked.connect(self._on_launch_browser_9222)
@@ -199,7 +219,9 @@ class TradingViewPage(QWidget):
 
         row_btn2 = QHBoxLayout()
         self.b_phase_b_preview = QPushButton("預覽將變更項目")
-        self.b_phase_b_preview.setToolTip("只掃描，不寫入；結果顯示於下方表格")
+        self.b_phase_b_preview.setToolTip(
+            "與「開始執行」相同流程掃描子圖與指標，但不寫入欄位、不刪過期指標、不儲存版面；結果顯示於下方表格"
+        )
         self.b_phase_b_preview.clicked.connect(self._on_phase_b_preview)
         row_btn2.addWidget(self.b_phase_b_preview)
 
@@ -218,9 +240,21 @@ class TradingViewPage(QWidget):
         self.preview_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.preview_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.preview_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.preview_table.setTextElideMode(Qt.ElideNone)
+        self.preview_table.setWordWrap(False)
         self.preview_table.setMaximumHeight(220)
-        self.preview_table.setToolTip("「預覽將變更項目」執行後更新")
-        batch_root.addWidget(QLabel("預覽表（僅預覽按鈕會填入）"))
+        self.preview_table.setToolTip("「預覽將變更項目」執行後更新；圖表 URL 欄為尾端省略，滑鼠懸停可看完整網址。")
+        preview_bar = QHBoxLayout()
+        preview_bar.addWidget(QLabel("預覽表（僅預覽按鈕會填入）"))
+        preview_bar.addStretch(1)
+        self.b_open_preview_chart_url = QPushButton("開啟選取列之圖表 URL")
+        self.b_open_preview_chart_url.setToolTip(
+            "在已連線的 CDP（預設 127.0.0.1:9222）瀏覽器中開啟選取列的圖表網址；"
+            "首個網址用目前分頁，其餘各開新分頁（可按住 Ctrl 多選）"
+        )
+        self.b_open_preview_chart_url.clicked.connect(self._on_open_preview_selected_chart_urls)
+        preview_bar.addWidget(self.b_open_preview_chart_url)
+        batch_root.addLayout(preview_bar)
         batch_root.addWidget(self.preview_table)
 
         tabs.addTab(tab_batch, "批次與整理")
@@ -301,6 +335,7 @@ class TradingViewPage(QWidget):
         self._last_phase_b_symbols: list[str] = []
         self._last_phase_b_matched_subcharts: int = 0
         self._last_phase_b_layouts: list[str] = []
+        self._last_phase_b_layout_list_degraded: bool = False
         self.cb_ticker.currentTextChanged.connect(self._save_tv_prefs)
         self._load_tv_prefs()
         self._on_ticker_scope_changed()
@@ -340,25 +375,116 @@ class TradingViewPage(QWidget):
             return ""
         return "尚缺 DB：" + "、".join(_DAY_ABBR[d] for d in missing)
 
+    @staticmethod
+    def _preview_item_is_actionable(item: WorkItem) -> bool:
+        ps = (item.preview_status or "").strip()
+        if not ps:
+            return True
+        if ps.startswith("略過"):
+            return False
+        return True
+
+    @staticmethod
+    def _format_url_cell_elide_tail(url: str, max_len: int = _PREVIEW_URL_DISPLAY_MAX) -> str:
+        """Prefer keeping '/chart/<id>' tail visible in narrow table cells."""
+        u = (url or "").strip()
+        if not u:
+            return "—"
+        marker = "/chart/"
+        pos = u.lower().rfind(marker)
+        if pos >= 0:
+            tail = u[pos:]
+            if len(tail) + 3 <= max_len:
+                return "..." + tail
+        if len(u) <= max_len:
+            return u
+        keep = max(12, max_len - 3)
+        return "..." + u[-keep:]
+
+    def _on_open_preview_selected_chart_urls(self) -> None:
+        sel = self.preview_table.selectionModel()
+        if sel is None or not sel.hasSelection():
+            QMessageBox.information(self, "未選取", "請先在預覽表中選取一列或多列。")
+            return
+        rows = sorted({ix.row() for ix in sel.selectedIndexes()})
+        seen: set[str] = set()
+        urls: list[str] = []
+        for r in rows:
+            item = self.preview_table.item(r, _PREVIEW_COL_CHART_URL)
+            if item is None:
+                continue
+            raw = str(item.data(Qt.UserRole) or "").strip()
+            low = raw.lower()
+            if not raw or not (low.startswith("http://") or low.startswith("https://")):
+                continue
+            if raw in seen:
+                continue
+            seen.add(raw)
+            urls.append(raw)
+        if not urls:
+            QMessageBox.information(self, "無 URL", "選取列沒有可開啟的 http(s) 圖表網址。")
+            return
+        cfg = shared_config.load_tradingview_config()
+        cdp_url = str(cfg.get("cdp_url") or "http://127.0.0.1:9222").strip()
+        try:
+            asyncio.run(self._open_preview_chart_urls_via_cdp(cdp_url, urls))
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "CDP 開啟失敗",
+                f"無法透過 {cdp_url} 在已啟動的瀏覽器中開啟網址。\n"
+                f"請確認已用遠端除錯埠啟動 TradingView，且設定檔 cdp_url 正確。\n\n錯誤：{exc}",
+            )
+
+    async def _open_preview_chart_urls_via_cdp(self, cdp_url: str, urls: list[str]) -> None:
+        automator = PlaywrightCDPAutomator(cdp_url=cdp_url)
+        try:
+            await automator.open_chart_urls_via_cdp(urls)
+        finally:
+            await automator.close()
+
     def _populate_preview_table(self, items: list[WorkItem]) -> None:
         self.preview_table.setRowCount(0)
         for it in items:
             row = self.preview_table.rowCount()
             self.preview_table.insertRow(row)
-            fill_txt = self._abbr_weekday_labels(it.available_days)
-            miss_txt = self._missing_weekday_labels(it.codes)
-            fill_cell = f"{fill_txt}　{miss_txt}".strip() if miss_txt else fill_txt
-            values = [
-                it.layout_name or it.layout_id or "—",
-                it.chart_url or "—",
-                str(it.subchart_index) if it.subchart_index is not None else "—",
-                it.subchart_symbol or "—",
-                it.ticker,
-                it.monday.isoformat(),
-                fill_cell,
-            ]
-            for col, val in enumerate(values):
-                self.preview_table.setItem(row, col, QTableWidgetItem(val))
+            ps = (it.preview_status or "").strip()
+            if ps.startswith(("略過", "失敗")):
+                fill_cell = ps
+            elif ps.startswith("預覽："):
+                # Do not prefix ``available_days`` here: that lists every DB-backed day for the
+                # week, while log / preview_status use chart-vs-DB (e.g. cache) to show only
+                # days that would actually be written — prefixing both misled users (e.g. 一~五
+                # vs 執行將填 四、五).
+                miss_txt = self._missing_weekday_labels(it.codes)
+                fill_cell = f"{ps}　{miss_txt}".strip() if miss_txt else ps
+            else:
+                fill_txt = self._abbr_weekday_labels(it.available_days)
+                miss_txt = self._missing_weekday_labels(it.codes)
+                fill_cell = f"{fill_txt}　{miss_txt}".strip() if miss_txt else fill_txt
+                if ps:
+                    fill_cell = f"{fill_cell}　{ps}".strip()
+
+            self.preview_table.setItem(
+                row, 0, QTableWidgetItem(it.layout_name or it.layout_id or "—")
+            )
+            url_full = (it.chart_url or "").strip()
+            if url_full:
+                url_item = QTableWidgetItem(self._format_url_cell_elide_tail(url_full))
+                url_item.setData(Qt.UserRole, url_full)
+                url_item.setToolTip(url_full)
+                url_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            else:
+                url_item = QTableWidgetItem("—")
+            self.preview_table.setItem(row, _PREVIEW_COL_CHART_URL, url_item)
+
+            self.preview_table.setItem(
+                row, 2, QTableWidgetItem(str(it.subchart_index) if it.subchart_index is not None else "—")
+            )
+            self.preview_table.setItem(row, 3, QTableWidgetItem(it.subchart_symbol or "—"))
+            self.preview_table.setItem(row, 4, QTableWidgetItem(it.ticker))
+            self.preview_table.setItem(row, 5, QTableWidgetItem(it.monday.isoformat()))
+            self.preview_table.setItem(row, 6, QTableWidgetItem(fill_cell))
 
     @staticmethod
     def _format_batch_report_exec(report: BatchReport) -> str:
@@ -435,7 +561,10 @@ class TradingViewPage(QWidget):
         self.chk_skip_if_has_values.setChecked(bool(cfg.get("skip_filled_days", True)))
         self.chk_visibility_preset.setChecked(bool(cfg.get("apply_visibility_preset", True)))
         self.chk_organize_indicators.setChecked(bool(cfg.get("organize_indicators", False)))
-
+        if str(cfg.get("browser") or "chrome").strip().lower() == "brave":
+            self.radio_brave.setChecked(True)
+        else:
+            self.radio_chrome.setChecked(True)
         pref_ticker = str(cfg.get("ticker") or "").strip().upper()
         if pref_ticker:
             i = self.cb_ticker.findText(pref_ticker)
@@ -453,6 +582,7 @@ class TradingViewPage(QWidget):
                 "skip_filled_days": self.chk_skip_if_has_values.isChecked(),
                 "apply_visibility_preset": self.chk_visibility_preset.isChecked(),
                 "organize_indicators": self.chk_organize_indicators.isChecked(),
+                "browser": "brave" if self.radio_brave.isChecked() else "chrome",
                 "ticker": self.cb_ticker.currentText().strip().upper(),
             }
         )
@@ -472,24 +602,29 @@ class TradingViewPage(QWidget):
 
     # ---------- Actions ----------
     def _on_launch_browser_9222(self) -> None:
+        browser_type = "brave" if self.radio_brave.isChecked() else "chrome"
+        app_name = "Brave" if browser_type == "brave" else "Chrome"
         target_url = "https://tw.tradingview.com/chart/"
-        candidates = [
-            shutil.which("chrome"),
-            shutil.which("brave"),
-            shutil.which("msedge"),
-            str(Path("C:/Program Files/Google/Chrome/Application/chrome.exe")),
-            str(Path("C:/Program Files (x86)/Google/Chrome/Application/chrome.exe")),
-            str(Path("C:/Program Files/BraveSoftware/Brave-Browser/Application/brave.exe")),
-            str(Path("C:/Program Files (x86)/BraveSoftware/Brave-Browser/Application/brave.exe")),
-        ]
+        candidates = self._browser_candidates(browser_type)
         browser_path = next((p for p in candidates if p and Path(p).exists()), None)
         if not browser_path:
+            manual_cmd = (
+                'open -na "Brave Browser" --args --remote-debugging-port=9222 '
+                '"https://tw.tradingview.com/chart/"'
+                if sys.platform == "darwin" and browser_type == "brave"
+                else (
+                    'open -na "Google Chrome" --args --remote-debugging-port=9222 '
+                    '"https://tw.tradingview.com/chart/"'
+                    if sys.platform == "darwin"
+                    else f'{browser_type} --remote-debugging-port=9222 "{target_url}"'
+                )
+            )
             QMessageBox.warning(
                 self,
                 "找不到瀏覽器",
-                "找不到 Chrome/Brave 可執行檔。\n"
+                f"找不到 {app_name} 可執行檔。\n"
                 "請手動啟動：\n"
-                'chrome --remote-debugging-port=9222 "https://tw.tradingview.com/chart/"',
+                f"{manual_cmd}",
             )
             return
 
@@ -510,16 +645,16 @@ class TradingViewPage(QWidget):
             )
         except Exception as exc:
             QMessageBox.critical(self, "啟動失敗", f"無法啟動瀏覽器：{exc}")
-            self.lbl_status.setText("啟動瀏覽器失敗。")
+            self.lbl_status.setText(f"啟動 {app_name} 失敗。")
             self.lbl_status.setStyleSheet("color:#FF6B6B;")
             return
 
         if self._wait_for_cdp_ready():
-            self.lbl_status.setText("已啟動瀏覽器（9222）並開啟 TradingView chart。")
+            self.lbl_status.setText(f"已啟動 {app_name}（9222）並開啟 TradingView chart。")
             self.lbl_status.setStyleSheet("color:#2CC985;")
             return
 
-        self.lbl_status.setText("瀏覽器已啟動，但 9222 尚未可連線。")
+        self.lbl_status.setText(f"{app_name} 已啟動，但 9222 尚未可連線。")
         self.lbl_status.setStyleSheet("color:#FF6B6B;")
         QMessageBox.warning(
             self,
@@ -527,6 +662,48 @@ class TradingViewPage(QWidget):
             "偵測到瀏覽器啟動，但 CDP 9222 尚未可連線。\n"
             "請先完全關閉所有 Chrome/Brave 視窗後，再按一次本按鈕。",
         )
+
+    def _browser_candidates(self, browser_type: str) -> list[str | None]:
+        kind = "brave" if str(browser_type).strip().lower() == "brave" else "chrome"
+        if kind == "brave":
+            if sys.platform.startswith("win"):
+                return [
+                    shutil.which("brave"),
+                    shutil.which("brave.exe"),
+                    os.path.join(os.environ.get("PROGRAMFILES", "C:\\Program Files"), "BraveSoftware\\Brave-Browser\\Application\\brave.exe"),
+                    os.path.join(os.environ.get("PROGRAMFILES(X86)", "C:\\Program Files (x86)"), "BraveSoftware\\Brave-Browser\\Application\\brave.exe"),
+                    os.path.join(os.environ.get("LOCALAPPDATA", ""), "BraveSoftware\\Brave-Browser\\Application\\brave.exe"),
+                ]
+            if sys.platform == "darwin":
+                return [
+                    shutil.which("brave"),
+                    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+                ]
+            return [
+                shutil.which("brave-browser"),
+                shutil.which("brave"),
+            ]
+        if sys.platform.startswith("win"):
+            return [
+                shutil.which("chrome"),
+                shutil.which("chrome.exe"),
+                os.path.join(os.environ.get("PROGRAMFILES", "C:\\Program Files"), "Google\\Chrome\\Application\\chrome.exe"),
+                os.path.join(os.environ.get("PROGRAMFILES(X86)", "C:\\Program Files (x86)"), "Google\\Chrome\\Application\\chrome.exe"),
+                os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google\\Chrome\\Application\\chrome.exe"),
+            ]
+        if sys.platform == "darwin":
+            return [
+                shutil.which("google-chrome"),
+                shutil.which("chrome"),
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            ]
+        return [
+            shutil.which("google-chrome"),
+            shutil.which("google-chrome-stable"),
+            shutil.which("chromium-browser"),
+            shutil.which("chromium"),
+            shutil.which("chrome"),
+        ]
 
     def _copy_to_clipboard(self) -> None:
         from PySide6.QtWidgets import QApplication
@@ -554,15 +731,24 @@ class TradingViewPage(QWidget):
         self.b_phase_b_cleanup.setEnabled(False)
         self.b_stop.setEnabled(True)
         self.progress.setValue(0)
-        ticker_label = opts.ticker or "ALL"
         self._exec_log_clear()
-        self._exec_log(
-            "── 批次執行 ──\n"
-            f"  ticker 範圍：{opts.ticker_scope}（目標：{ticker_label}）\n"
-            f"  版面範圍：{opts.layout_scope}｜寫入前先整理過期指標："
-            f"{'是' if opts.organize_indicators else '否'}"
-        )
-        self.lbl_status.setText(f"批次執行中：{ticker_label}（版面／子圖）…")
+        if opts.ticker_scope == "all":
+            self._exec_log(
+                "── 批次執行 ──\n"
+                f"  ticker 範圍：{opts.ticker_scope}（由各子圖辨識）\n"
+                f"  版面範圍：{opts.layout_scope}｜寫入前先整理過期指標："
+                f"{'是' if opts.organize_indicators else '否'}"
+            )
+            self.lbl_status.setText("批次執行中：各子圖辨識 ticker（版面／子圖）…")
+        else:
+            ticker_label = (opts.ticker or "").strip() or "（未指定）"
+            self._exec_log(
+                "── 批次執行 ──\n"
+                f"  ticker 範圍：{opts.ticker_scope}（目標：{ticker_label}）\n"
+                f"  版面範圍：{opts.layout_scope}｜寫入前先整理過期指標："
+                f"{'是' if opts.organize_indicators else '否'}"
+            )
+            self.lbl_status.setText(f"批次執行中：{ticker_label}（版面／子圖）…")
         self.lbl_status.setStyleSheet("color:#FFA500;")
 
         self._scan_thread = _PhaseBScanThread(self, opts)
@@ -614,30 +800,49 @@ class TradingViewPage(QWidget):
             QMessageBox.warning(self, "缺少 ticker", "請先選擇或輸入 ticker。")
             return
         self.b_phase_b_preview.setEnabled(False)
-        ticker_label = opts.ticker or "ALL"
+        self._last_phase_b_layout_list_degraded = False
         self._exec_log_clear()
-        self._exec_log(
-            f"── 預覽（不寫入）── ticker 範圍={opts.ticker_scope} 目標={ticker_label} 版面={opts.layout_scope}"
-        )
+        if opts.ticker_scope == "all":
+            self._exec_log(
+                f"── 預覽（不寫入）── ticker 範圍={opts.ticker_scope} 版面={opts.layout_scope}"
+            )
+        else:
+            ticker_label = (opts.ticker or "").strip() or "（未指定）"
+            self._exec_log(
+                f"── 預覽（不寫入）── ticker 範圍={opts.ticker_scope} 目標={ticker_label} 版面={opts.layout_scope}"
+            )
         try:
             items = asyncio.run(self._phase_b_preview_flow(opts=opts))
         except Exception as exc:
             QMessageBox.critical(self, "預覽掃描失敗", f"錯誤：{exc}")
             self._exec_log(f"【預覽失敗】{exc}")
         else:
-            if not items:
+            all_items = items
+            view_items = [it for it in all_items if self._preview_item_is_actionable(it)]
+            if not view_items:
                 self.preview_table.setRowCount(0)
-                self._exec_log("【預覽】沒有符合條件的可執行項目（0 筆）。")
-                self.lbl_status.setText("預覽掃描完成：0 筆可執行項。")
+                if all_items:
+                    self._exec_log(
+                        f"【預覽】表格顯示 0 列（已隱藏 {len(all_items)} 列略過）。"
+                    )
+                else:
+                    self._exec_log("【預覽】沒有符合條件的可執行項目（0 筆）。")
+                self._warn_if_layout_list_degraded(opts)
+                self.lbl_status.setText("預覽掃描完成：0 列。")
                 self.lbl_status.setStyleSheet("color:#7FB3FF;")
             else:
-                deduped = self._dedupe_phase_b_items(items)
-                self._populate_preview_table(deduped)
-                self._exec_log(
-                    f"【預覽】可執行 {len(deduped)} 筆（去重後，見「批次與整理」分頁表格）。"
+                self._populate_preview_table(view_items)
+                hidden = len(all_items) - len(view_items)
+                base = (
+                    f"【預覽】表格顯示 {len(view_items)} 列（掃描共 {len(all_items)} 列；"
+                    f"與「開始執行」相同流程，僅不寫入、不刪過期、不儲存版面）。"
                     f"掃描到 {len(self._last_phase_b_layouts)} 個版面。"
                 )
-                self.lbl_status.setText(f"預覽掃描完成：{len(deduped)} 筆可執行項。")
+                if hidden > 0:
+                    base += f" 已隱藏 {hidden} 列略過。"
+                self._exec_log(base)
+                self._warn_if_layout_list_degraded(opts)
+                self.lbl_status.setText(f"預覽掃描完成：{len(view_items)} 列。")
                 self.lbl_status.setStyleSheet("color:#2CC985;")
         finally:
             self.b_phase_b_preview.setEnabled(True)
@@ -650,13 +855,21 @@ class TradingViewPage(QWidget):
         self.b_phase_b_cleanup.setEnabled(False)
         self.b_phase_b.setEnabled(False)
         self.progress.setValue(0)
-        ticker_label = opts.ticker or "ALL"
+        self._last_phase_b_layout_list_degraded = False
         self._exec_log_clear()
-        self._exec_log(
-            f"── 整理過期 GEX 指標 ──\n"
-            f"  ticker：{ticker_label}（{opts.ticker_scope}）｜版面：{opts.layout_scope}"
-        )
-        self.lbl_status.setText(f"Cleanup 進行中：{ticker_label}（layouts/subcharts）")
+        if opts.ticker_scope == "all":
+            self._exec_log(
+                f"── 整理過期 GEX 指標 ──\n"
+                f"  ticker 範圍：{opts.ticker_scope}（由各子圖辨識）｜版面：{opts.layout_scope}"
+            )
+            self.lbl_status.setText("Cleanup 進行中：各子圖辨識（layouts/subcharts）")
+        else:
+            ticker_label = (opts.ticker or "").strip() or "（未指定）"
+            self._exec_log(
+                f"── 整理過期 GEX 指標 ──\n"
+                f"  ticker：{ticker_label}（{opts.ticker_scope}）｜版面：{opts.layout_scope}"
+            )
+            self.lbl_status.setText(f"Cleanup 進行中：{ticker_label}（layouts/subcharts）")
         self.lbl_status.setStyleSheet("color:#FFA500;")
         try:
             report = asyncio.run(self._phase_b_cleanup_flow(opts=opts))
@@ -685,6 +898,7 @@ class TradingViewPage(QWidget):
         *,
         skip_if_has_values: bool,
         subchart_cache: WeeklyGexSubchartCache | None = None,
+        dry_run: bool = False,
     ) -> BatchResultItem:
         ticker = item.ticker
         monday = item.monday
@@ -718,7 +932,8 @@ class TradingViewPage(QWidget):
                     f"【失敗｜子圖對位】版面={layout_label} URL={u} 子圖#{sub_txt} "
                     f"圖上={sym_txt} ticker={ticker}\n  原因：無法對準預期 symbol（漂移）"
                 )
-                return BatchResultItem(item=item, status="failed", message="無法鎖定目標子圖（symbol 漂移）")
+                rit = replace(item, preview_status="失敗：無法鎖定子圖 symbol") if dry_run else item
+                return BatchResultItem(item=rit, status="failed", message="無法鎖定目標子圖（symbol 漂移）")
             pinned = await automator.pin_indicator_scope_to_subchart(target_subchart)
             if not pinned:
                 u = await _page_url()
@@ -726,7 +941,8 @@ class TradingViewPage(QWidget):
                     f"【失敗｜scope】版面={layout_label} URL={u} 子圖#{sub_txt} ticker={ticker}\n"
                     "  原因：無法在圖表區標定該子圖（scope pin 失敗）"
                 )
-                return BatchResultItem(item=item, status="failed", message="無法鎖定目標子圖（scope pin 失敗）")
+                rit = replace(item, preview_status="失敗：scope pin") if dry_run else item
+                return BatchResultItem(item=rit, status="failed", message="無法鎖定目標子圖（scope pin 失敗）")
 
         try:
             target_iso = monday.isoformat()
@@ -765,16 +981,51 @@ class TradingViewPage(QWidget):
                             f"【略過｜快取】版面={layout_label} URL={u} 子圖#{sub_txt} 圖上={sym_txt} "
                             f"ticker={ticker} 週一起={monday}\n  原因：該週可填欄位皆已有值（子圖載入前掃描）"
                         )
+                        rit = (
+                            replace(item, preview_status="略過：子圖快取顯示該週欄位已有值")
+                            if dry_run
+                            else item
+                        )
                         return BatchResultItem(
-                            item=item,
+                            item=rit,
                             status="skipped",
                             message="該週可用天皆已有值",
+                        )
+                    if dry_run:
+                        planned = [d for d in _DAY_ORDER if missing_only_codes.get(d)]
+                        fills = self._abbr_weekday_labels(planned)
+                        u = await _page_url()
+                        self._exec_log(
+                            f"【預覽｜快取】版面={layout_label} URL={u} 子圖#{sub_txt} 圖上={sym_txt} "
+                            f"ticker={ticker} 週一起={monday}\n  執行時將填：{fills}"
+                        )
+                        return BatchResultItem(
+                            item=replace(item, preview_status=f"預覽：執行將填 {fills}"),
+                            status="skipped",
+                            message="preview_would_fill_from_cache",
                         )
 
             state = await automator.open_or_create_indicator_for_week(
                 monday=monday,
                 subchart_cache=subchart_cache,
+                dry_run=dry_run,
             )
+            if state == "would_create":
+                u = await _page_url()
+                planned = [d for d in _DAY_ORDER if (codes.get(d) or "").strip()]
+                fills = self._abbr_weekday_labels(planned)
+                self._exec_log(
+                    f"【預覽】版面={layout_label} URL={u} 子圖#{sub_txt} 圖上={sym_txt} "
+                    f"ticker={ticker} 週一起={monday}\n  將新增指標並填：{fills}"
+                )
+                return BatchResultItem(
+                    item=replace(
+                        item,
+                        preview_status=f"預覽：尚無該週指標，執行將新增並填 {fills}",
+                    ),
+                    status="skipped",
+                    message="preview_would_create",
+                )
             if state == "existing":
                 opened_date, _opened_time = await automator.read_weekly_start_datetime()
                 opened_start = (opened_date or "").strip()
@@ -790,7 +1041,8 @@ class TradingViewPage(QWidget):
                         f"【失敗｜週期不符】版面={layout_label} URL={u} 子圖#{sub_txt} "
                         f"ticker={ticker} 週一起={monday}\n  原因：{msg}"
                     )
-                    return BatchResultItem(item=item, status="failed", message=msg)
+                    rit = replace(item, preview_status=f"失敗：{msg}") if dry_run else item
+                    return BatchResultItem(item=rit, status="failed", message=msg)
             if state == "existing":
                 existing_levels = await automator.read_weekly_levels()
                 missing_only_codes = {
@@ -812,7 +1064,43 @@ class TradingViewPage(QWidget):
                         f"【略過】版面={layout_label} URL={u} 子圖#{sub_txt} 圖上={sym_txt} "
                         f"ticker={ticker} 週一起={monday}\n  原因：該週可填欄位皆已有值"
                     )
-                    return BatchResultItem(item=item, status="skipped", message="該週可用天皆已有值")
+                    rit = replace(item, preview_status="略過：圖上該週欄位已有值") if dry_run else item
+                    return BatchResultItem(item=rit, status="skipped", message="該週可用天皆已有值")
+                if dry_run:
+                    planned = [d for d in _DAY_ORDER if missing_only_codes.get(d)]
+                    fills = self._abbr_weekday_labels(planned)
+                    date_val, time_val = await automator.read_weekly_start_datetime()
+                    got_date = (date_val or "").strip()
+                    got_time = (time_val or "").strip()
+                    expected_date = monday.isoformat()
+                    expected_time = start_time.strip()
+                    if got_date != expected_date or got_time != expected_time:
+                        await automator.close_settings(save=False)
+                        msg = (
+                            "開始時間驗證失敗(預覽): "
+                            f"expected={expected_date} {expected_time}, got={got_date or '-'} {got_time or '-'}"
+                        )
+                        u = await _page_url()
+                        self._exec_log(
+                            f"【失敗｜起始時間】版面={layout_label} URL={u} ticker={ticker} 週一起={monday}\n"
+                            f"  原因：{msg}"
+                        )
+                        rit = replace(item, preview_status=f"失敗：{msg}")
+                        return BatchResultItem(item=rit, status="failed", message=msg)
+                    await automator.close_settings(save=False)
+                    u = await _page_url()
+                    self._exec_log(
+                        f"【預覽】版面={layout_label} URL={u} 子圖#{sub_txt} ticker={ticker} 週一起={monday}\n"
+                        f"  執行時將填：{fills}"
+                    )
+                    return BatchResultItem(
+                        item=replace(
+                            item,
+                            preview_status=f"預覽：執行將填 {fills}",
+                        ),
+                        status="skipped",
+                        message="preview_would_fill",
+                    )
 
             await automator.set_weekly_start_date(monday=monday, time_str=start_time)
             date_val, time_val = await automator.read_weekly_start_datetime()
@@ -830,7 +1118,8 @@ class TradingViewPage(QWidget):
                 self._exec_log(
                     f"【失敗｜起始時間】版面={layout_label} URL={u} ticker={ticker} 週一起={monday}\n  原因：{msg}"
                 )
-                return BatchResultItem(item=item, status="failed", message=msg)
+                rit = replace(item, preview_status=f"失敗：{msg}") if dry_run else item
+                return BatchResultItem(item=rit, status="failed", message=msg)
             filled_days = await automator.fill_weekly_levels(
                 codes,
                 clear_missing=(state == "created"),
@@ -853,7 +1142,8 @@ class TradingViewPage(QWidget):
                 f"【略過｜指標配額】版面={layout_label} URL={u} 子圖#{sub_txt} "
                 f"ticker={ticker} 週一起={monday}\n  原因：{exc}"
             )
-            return BatchResultItem(item=item, status="skipped", message=f"skip_quota: {exc}")
+            rit = replace(item, preview_status=f"略過：{exc}") if dry_run else item
+            return BatchResultItem(item=rit, status="skipped", message=f"skip_quota: {exc}")
         except Exception as exc:  # noqa: BLE001
             u = await _page_url()
             err = str(exc).replace("\n", " ")
@@ -862,7 +1152,8 @@ class TradingViewPage(QWidget):
             self._exec_log(
                 f"【失敗】版面={layout_label} URL={u} 子圖#{sub_txt} ticker={ticker} 週一起={monday}\n  錯誤：{err}"
             )
-            return BatchResultItem(item=item, status="failed", message=str(exc))
+            rit = replace(item, preview_status=f"失敗：{err}") if dry_run else item
+            return BatchResultItem(item=rit, status="failed", message=str(exc))
         finally:
             automator.set_indicator_scope_subchart(None)
             await automator.clear_indicator_scope_marker()
@@ -926,6 +1217,7 @@ class TradingViewPage(QWidget):
         skip_if_has_values: bool,
         max_retry: int = 1,
         subchart_cache: WeeklyGexSubchartCache | None = None,
+        dry_run: bool = False,
     ) -> BatchResultItem:
         """Apply one item with bounded retries for transient TV UI failures."""
         result = await self._apply_work_item_with_automator(
@@ -933,8 +1225,9 @@ class TradingViewPage(QWidget):
             item,
             skip_if_has_values=skip_if_has_values,
             subchart_cache=subchart_cache,
+            dry_run=dry_run,
         )
-        if result.status != "failed":
+        if dry_run or result.status != "failed":
             return result
         msg = (result.message or "").strip().lower()
         if "could not deterministically open newly added indicator settings" in msg:
@@ -955,6 +1248,7 @@ class TradingViewPage(QWidget):
                 item,
                 skip_if_has_values=skip_if_has_values,
                 subchart_cache=subchart_cache,
+                dry_run=dry_run,
             )
             if result.status != "failed":
                 self._exec_log(
@@ -1009,6 +1303,26 @@ class TradingViewPage(QWidget):
             active_name = (await automator.get_current_layout_name() or "Current Layout").strip()
             return [LayoutInfo(id="active", name=active_name)]
         return await automator.list_layouts()
+
+    def _sync_last_phase_b_layout_snap(self, layouts: list[LayoutInfo]) -> None:
+        self._last_phase_b_layouts = [
+            f"{layout.name}{f' | {layout.subtitle}' if layout.subtitle else ''}"
+            for layout in layouts
+        ]
+        self._last_phase_b_layout_list_degraded = (
+            len(layouts) == 1 and layouts[0].id == "current"
+        )
+
+    def _warn_if_layout_list_degraded(self, opts: BatchOptions) -> None:
+        if opts.layout_scope != "all":
+            return
+        if not self._last_phase_b_layout_list_degraded:
+            return
+        self._exec_log(
+            "【注意｜版面清單】無法從 TradingView 讀取已存版面列表（對話框未開啟或列為空），"
+            "已降級為僅「目前頁面／Current」。請點圖表區、關閉其他選單；程式會依序試「.」、"
+            "管理選單內「Open layout…／開啟版面」、以及標題列版面名稱按鈕，不會去點圖表屬性類的「版面設定」。"
+        )
 
     def _resolve_target_ticker_for_subchart(
         self,
@@ -1131,10 +1445,8 @@ class TradingViewPage(QWidget):
         try:
             await automator.connect()
             layouts = await self._resolve_target_layouts(automator, opts)
-            self._last_phase_b_layouts = [
-                f"{layout.name}{f' | {layout.subtitle}' if layout.subtitle else ''}"
-                for layout in layouts
-            ]
+            self._sync_last_phase_b_layout_snap(layouts)
+            self._warn_if_layout_list_degraded(opts)
             seen_subchart_keys: set[tuple[str, int, str]] = set()
             for layout_idx, layout in enumerate(layouts):
                 if opts.layout_scope == "active":
@@ -1207,10 +1519,8 @@ class TradingViewPage(QWidget):
             await automator.connect()
             mondays = sorted(compute_target_mondays(opts.weeks))
             layouts = await self._resolve_target_layouts(automator, opts)
-            self._last_phase_b_layouts = [
-                f"{layout.name}{f' | {layout.subtitle}' if layout.subtitle else ''}"
-                for layout in layouts
-            ]
+            self._sync_last_phase_b_layout_snap(layouts)
+            self._warn_if_layout_list_degraded(opts)
 
             seen_symbols: set[str] = set()
             matched_subcharts = 0
@@ -1225,7 +1535,7 @@ class TradingViewPage(QWidget):
                     self._exec_log("【已停止】使用者中止批次。")
                     stop_all = True
                     break
-                if layout_idx > 0 and prev_layout_modified:
+                if not opts.dry_run and layout_idx > 0 and prev_layout_modified:
                     self._exec_log(
                         f"【已儲存版面】{prev_layout_label or '—'}（切換至下一個版面之前）"
                     )
@@ -1319,15 +1629,14 @@ class TradingViewPage(QWidget):
                                 f"【警告】子圖#{sub.index} scope pin 失敗，略過該子圖之 GEX 掃描與寫入。"
                             )
                             continue
+                        org_cleanup = opts.organize_indicators and not opts.dry_run
                         keep_mondays = (
-                            self._compute_cleanup_keep_mondays(4)
-                            if opts.organize_indicators
-                            else None
+                            self._compute_cleanup_keep_mondays(4) if org_cleanup else None
                         )
                         subchart_cache = await automator.build_weekly_gex_subchart_cache(
                             keep_mondays=keep_mondays,
                         )
-                        if opts.organize_indicators and subchart_cache.removed_expired > 0:
+                        if org_cleanup and subchart_cache.removed_expired > 0:
                             layout_modified = True
                         for monday in mondays:
                             if self._batch_should_stop():
@@ -1362,9 +1671,10 @@ class TradingViewPage(QWidget):
                                 skip_if_has_values=opts.skip_filled_days,
                                 max_retry=1,
                                 subchart_cache=subchart_cache,
+                                dry_run=opts.dry_run,
                             )
                             results.append(result)
-                            if result.status == "done":
+                            if not opts.dry_run and result.status == "done":
                                 layout_modified = True
                     finally:
                         automator.set_indicator_scope_subchart(None)
@@ -1377,7 +1687,7 @@ class TradingViewPage(QWidget):
                 if stop_all:
                     break
 
-            if prev_layout_modified:
+            if not opts.dry_run and prev_layout_modified:
                 self._exec_log(f"【已儲存版面】{prev_layout_label or '—'}（批次結束）")
                 await automator.save_current_layout()
 
@@ -1396,15 +1706,43 @@ class TradingViewPage(QWidget):
         finally:
             await automator.close()
 
+    def _work_items_from_dry_run_report(self, report: BatchReport) -> list[WorkItem]:
+        """Turn batch dry-run results into preview table rows (with ``preview_status``)."""
+        out: list[WorkItem] = []
+        for r in report.items:
+            it = r.item
+            if r.status == "failed":
+                msg = (r.message or "").strip().replace("\n", " ")
+                if len(msg) > 120:
+                    msg = msg[:117] + "…"
+                ps = it.preview_status or f"失敗：{msg}"
+                out.append(replace(it, preview_status=ps))
+                continue
+            if r.status == "skipped":
+                if it.preview_status:
+                    out.append(it)
+                    continue
+                m = (r.message or "").strip()
+                if m == "該週可用天皆已有值":
+                    out.append(replace(it, preview_status="略過：圖上該週欄位已有值"))
+                elif m.startswith("skip_quota"):
+                    out.append(replace(it, preview_status="略過：指標配額"))
+                else:
+                    out.append(replace(it, preview_status=f"略過：{m[:96]}"))
+                continue
+            if r.status == "done":
+                out.append(replace(it, preview_status="（預覽不應標記為完成）"))
+        return out
+
     async def _phase_b_preview_flow(self, opts: BatchOptions) -> list[WorkItem]:
-        automator = PlaywrightCDPAutomator()
-        automator.set_apply_visibility_preset(opts.apply_visibility_preset)
-        try:
-            await automator.connect()
-            items = await self._build_phase_b_items(automator=automator, opts=opts)
-            return self._dedupe_phase_b_items(items)
-        finally:
-            await automator.close()
+        dry = replace(
+            opts,
+            dry_run=True,
+            apply_visibility_preset=False,
+            organize_indicators=False,
+        )
+        report = await self._phase_b_scan_flow(dry)
+        return self._dedupe_phase_b_items(self._work_items_from_dry_run_report(report))
 
     async def _build_phase_b_items(
         self,
@@ -1413,10 +1751,7 @@ class TradingViewPage(QWidget):
     ) -> list[WorkItem]:
         mondays = sorted(compute_target_mondays(opts.weeks))
         layouts = await self._resolve_target_layouts(automator, opts)
-        self._last_phase_b_layouts = [
-            f"{layout.name}{f' | {layout.subtitle}' if layout.subtitle else ''}"
-            for layout in layouts
-        ]
+        self._sync_last_phase_b_layout_snap(layouts)
         items: list[WorkItem] = []
         seen_symbols: set[str] = set()
         matched_subcharts = 0
