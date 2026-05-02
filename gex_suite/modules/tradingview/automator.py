@@ -4567,30 +4567,81 @@ class PlaywrightCDPAutomator(TVAutomator):
     async def _try_click_open_layout_menuitem(self) -> bool:
         """In the manage-layout dropdown, click the row that opens saved layouts (Dot)."""
         page = self._require_page()
-        roots = (
-            page.locator("[data-qa-id='popup-menu-container'] [role='menuitem']"),
-            page.locator("#overlap-manager-root [role='menuitem']"),
+        menu_roots = (
+            page.locator("[data-qa-id='popup-menu-container']"),
+            page.locator("#overlap-manager-root"),
         )
-        label_rx = re.compile(
-            r"(open\s*layout|開啟版面|打开布局|開啟版面配置|開啟版面…)",
+        include_rx = re.compile(r"(open\s*layout|開啟版面|打开布局|開啟佈局)", re.I)
+        # Avoid "Layout setup" / split-layout / save actions.
+        exclude_rx = re.compile(
+            r"(setup|設定|设置|split|分割|儲存|保存|rename|delete|remove|new\s+layout)",
             re.I,
         )
-        for root in roots:
+        for root in menu_roots:
             try:
-                n = await root.count()
+                if await root.count() == 0:
+                    continue
+            except Exception:
+                continue
+
+            # Strategy A: semantic text hit first (works across role variants).
+            text_candidates = root.locator(
+                "text=/open\\s*layout|開啟版面|打开布局|開啟佈局/i"
+            )
+            try:
+                tc = await text_candidates.count()
+            except Exception:
+                tc = 0
+            for i in range(min(tc, 16)):
+                node = text_candidates.nth(i)
+                try:
+                    raw = ((await node.inner_text(timeout=500)) or "").strip()
+                except Exception:
+                    raw = ""
+                low_raw = raw.lower()
+                if raw and exclude_rx.search(low_raw):
+                    continue
+                # Prefer clicking the enclosing menuitem row when available.
+                row = node.locator(
+                    "xpath=ancestor-or-self::*[@role='menuitem' or @role='option' or @role='button'][1]"
+                ).first
+                try:
+                    if await row.count():
+                        await row.click(timeout=1400)
+                    else:
+                        await node.click(timeout=1400)
+                    self._log(f"[open_layout_dialog] clicked Open layout via text-candidate: {raw[:72]!r}")
+                    return True
+                except Exception:
+                    continue
+
+            # Strategy B: fallback scan in menu-like rows.
+            rows = root.locator("[role='menuitem'], [role='option'], [role='button'], button, div")
+            try:
+                n = await rows.count()
             except Exception:
                 n = 0
             for i in range(min(n, 48)):
-                item = root.nth(i)
+                item = rows.nth(i)
                 try:
                     txt = ((await item.inner_text(timeout=500)) or "").strip()
                 except Exception:
                     continue
-                if not txt or not label_rx.search(txt):
+                if not txt:
+                    continue
+                low = txt.lower()
+                if exclude_rx.search(low):
+                    continue
+                # Strong match: label text says Open layout and shows Dot hotkey.
+                has_dot_hotkey = "dot" in low
+                if not include_rx.search(low):
                     continue
                 try:
                     await item.click(timeout=1400)
-                    self._log(f"[open_layout_dialog] clicked Open layout menuitem: {txt[:72]!r}")
+                    self._log(
+                        f"[open_layout_dialog] clicked Open layout menuitem (dot={has_dot_hotkey}): "
+                        f"{txt[:72]!r}"
+                    )
                     return True
                 except Exception as exc:
                     self._log(f"[open_layout_dialog] Open layout menuitem click err: {exc!r}")
@@ -4629,7 +4680,7 @@ class PlaywrightCDPAutomator(TVAutomator):
         return False
 
     async def _open_layout_dialog(self) -> bool:
-        """Open saved-layouts list: '.' first; if only manage menu appears, use Open layout…
+        """Open saved-layouts list, preferring Manage layouts → Open layout...
 
         Do NOT press Escape here -- in some flows it cancels the prior layout switch.
         """
@@ -4650,42 +4701,12 @@ class PlaywrightCDPAutomator(TVAutomator):
             return False
         await page.wait_for_timeout(50)
 
-        await self._focus_chart_for_shortcuts()
-        for key in (".", "Period", "NumpadDecimal"):
-            try:
-                await page.keyboard.press(key)
-            except Exception:
-                continue
-            for _ in range(12):
-                await page.wait_for_timeout(130)
-                if await self._is_layout_dialog_open():
-                    await self._clear_layout_dialog_search(self._layout_dialog_locator())
-                    self._log(f"[open_layout_dialog] opened via key={key}")
-                    return True
-                if await self._is_any_popup_menu_open():
-                    # '.' often opens the manage menu first; that menu is still [role=menu],
-                    # so we must click Open layout… instead of aborting as non-target.
-                    if await self._try_click_open_layout_menuitem():
-                        await page.wait_for_timeout(300)
-                        if await self._is_layout_dialog_open():
-                            await self._clear_layout_dialog_search(self._layout_dialog_locator())
-                            self._log(f"[open_layout_dialog] opened via Open layout... after key={key}")
-                            return True
-                    self._log(
-                        f"[open_layout_dialog] popup menu after key={key} but not Layouts dialog; "
-                        "stopping further keys (avoid typing into search)"
-                    )
-                    break
-
-        if await self._open_layout_dialog_via_header_layout_dropdown():
-            await self._clear_layout_dialog_search(self._layout_dialog_locator())
-            return True
-        if await self._open_layout_dialog_via_current_layout_menu():
-            await self._clear_layout_dialog_search(self._layout_dialog_locator())
-            return True
+        # Preferred routes: explicit menu paths (stable on macOS + Brave).
         if await self._open_layout_dialog_via_save_load_menu():
             await self._clear_layout_dialog_search(self._layout_dialog_locator())
             return True
+        # Do not use header/current-layout fallbacks here. Those controls can map
+        # to "Layout setup" on some TV builds and break the batch flow.
         await self._log_layout_open_candidates()
         await self._dump_dom("layout_dialog_open_failed")
         return False
@@ -4693,20 +4714,33 @@ class PlaywrightCDPAutomator(TVAutomator):
     async def _clear_layout_dialog_search(self, dialog) -> None:
         """Clear Layouts dialog search (macOS uses Meta+A, others Control+A)."""
         page = self._require_page()
-        search_input = dialog.locator(
-            "input[placeholder*='Search'], input[placeholder*='search'], "
-            "input[type='search'], input[aria-label*='Search'], input[aria-label*='搜尋']"
-        ).first
-        if await search_input.count() == 0:
+        for _ in range(6):
+            search_input = dialog.locator(
+                "input[placeholder*='Search'], input[placeholder*='search'], "
+                "input[type='search'], input[aria-label*='Search'], input[aria-label*='搜尋']"
+            ).first
+            if await search_input.count() == 0:
+                await page.wait_for_timeout(120)
+                continue
+            try:
+                await search_input.click(timeout=800)
+                await page.keyboard.press(await self._select_all_shortcut())
+                await page.keyboard.press("Backspace")
+                await search_input.fill("")
+                # DOM-level clear as final guard for event-order edge cases.
+                await search_input.evaluate(
+                    """
+                    (el) => {
+                      el.value = "";
+                      el.dispatchEvent(new Event("input", { bubbles: true }));
+                      el.dispatchEvent(new Event("change", { bubbles: true }));
+                    }
+                    """
+                )
+                await page.wait_for_timeout(220)
+            except Exception:
+                pass
             return
-        try:
-            await search_input.click(timeout=800)
-            await search_input.fill("")
-            await page.keyboard.press(await self._select_all_shortcut())
-            await page.keyboard.press("Backspace")
-            await page.wait_for_timeout(220)
-        except Exception:
-            pass
 
     async def _select_all_shortcut(self) -> str:
         """Return platform-appropriate Select-All shortcut."""
@@ -4771,37 +4805,6 @@ class PlaywrightCDPAutomator(TVAutomator):
             if await self._is_layout_dialog_open():
                 self._log("[open_layout_dialog] via-current-layout-btn → Open layout...")
                 return True
-
-        # Try likely menu actions that open saved-layout list.
-        items = page.locator(
-            "[role='menuitem']:has-text('版面'), [role='menuitem']:has-text('佈局'), "
-            "[role='menuitem']:has-text('Layout'), [role='menuitem']:has-text('載入'), "
-            "[role='menuitem']:has-text('開啟'), [role='menuitem']:has-text('Open')"
-        )
-        try:
-            count = await items.count()
-        except Exception:
-            count = 0
-        for i in range(min(count, 12)):
-            item = items.nth(i)
-            try:
-                txt = ((await item.inner_text(timeout=600)) or "").strip()
-            except Exception:
-                txt = ""
-            low = txt.lower()
-            if not txt:
-                continue
-            # Avoid re-clicking split-layout setup entries.
-            if any(k in low for k in ("同步", "sync", "crosshair", "商品", "週期", "symbol")):
-                continue
-            try:
-                await item.click(timeout=1000)
-                await page.wait_for_timeout(260)
-            except Exception:
-                continue
-            if await self._is_layout_dialog_open():
-                self._log(f"[open_layout_dialog] via-current-layout-menu item='{txt[:60]}'")
-                return True
         return False
 
     async def _open_layout_dialog_via_save_load_menu(self) -> bool:
@@ -4857,46 +4860,11 @@ class PlaywrightCDPAutomator(TVAutomator):
             self._log("[open_layout_dialog] via-save-load-menu direct-open")
             return True
 
-        # Snapshot menuitem candidates once, then probe each by index.
-        items = page.locator("[role='menuitem']")
-        try:
-            count = await items.count()
-        except Exception:
-            count = 0
-        for i in range(min(count, 12)):
-            # Re-open menu each probe because click usually closes it.
-            try:
-                await page.locator("[data-name='save-load-menu']").first.click(timeout=1000)
-                await page.wait_for_timeout(160)
-            except Exception:
-                pass
-            probe_items = page.locator("[role='menuitem']")
-            try:
-                if await probe_items.count() <= i:
-                    continue
-                it = probe_items.nth(i)
-            except Exception:
-                continue
-            try:
-                txt = ((await it.inner_text(timeout=500)) or "").strip()
-            except Exception:
-                txt = ""
-            try:
-                dn = ((await it.get_attribute("data-name")) or "").strip().lower()
-            except Exception:
-                dn = ""
-            low = txt.lower()
-            if any(k in low for k in ("save", "儲存", "rename", "重新命名", "delete", "刪除")):
-                continue
-            if any(k in dn for k in ("save", "rename", "delete", "remove")):
-                continue
-            try:
-                await it.click(timeout=1000)
-                await page.wait_for_timeout(260)
-            except Exception:
-                continue
+        # Only click the explicit "Open layout..." row to avoid mis-clicking "Layout setup".
+        if await self._try_click_open_layout_menuitem():
+            await page.wait_for_timeout(300)
             if await self._is_layout_dialog_open():
-                self._log(f"[open_layout_dialog] via-save-load-menu item#{i} txt='{txt[:50]}' dn='{dn[:40]}'")
+                self._log("[open_layout_dialog] via-save-load-menu → Open layout...")
                 return True
         return False
 
