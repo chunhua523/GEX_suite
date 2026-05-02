@@ -323,19 +323,7 @@ class PlaywrightCDPAutomator(TVAutomator):
         dialog = self._layout_dialog_locator()
         await self._ensure_layouts_all_tab(dialog)
         # Clear any sticky search/filter text; otherwise TV may show only one row.
-        search_input = dialog.locator(
-            "input[placeholder*='Search'], input[placeholder*='search'], "
-            "input[type='search'], input[aria-label*='Search'], input[aria-label*='搜尋']"
-        ).first
-        if await search_input.count():
-            try:
-                await search_input.click(timeout=800)
-                await search_input.fill("")
-                await page.keyboard.press("Control+A")
-                await page.keyboard.press("Backspace")
-                await page.wait_for_timeout(220)
-            except Exception:
-                pass
+        await self._clear_layout_dialog_search(dialog)
         out: list[LayoutInfo] = []
         seen_keys: set[str] = set()
         first_row_dumped = False
@@ -703,7 +691,7 @@ class PlaywrightCDPAutomator(TVAutomator):
             try:
                 await search_input.click(timeout=900)
                 await search_input.fill("")
-                await page.keyboard.press("Control+A")
+                await page.keyboard.press(await self._select_all_shortcut())
                 await page.keyboard.press("Backspace")
                 await page.wait_for_timeout(200)
                 await search_input.fill(layout.name)
@@ -4648,12 +4636,14 @@ class PlaywrightCDPAutomator(TVAutomator):
         page = self._require_page()
         await page.bring_to_front()
         if await self._is_layout_dialog_open():
+            await self._clear_layout_dialog_search(self._layout_dialog_locator())
             return True
         # Menu already open (e.g. user left manage-layout dropdown): try Open layout…
         if await self._is_any_popup_menu_open():
             if await self._try_click_open_layout_menuitem():
                 await page.wait_for_timeout(340)
                 if await self._is_layout_dialog_open():
+                    await self._clear_layout_dialog_search(self._layout_dialog_locator())
                     self._log("[open_layout_dialog] opened via Open layout... (pre-existing menu)")
                     return True
             self._log("[open_layout_dialog] popup already open; skip '.' shortcut typing")
@@ -4669,6 +4659,7 @@ class PlaywrightCDPAutomator(TVAutomator):
             for _ in range(12):
                 await page.wait_for_timeout(130)
                 if await self._is_layout_dialog_open():
+                    await self._clear_layout_dialog_search(self._layout_dialog_locator())
                     self._log(f"[open_layout_dialog] opened via key={key}")
                     return True
                 if await self._is_any_popup_menu_open():
@@ -4677,6 +4668,7 @@ class PlaywrightCDPAutomator(TVAutomator):
                     if await self._try_click_open_layout_menuitem():
                         await page.wait_for_timeout(300)
                         if await self._is_layout_dialog_open():
+                            await self._clear_layout_dialog_search(self._layout_dialog_locator())
                             self._log(f"[open_layout_dialog] opened via Open layout... after key={key}")
                             return True
                     self._log(
@@ -4686,14 +4678,44 @@ class PlaywrightCDPAutomator(TVAutomator):
                     break
 
         if await self._open_layout_dialog_via_header_layout_dropdown():
+            await self._clear_layout_dialog_search(self._layout_dialog_locator())
             return True
         if await self._open_layout_dialog_via_current_layout_menu():
+            await self._clear_layout_dialog_search(self._layout_dialog_locator())
             return True
         if await self._open_layout_dialog_via_save_load_menu():
+            await self._clear_layout_dialog_search(self._layout_dialog_locator())
             return True
         await self._log_layout_open_candidates()
         await self._dump_dom("layout_dialog_open_failed")
         return False
+
+    async def _clear_layout_dialog_search(self, dialog) -> None:
+        """Clear Layouts dialog search (macOS uses Meta+A, others Control+A)."""
+        page = self._require_page()
+        search_input = dialog.locator(
+            "input[placeholder*='Search'], input[placeholder*='search'], "
+            "input[type='search'], input[aria-label*='Search'], input[aria-label*='搜尋']"
+        ).first
+        if await search_input.count() == 0:
+            return
+        try:
+            await search_input.click(timeout=800)
+            await search_input.fill("")
+            await page.keyboard.press(await self._select_all_shortcut())
+            await page.keyboard.press("Backspace")
+            await page.wait_for_timeout(220)
+        except Exception:
+            pass
+
+    async def _select_all_shortcut(self) -> str:
+        """Return platform-appropriate Select-All shortcut."""
+        page = self._require_page()
+        try:
+            platform = str(await page.evaluate("() => navigator.platform || ''")).lower()
+        except Exception:
+            platform = ""
+        return "Meta+A" if "mac" in platform else "Control+A"
 
     async def _focus_chart_for_shortcuts(self) -> None:
         """Best-effort focus transfer back to chart so '.' shortcut works."""
