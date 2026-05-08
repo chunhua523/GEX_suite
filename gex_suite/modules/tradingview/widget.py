@@ -71,6 +71,59 @@ _DAY_ABBR = {
     "Friday": "五",
 }
 
+# TradingView continuous-futures symbols → DB ticker (per layout mode).
+#   "futures" : feed the chart with the actual futures TV codes (CME-imported, suffixed with 1!).
+#   "equity"  : feed the chart with the related ETF / equity ticker (e.g. SPY for ES1!).
+#   "index"   : feed the chart with the underlying index (e.g. SPX for ES1!).
+# All three modes shift the indicator's "Start date" to Sunday 18:00, because the
+# X-axis bar anchor depends on the chart symbol (always futures), not the data source.
+# A None entry means "no DB ticker exists for this mode" → strict skip with a clear log.
+_FUTURES_ALIAS_MAP: dict[str, dict[str, str | None]] = {
+    # E-mini equity index futures (all 3 modes have a real counterpart)
+    "ES1!":  {"futures": "ES1!",  "equity": "SPY",  "index": "SPX"},
+    "NQ1!":  {"futures": "NQ1!",  "equity": "QQQ",  "index": "NDX"},
+    "RTY1!": {"futures": "RTY1!", "equity": "IWM",  "index": "RUT"},
+
+    # Precious metals (no broadly-tracked option-bearing index → index=None)
+    "GC1!":  {"futures": "GC1!",  "equity": "GLD",  "index": None},
+    "SI1!":  {"futures": "SI1!",  "equity": "SLV",  "index": None},
+    "PL1!":  {"futures": "PL1!",  "equity": "PPLT", "index": None},
+    "PA1!":  {"futures": "PA1!",  "equity": "PALL", "index": None},
+
+    # Industrial metals
+    "HG1!":  {"futures": "HG1!",  "equity": "CPER", "index": None},
+
+    # Energy
+    "CL1!":  {"futures": "CL1!",  "equity": "USO",  "index": None},
+
+    # Grains
+    "ZC1!":  {"futures": "ZC1!",  "equity": "CORN", "index": None},
+    "ZS1!":  {"futures": "ZS1!",  "equity": "SOYB", "index": None},
+    "ZW1!":  {"futures": "ZW1!",  "equity": "WEAT", "index": None},
+
+    # Treasury futures (each maturity bucket → matching ETF)
+    "ZT1!":  {"futures": "ZT1!",  "equity": "SHY",  "index": None},  # 2Y
+    "ZF1!":  {"futures": "ZF1!",  "equity": "IEI",  "index": None},  # 5Y
+    "ZN1!":  {"futures": "ZN1!",  "equity": "IEF",  "index": None},  # 10Y
+    "TN1!":  {"futures": "TN1!",  "equity": "IEF",  "index": None},  # 10Y ultra → 同 IEF
+    "ZB1!":  {"futures": "ZB1!",  "equity": "TLT",  "index": None},  # 30Y
+    "UB1!":  {"futures": "UB1!",  "equity": "TLT",  "index": None},  # Ultra bond → 同 TLT
+
+    # Crypto
+    "BTC1!": {"futures": "BTC1!", "equity": "IBIT", "index": None},
+}
+
+_FUTURES_START_TIME = "18:00"
+_FUTURES_DEFAULT_MODE = "equity"
+
+# Layout-name markers (English, case-insensitive substring match).
+# Multiple aliases per mode supported — pick whichever feels natural in your layout name.
+_LAYOUT_MODE_MARKERS: dict[str, tuple[str, ...]] = {
+    "futures": ("[futures]", "[future]", "[fut]"),
+    "equity":  ("[equity]", "[etf]", "[eq]"),
+    "index":   ("[index]", "[idx]", "[ix]"),
+}
+
 _PREVIEW_COL_CHART_URL = 1
 # Narrow columns clip the left side of long URLs; keep this small so "…/chart/<id>/" tail stays visible.
 _PREVIEW_URL_DISPLAY_MAX = 36
@@ -93,6 +146,33 @@ class _PhaseBScanThread(QThread):
         try:
             report = loop.run_until_complete(self._page._phase_b_scan_flow(self._opts))
             self.succeeded.emit(report)
+        except BaseException as exc:  # noqa: BLE001
+            self.failed.emit(exc)
+        finally:
+            loop.close()
+            asyncio.set_event_loop(None)
+
+
+class _AsyncCoroThread(QThread):
+    """Runs a coroutine factory on a dedicated event loop and emits its result.
+
+    Use this for any TradingView async work triggered from the UI thread —
+    calling ``asyncio.run`` directly on the GUI thread would freeze the window.
+    """
+
+    succeeded = Signal(object)
+    failed = Signal(object)
+
+    def __init__(self, parent: QWidget, coro_factory) -> None:
+        super().__init__(parent)
+        self._coro_factory = coro_factory
+
+    def run(self) -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(self._coro_factory())
+            self.succeeded.emit(result)
         except BaseException as exc:  # noqa: BLE001
             self.failed.emit(exc)
         finally:
@@ -342,6 +422,9 @@ class TradingViewPage(QWidget):
 
         self._cancel_batch_scan = False
         self._scan_thread: _PhaseBScanThread | None = None
+        self._preview_thread: _AsyncCoroThread | None = None
+        self._cleanup_thread: _AsyncCoroThread | None = None
+        self._open_urls_thread: _AsyncCoroThread | None = None
 
     # ---------- 執行紀錄（產品向精簡） ----------
     def _exec_log_clear(self) -> None:
@@ -426,15 +509,22 @@ class TradingViewPage(QWidget):
             return
         cfg = shared_config.load_tradingview_config()
         cdp_url = str(cfg.get("cdp_url") or "http://127.0.0.1:9222").strip()
-        try:
-            asyncio.run(self._open_preview_chart_urls_via_cdp(cdp_url, urls))
-        except Exception as exc:
-            QMessageBox.warning(
-                self,
-                "CDP 開啟失敗",
-                f"無法透過 {cdp_url} 在已啟動的瀏覽器中開啟網址。\n"
-                f"請確認已用遠端除錯埠啟動 TradingView，且設定檔 cdp_url 正確。\n\n錯誤：{exc}",
-            )
+        thread = _AsyncCoroThread(
+            self,
+            lambda: self._open_preview_chart_urls_via_cdp(cdp_url, urls),
+        )
+        thread.failed.connect(lambda exc, u=cdp_url: self._on_open_preview_failed(u, exc))
+        thread.finished.connect(thread.deleteLater)
+        self._open_urls_thread = thread
+        thread.start()
+
+    def _on_open_preview_failed(self, cdp_url: str, exc: BaseException) -> None:
+        QMessageBox.warning(
+            self,
+            "CDP 開啟失敗",
+            f"無法透過 {cdp_url} 在已啟動的瀏覽器中開啟網址。\n"
+            f"請確認已用遠端除錯埠啟動 TradingView，且設定檔 cdp_url 正確。\n\n錯誤：{exc}",
+        )
 
     async def _open_preview_chart_urls_via_cdp(self, cdp_url: str, urls: list[str]) -> None:
         automator = PlaywrightCDPAutomator(cdp_url=cdp_url)
@@ -636,6 +726,7 @@ class TradingViewPage(QWidget):
                 [
                     browser_path,
                     "--remote-debugging-port=9222",
+                    "--remote-debugging-address=127.0.0.1",
                     f"--user-data-dir={profile_dir}",
                     "--new-window",
                     target_url,
@@ -800,6 +891,8 @@ class TradingViewPage(QWidget):
             QMessageBox.warning(self, "缺少 ticker", "請先選擇或輸入 ticker。")
             return
         self.b_phase_b_preview.setEnabled(False)
+        self._cancel_batch_scan = False
+        self.b_stop.setEnabled(True)
         self._last_phase_b_layout_list_degraded = False
         self._exec_log_clear()
         if opts.ticker_scope == "all":
@@ -811,41 +904,52 @@ class TradingViewPage(QWidget):
             self._exec_log(
                 f"── 預覽（不寫入）── ticker 範圍={opts.ticker_scope} 目標={ticker_label} 版面={opts.layout_scope}"
             )
-        try:
-            items = asyncio.run(self._phase_b_preview_flow(opts=opts))
-        except Exception as exc:
-            QMessageBox.critical(self, "預覽掃描失敗", f"錯誤：{exc}")
-            self._exec_log(f"【預覽失敗】{exc}")
-        else:
-            all_items = items
-            view_items = [it for it in all_items if self._preview_item_is_actionable(it)]
-            if not view_items:
-                self.preview_table.setRowCount(0)
-                if all_items:
-                    self._exec_log(
-                        f"【預覽】表格顯示 0 列（已隱藏 {len(all_items)} 列略過）。"
-                    )
-                else:
-                    self._exec_log("【預覽】沒有符合條件的可執行項目（0 筆）。")
-                self._warn_if_layout_list_degraded(opts)
-                self.lbl_status.setText("預覽掃描完成：0 列。")
-                self.lbl_status.setStyleSheet("color:#7FB3FF;")
-            else:
-                self._populate_preview_table(view_items)
-                hidden = len(all_items) - len(view_items)
-                base = (
-                    f"【預覽】表格顯示 {len(view_items)} 列（掃描共 {len(all_items)} 列；"
-                    f"與「開始執行」相同流程，僅不寫入、不刪過期、不儲存版面）。"
-                    f"掃描到 {len(self._last_phase_b_layouts)} 個版面。"
+        thread = _AsyncCoroThread(self, lambda: self._phase_b_preview_flow(opts=opts))
+        thread.succeeded.connect(lambda items, o=opts: self._on_phase_b_preview_succeeded(o, items))
+        thread.failed.connect(self._on_phase_b_preview_failed)
+        thread.finished.connect(self._on_phase_b_preview_finished)
+        thread.finished.connect(thread.deleteLater)
+        self._preview_thread = thread
+        thread.start()
+
+    def _on_phase_b_preview_succeeded(self, opts: BatchOptions, items) -> None:
+        all_items = items
+        view_items = [it for it in all_items if self._preview_item_is_actionable(it)]
+        if not view_items:
+            self.preview_table.setRowCount(0)
+            if all_items:
+                self._exec_log(
+                    f"【預覽】表格顯示 0 列（已隱藏 {len(all_items)} 列略過）。"
                 )
-                if hidden > 0:
-                    base += f" 已隱藏 {hidden} 列略過。"
-                self._exec_log(base)
-                self._warn_if_layout_list_degraded(opts)
-                self.lbl_status.setText(f"預覽掃描完成：{len(view_items)} 列。")
-                self.lbl_status.setStyleSheet("color:#2CC985;")
-        finally:
-            self.b_phase_b_preview.setEnabled(True)
+            else:
+                self._exec_log("【預覽】沒有符合條件的可執行項目（0 筆）。")
+            self._warn_if_layout_list_degraded(opts)
+            self.lbl_status.setText("預覽掃描完成：0 列。")
+            self.lbl_status.setStyleSheet("color:#7FB3FF;")
+        else:
+            self._populate_preview_table(view_items)
+            hidden = len(all_items) - len(view_items)
+            base = (
+                f"【預覽】表格顯示 {len(view_items)} 列（掃描共 {len(all_items)} 列；"
+                f"與「開始執行」相同流程，僅不寫入、不刪過期、不儲存版面）。"
+                f"掃描到 {len(self._last_phase_b_layouts)} 個版面。"
+            )
+            if hidden > 0:
+                base += f" 已隱藏 {hidden} 列略過。"
+            self._exec_log(base)
+            self._warn_if_layout_list_degraded(opts)
+            self.lbl_status.setText(f"預覽掃描完成：{len(view_items)} 列。")
+            self.lbl_status.setStyleSheet("color:#2CC985;")
+
+    def _on_phase_b_preview_failed(self, exc: BaseException) -> None:
+        QMessageBox.critical(self, "預覽掃描失敗", f"錯誤：{exc}")
+        self._exec_log(f"【預覽失敗】{exc}")
+
+    def _on_phase_b_preview_finished(self) -> None:
+        self.b_stop.setEnabled(False)
+        self._cancel_batch_scan = False
+        self.b_phase_b_preview.setEnabled(True)
+        self._preview_thread = None
 
     def _on_phase_b_cleanup(self) -> None:
         opts = self._build_batch_options()
@@ -871,25 +975,34 @@ class TradingViewPage(QWidget):
             )
             self.lbl_status.setText(f"Cleanup 進行中：{ticker_label}（layouts/subcharts）")
         self.lbl_status.setStyleSheet("color:#FFA500;")
-        try:
-            report = asyncio.run(self._phase_b_cleanup_flow(opts=opts))
-        except Exception as exc:
-            QMessageBox.critical(self, "Cleanup 執行失敗", f"錯誤：{exc}")
-            self.lbl_status.setText("Cleanup 失敗。")
-            self.lbl_status.setStyleSheet("color:#FF6B6B;")
+        thread = _AsyncCoroThread(self, lambda: self._phase_b_cleanup_flow(opts=opts))
+        thread.succeeded.connect(self._on_phase_b_cleanup_succeeded)
+        thread.failed.connect(self._on_phase_b_cleanup_failed)
+        thread.finished.connect(self._on_phase_b_cleanup_finished)
+        thread.finished.connect(thread.deleteLater)
+        self._cleanup_thread = thread
+        thread.start()
+
+    def _on_phase_b_cleanup_succeeded(self, report) -> None:
+        if report.total == 0:
+            self.lbl_status.setText("Cleanup 完成：0 筆目標。")
         else:
-            if report.total == 0:
-                self.lbl_status.setText("Cleanup 完成：0 筆目標。")
-            else:
-                self.lbl_status.setText(
-                    f"Cleanup 完成：done={report.done} / skipped={report.skipped} / failed={report.failed}（total={report.total}）"
-                )
-            self.lbl_status.setStyleSheet("color:#2CC985;" if report.failed == 0 else "color:#FFA500;")
-            self.progress.setValue(100 if report.total > 0 else 0)
-            self._exec_log(self._format_batch_report_exec(report))
-        finally:
-            self.b_phase_b_cleanup.setEnabled(True)
-            self.b_phase_b.setEnabled(True)
+            self.lbl_status.setText(
+                f"Cleanup 完成：done={report.done} / skipped={report.skipped} / failed={report.failed}（total={report.total}）"
+            )
+        self.lbl_status.setStyleSheet("color:#2CC985;" if report.failed == 0 else "color:#FFA500;")
+        self.progress.setValue(100 if report.total > 0 else 0)
+        self._exec_log(self._format_batch_report_exec(report))
+
+    def _on_phase_b_cleanup_failed(self, exc: BaseException) -> None:
+        QMessageBox.critical(self, "Cleanup 執行失敗", f"錯誤：{exc}")
+        self.lbl_status.setText("Cleanup 失敗。")
+        self.lbl_status.setStyleSheet("color:#FF6B6B;")
+
+    def _on_phase_b_cleanup_finished(self) -> None:
+        self.b_phase_b_cleanup.setEnabled(True)
+        self.b_phase_b.setEnabled(True)
+        self._cleanup_thread = None
 
     async def _apply_work_item_with_automator(
         self,
@@ -903,7 +1016,15 @@ class TradingViewPage(QWidget):
         ticker = item.ticker
         monday = item.monday
         codes = item.codes
-        start_time = self._resolve_start_time_for_ticker(ticker)
+        # Futures alias (e.g. ES1!→SPX): indicator anchors at Sunday 18:00 instead of Monday <ticker_time>.
+        # DB lookup still uses ``item.monday`` (the trading-week Monday).
+        if item.is_futures:
+            indicator_date = monday - timedelta(days=1)
+            indicator_start_time = _FUTURES_START_TIME
+        else:
+            indicator_date = monday
+            indicator_start_time = self._resolve_start_time_for_ticker(ticker)
+        start_time = indicator_start_time
         layout_label = item.layout_name or item.layout_id or "（目前圖表）"
         sub_txt = str(item.subchart_index) if item.subchart_index is not None else "—"
         sym_txt = item.subchart_symbol or "—"
@@ -945,7 +1066,7 @@ class TradingViewPage(QWidget):
                 return BatchResultItem(item=rit, status="failed", message="無法鎖定目標子圖（scope pin 失敗）")
 
         try:
-            target_iso = monday.isoformat()
+            target_iso = indicator_date.isoformat()
             if (
                 subchart_cache is not None
                 and subchart_cache.probe_complete
@@ -1006,7 +1127,7 @@ class TradingViewPage(QWidget):
                         )
 
             state = await automator.open_or_create_indicator_for_week(
-                monday=monday,
+                monday=indicator_date,
                 subchart_cache=subchart_cache,
                 dry_run=dry_run,
             )
@@ -1029,7 +1150,7 @@ class TradingViewPage(QWidget):
             if state == "existing":
                 opened_date, _opened_time = await automator.read_weekly_start_datetime()
                 opened_start = (opened_date or "").strip()
-                expected_start = monday.isoformat()
+                expected_start = indicator_date.isoformat()
                 if opened_start and opened_start != expected_start:
                     await automator.close_settings(save=False)
                     msg = (
@@ -1072,8 +1193,8 @@ class TradingViewPage(QWidget):
                     date_val, time_val = await automator.read_weekly_start_datetime()
                     got_date = (date_val or "").strip()
                     got_time = (time_val or "").strip()
-                    expected_date = monday.isoformat()
-                    expected_time = start_time.strip()
+                    expected_date = indicator_date.isoformat()
+                    expected_time = indicator_start_time.strip()
                     if got_date != expected_date or got_time != expected_time:
                         await automator.close_settings(save=False)
                         msg = (
@@ -1102,12 +1223,12 @@ class TradingViewPage(QWidget):
                         message="preview_would_fill",
                     )
 
-            await automator.set_weekly_start_date(monday=monday, time_str=start_time)
+            await automator.set_weekly_start_date(monday=indicator_date, time_str=indicator_start_time)
             date_val, time_val = await automator.read_weekly_start_datetime()
             got_date = (date_val or "").strip()
             got_time = (time_val or "").strip()
-            expected_date = monday.isoformat()
-            expected_time = start_time.strip()
+            expected_date = indicator_date.isoformat()
+            expected_time = indicator_start_time.strip()
             if got_date != expected_date or got_time != expected_time:
                 await automator.close_settings(save=False)
                 msg = (
@@ -1128,12 +1249,19 @@ class TradingViewPage(QWidget):
             u = await _page_url()
             verb = "新增 GEX 指標並填欄位" if state == "created" else "更新 GEX 指標欄位"
             fills = self._abbr_weekday_labels(filled_days) if filled_days else "—"
+            if item.is_futures:
+                start_line = (
+                    f"  週一起：{monday}  指標起始：{indicator_date} {indicator_start_time}"
+                    f"（期貨：{sym_txt}）  已寫入：{fills}"
+                )
+            else:
+                start_line = f"  週一起：{monday}  開盤時間：{indicator_start_time}  已寫入：{fills}"
             self._exec_log(
                 f"【{verb}】\n"
                 f"  版面：{layout_label}\n"
                 f"  URL：{u}\n"
                 f"  子圖#{sub_txt} 圖上商品：{sym_txt}  DB ticker：{ticker}\n"
-                f"  週一起：{monday}  開盤時間：{start_time}  已寫入：{fills}"
+                f"{start_line}"
             )
             return BatchResultItem(item=item, status="done")
         except IndicatorQuotaExceededError as exc:
@@ -1328,12 +1456,108 @@ class TradingViewPage(QWidget):
         self,
         symbol: str | None,
         opts: BatchOptions,
-    ) -> str | None:
+        layout_mode: str = _FUTURES_DEFAULT_MODE,
+    ) -> tuple[str | None, bool]:
+        """Resolve subchart symbol → (DB ticker, is_futures_alias) under a layout mode.
+
+        Strict: if the symbol matches a futures alias entry but the requested
+        ``layout_mode`` has no DB ticker for it (e.g. RTY1! in index mode →
+        RUT not imported), returns ``(None, False)`` so the caller can emit a
+        clear strict-skip log. The caller distinguishes "alias known but mode
+        unmapped" from "symbol unknown" by calling :meth:`_futures_alias_lookup`.
+        """
+        entry = self._futures_alias_lookup(symbol)
+        aliased = entry.get(layout_mode) if entry else None
         if opts.ticker_scope == "ticker":
-            if opts.ticker and self._symbol_matches_ticker(symbol, opts.ticker):
-                return opts.ticker
+            target = (opts.ticker or "").strip().upper()
+            if not target:
+                return (None, False)
+            if aliased and aliased == target:
+                return (target, True)
+            # Known futures alias: do NOT fall through to plain symbol match.
+            # User must use the alias-mode router (or change mode/target).
+            if entry is not None:
+                return (None, False)
+            if self._symbol_matches_ticker(symbol, target):
+                return (target, False)
+            return (None, False)
+        # scope == "all"
+        if aliased:
+            return (aliased, True)
+        if entry is not None:
+            # Known futures alias but this mode has no DB mapping → strict skip.
+            return (None, False)
+        return (self._extract_ticker_from_symbol(symbol), False)
+
+    @staticmethod
+    def _futures_alias_lookup(symbol: str | None) -> dict[str, str | None] | None:
+        """Return the alias entry dict if symbol's tail matches the alias map, else None."""
+        text = str(symbol or "").strip().upper()
+        if not text:
             return None
-        return self._extract_ticker_from_symbol(symbol)
+        tail = text.split(":")[-1]
+        return _FUTURES_ALIAS_MAP.get(tail)
+
+    @classmethod
+    def _futures_alias_for_symbol(
+        cls,
+        symbol: str | None,
+        mode: str = _FUTURES_DEFAULT_MODE,
+    ) -> str | None:
+        """Strict: return DB ticker for symbol+mode, or None if no mapping."""
+        entry = cls._futures_alias_lookup(symbol)
+        if not entry:
+            return None
+        return entry.get(mode)
+
+    @staticmethod
+    def _parse_layout_marker_sequence(name: str | None) -> list[str]:
+        """Return the ordered list of mode markers found in ``name`` (case-insensitive).
+
+        Multiple occurrences of the same or different markers preserve order of
+        appearance. e.g. ``"ES1! [equity] + ES1! [index] + ES1! [fut]"`` →
+        ``["equity", "index", "futures"]``.
+        """
+        if not name:
+            return []
+        upper = name.upper()
+        found: list[tuple[int, str]] = []
+        for mode, markers in _LAYOUT_MODE_MARKERS.items():
+            for marker in markers:
+                mu = marker.upper()
+                start = 0
+                while True:
+                    idx = upper.find(mu, start)
+                    if idx < 0:
+                        break
+                    found.append((idx, mode))
+                    start = idx + len(mu)
+        found.sort(key=lambda x: x[0])
+        return [m for _pos, m in found]
+
+    @classmethod
+    def _resolve_layout_mode_for_subchart(
+        cls,
+        name: str | None,
+        subchart_index: int | None,
+        default_mode: str = _FUTURES_DEFAULT_MODE,
+    ) -> str:
+        """Resolve the mode for a given subchart based on layout-name markers.
+
+        - 0 markers: ``default_mode`` for every subchart.
+        - 1 marker:  layout-level — that mode applies to every subchart.
+        - 2+ markers: positional — subchart i ↔ markers[i]; subcharts beyond
+          marker count fall back to ``default_mode``.
+        """
+        markers = cls._parse_layout_marker_sequence(name)
+        if not markers:
+            return default_mode
+        if len(markers) == 1:
+            return markers[0]
+        idx = int(subchart_index) if subchart_index is not None else 0
+        if 0 <= idx < len(markers):
+            return markers[idx]
+        return default_mode
 
     @staticmethod
     def _extract_ticker_from_symbol(symbol: str | None) -> str | None:
@@ -1476,7 +1700,10 @@ class TradingViewPage(QWidget):
                         automator,
                         expected_symbol=sub.symbol,
                     )
-                    target_ticker = self._resolve_target_ticker_for_subchart(search_symbol, opts)
+                    layout_mode = self._resolve_layout_mode_for_subchart(layout.name, sub.index)
+                    target_ticker, _is_futures_unused = self._resolve_target_ticker_for_subchart(
+                        search_symbol, opts, layout_mode=layout_mode
+                    )
                     if not target_ticker:
                         continue
                     target_key = (
@@ -1522,9 +1749,13 @@ class TradingViewPage(QWidget):
             self._sync_last_phase_b_layout_snap(layouts)
             self._warn_if_layout_list_degraded(opts)
 
+            try:
+                known_tickers: set[str] = {t.upper() for t in db.get_all_tickers()}
+            except Exception:
+                known_tickers = set()
+
             seen_symbols: set[str] = set()
             matched_subcharts = 0
-            seen_runtime_keys: set[tuple[str, str, str]] = set()
             results: list[BatchResultItem] = []
             prev_layout_label: str | None = None
             prev_layout_modified = False
@@ -1556,13 +1787,21 @@ class TradingViewPage(QWidget):
                         self._exec_log(f"【略過版面】無法載入：{layout.name}")
                         continue
                 else:
+                    layout_marker_seq = self._parse_layout_marker_sequence(layout.name)
+                    if not layout_marker_seq:
+                        mode_annotation = f"模式：{_FUTURES_DEFAULT_MODE}（預設）"
+                    elif len(layout_marker_seq) == 1:
+                        mode_annotation = f"模式：{layout_marker_seq[0]}"
+                    else:
+                        mode_annotation = f"模式（依子圖序）：{', '.join(layout_marker_seq)}"
                     self._exec_log(
-                        f"▸ 版面「{layout.name}」\n  URL：{str(post.get('url') or '—')}"
+                        f"▸ 版面「{layout.name}」（{mode_annotation}）\n"
+                        f"  URL：{str(post.get('url') or '—')}"
                     )
                 locked_layout_name = (await automator.get_current_layout_name() or "").upper()
                 if not locked_layout_name:
                     locked_layout_name = layout.name.upper()
-                matched_symbols_in_layout: set[str] = set()
+                matched_keys_in_layout: set[tuple[str, str]] = set()
                 subcharts = await self._enumerate_subcharts_with_retry(
                     automator,
                     label="批次掃描",
@@ -1595,14 +1834,57 @@ class TradingViewPage(QWidget):
                     )
                     if search_symbol:
                         seen_symbols.add(search_symbol)
-                    target_ticker = self._resolve_target_ticker_for_subchart(search_symbol, opts)
+                    layout_mode = self._resolve_layout_mode_for_subchart(
+                        layout.name, sub.index
+                    )
+                    target_ticker, is_futures_alias = self._resolve_target_ticker_for_subchart(
+                        search_symbol, opts, layout_mode=layout_mode
+                    )
                     chosen = search_symbol if target_ticker else None
                     if not chosen:
+                        alias_entry = self._futures_alias_lookup(search_symbol)
+                        u = str(post.get("url") or "—")
+                        if alias_entry is not None:
+                            available = sorted(k for k, v in alias_entry.items() if v)
+                            if opts.ticker_scope == "ticker":
+                                mapped = alias_entry.get(layout_mode)
+                                reason = (
+                                    f"alias[{layout_mode}]={mapped or '—'}, "
+                                    f"與目標 ticker={opts.ticker or '—'} 不符"
+                                )
+                            else:
+                                reason = (
+                                    f"alias map 中此 symbol 在 {layout_mode} 模式下無對應 ticker"
+                                    + (f"（可用模式：{', '.join(available)}）" if available else "（此 root 三種模式皆無對應，需先匯入相關資料）")
+                                )
+                            self._exec_log(
+                                f"【略過｜alias 缺項】版面={layout.name} URL={u} 子圖#{sub.index} "
+                                f"圖上={search_symbol or '—'} 模式={layout_mode}\n  原因：{reason}"
+                            )
+                            continue
+                        parsed = self._extract_ticker_from_symbol(search_symbol)
+                        if opts.ticker_scope == "ticker":
+                            reason = (
+                                f"圖上 symbol 與目標 ticker 不符（解析={parsed or '—'}, "
+                                f"目標={opts.ticker or '—'}）"
+                            )
+                        else:
+                            reason = f"無法從 symbol 解析出 ticker（圖上={search_symbol or '—'}）"
+                        self._exec_log(
+                            f"【略過｜未匹配】版面={layout.name} URL={u} 子圖#{sub.index} "
+                            f"圖上={search_symbol or '—'}\n  原因：{reason}"
+                        )
                         continue
-                    chosen_key = chosen.upper()
-                    if chosen_key in matched_symbols_in_layout:
+                    chosen_key = (chosen.upper(), layout_mode)
+                    if chosen_key in matched_keys_in_layout:
+                        u = str(post.get("url") or "—")
+                        self._exec_log(
+                            f"【略過｜重複】版面={layout.name} URL={u} 子圖#{sub.index} "
+                            f"圖上={chosen} ticker={target_ticker} 模式={layout_mode}\n"
+                            f"  原因：同版面前面子圖在相同模式下已處理過此 symbol"
+                        )
                         continue
-                    matched_symbols_in_layout.add(chosen_key)
+                    matched_keys_in_layout.add(chosen_key)
                     matched_subcharts += 1
 
                     if self._batch_should_stop():
@@ -1643,14 +1925,22 @@ class TradingViewPage(QWidget):
                                 self._exec_log("【已停止】使用者中止批次。")
                                 stop_all = True
                                 break
-                            runtime_key = (target_ticker, monday.isoformat(), chosen_key)
-                            if runtime_key in seen_runtime_keys:
-                                continue
-                            seen_runtime_keys.add(runtime_key)
-
                             codes = db.fetch_tv_codes_for_week(ticker=target_ticker, monday=monday)
                             available = [day for day, code in codes.items() if code]
                             if not available:
+                                if target_ticker.upper() not in known_tickers:
+                                    reason = f"資料庫中無 ticker={target_ticker} 的資料"
+                                else:
+                                    reason = (
+                                        f"資料庫有 ticker={target_ticker}，但此週（{monday}~"
+                                        f"{(monday + timedelta(days=4))}）皆無 TV Code"
+                                    )
+                                u = str(post.get("url") or "—")
+                                self._exec_log(
+                                    f"【略過｜資料庫】版面={layout.name} URL={u} 子圖#{sub.index} "
+                                    f"圖上={chosen} ticker={target_ticker} 週一起={monday}\n"
+                                    f"  原因：{reason}"
+                                )
                                 continue
                             snap = await automator.get_runtime_snapshot()
                             chart_url = str(snap.get("url") or "") or None
@@ -1664,6 +1954,7 @@ class TradingViewPage(QWidget):
                                 subchart_index=sub.index,
                                 subchart_symbol=chosen,
                                 chart_url=chart_url,
+                                is_futures=is_futures_alias,
                             )
                             result = await self._apply_work_item_with_retry(
                                 automator,
@@ -1765,7 +2056,7 @@ class TradingViewPage(QWidget):
             locked_layout_name = (await automator.get_current_layout_name() or "").upper()
             if not locked_layout_name:
                 locked_layout_name = layout.name.upper()
-            matched_symbols_in_layout: set[str] = set()
+            matched_keys_in_layout: set[tuple[str, str]] = set()
             subcharts = await self._enumerate_subcharts_with_retry(
                 automator,
                 label="預覽掃描",
@@ -1784,14 +2075,17 @@ class TradingViewPage(QWidget):
                 )
                 if search_symbol:
                     seen_symbols.add(search_symbol)
-                target_ticker = self._resolve_target_ticker_for_subchart(search_symbol, opts)
+                layout_mode = self._resolve_layout_mode_for_subchart(layout.name, sub.index)
+                target_ticker, is_futures_alias = self._resolve_target_ticker_for_subchart(
+                    search_symbol, opts, layout_mode=layout_mode
+                )
                 chosen = search_symbol if target_ticker else None
                 if not chosen:
                     continue
-                chosen_key = chosen.upper()
-                if chosen_key in matched_symbols_in_layout:
+                chosen_key = (chosen.upper(), layout_mode)
+                if chosen_key in matched_keys_in_layout:
                     continue
-                matched_symbols_in_layout.add(chosen_key)
+                matched_keys_in_layout.add(chosen_key)
                 matched_subcharts += 1
                 snap = await automator.get_runtime_snapshot()
                 chart_url = str(snap.get("url") or "") or None
@@ -1811,6 +2105,7 @@ class TradingViewPage(QWidget):
                             subchart_index=sub.index,
                             subchart_symbol=chosen,
                             chart_url=chart_url,
+                            is_futures=is_futures_alias,
                         )
                     )
         self._last_phase_b_symbols = sorted(seen_symbols)

@@ -75,14 +75,62 @@ class _Inserter:
                 self.report.inserted += 1
 
 
+def _is_cme_source_path(fp: str) -> bool:
+    """Detect CME-sourced files by checking if any path component is ``CME``.
+
+    Scraper writes CME TV-Code files under ``download_folder/CME/TV Code/``
+    (see runner.py:save_tv_codes), so a ``/CME/`` segment is a reliable signal.
+    """
+    norm = fp.replace("\\", "/").upper()
+    parts = [p for p in norm.split("/") if p]
+    return "CME" in parts
+
+
+def _suffix_futures_ticker(ticker: str) -> str:
+    """Append ``1!`` to a CME-sourced root ticker (idempotent if already suffixed)."""
+    t = (ticker or "").strip()
+    if not t:
+        return t
+    return t if t.endswith("1!") else f"{t}1!"
+
+
+def _make_cme_aware_insert(
+    inserter: "_Inserter",
+    *,
+    cme: bool,
+) -> Callable[[str, str, str, object], None]:
+    """Return an ``insert(ticker, date, label, value)`` that auto-suffixes for CME."""
+    if not cme:
+        return inserter.insert
+
+    def _wrapped(ticker: str, date: str, label: str, value) -> None:
+        inserter.insert(_suffix_futures_ticker(ticker), date, label, value)
+
+    return _wrapped
+
+
 # ---------- TXT (multi-file) ----------
 
-def import_txt_files(file_paths: Iterable[str], resolver: Optional[ConflictResolver] = None) -> ImportReport:
+def import_txt_files(
+    file_paths: Iterable[str],
+    resolver: Optional[ConflictResolver] = None,
+    *,
+    force_source: Optional[str] = None,
+) -> ImportReport:
+    """Import TV-Code TXT files.
+
+    Files whose path contains a ``CME`` segment (or when ``force_source="cme"``)
+    are tagged as futures-sourced; their tickers get the ``1!`` suffix at insert
+    time so they don't collide with the equity ticker namespace.
+    """
     inserter = _Inserter(resolver)
+    forced_cme = (force_source or "").lower() == "cme"
     for fp in file_paths:
         if inserter.report.cancelled:
             break
         filename = os.path.basename(fp)
+        is_cme = forced_cme or _is_cme_source_path(fp)
+        insert_fn = _make_cme_aware_insert(inserter, cme=is_cme)
 
         default_date = None
         tv_match = re.search(r"TV_Codes_(\d{8})_\d{6}", filename)
@@ -102,14 +150,18 @@ def import_txt_files(file_paths: Iterable[str], resolver: Optional[ConflictResol
                     break
                 if ":" in line:
                     use_date = current_date if current_date else _dt.date.today().isoformat()
-                    gex_parser.parse_gex_code(use_date, line, inserter.insert)
+                    gex_parser.parse_gex_code(use_date, line, insert_fn)
                 else:
-                    try:
-                        candidate = line.split("_")[0]
-                        pd.to_datetime(candidate)
-                        current_date = candidate
-                    except Exception:
-                        pass
+                    candidate = line.split("_")[0]
+                    parsed = None
+                    for fmt in ("%Y%m%d", "%Y-%m-%d"):
+                        try:
+                            parsed = _dt.datetime.strptime(candidate, fmt).date()
+                            break
+                        except ValueError:
+                            continue
+                    if parsed is not None:
+                        current_date = parsed.isoformat()
         except Exception as exc:
             inserter.report.errors.append(f"{fp}: {exc}")
     return inserter.report

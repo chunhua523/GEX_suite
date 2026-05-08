@@ -143,6 +143,85 @@ GEX_suite/
 3. 於應用程式 **TradingView** 分頁選擇週期、版面範圍、ticker 範圍等，可先 **預覽將變更項目** 再執行批次；執行中可用 **停止** 中止。
 4. 除錯截圖與 HTML dump 預設寫入 `gex_suite/data/tradingview/debug/`（依執行時標籤分子目錄）。
 
+## 期貨 ↔ Equity ↔ Index 三模式
+
+CME 連續期貨（如 `ES1!`、`NQ1!`、`GC1!`、`BTC1!`…）的 GEX 可以用三種方式呈現，依 layout 名稱中的 marker 切換。
+
+### 模式對應表（節錄）
+
+| 期貨 root | futures（CME 自身） | equity（ETF / 股票） | index（指數） |
+|---|---|---|---|
+| ES1!  | ES1!  | SPY  | SPX |
+| NQ1!  | NQ1!  | QQQ  | NDX |
+| RTY1! | RTY1! | IWM  | RUT |
+| GC1!  | GC1!  | GLD  | — |
+| SI1!  | SI1!  | SLV  | — |
+| CL1!  | CL1!  | USO  | — |
+| HG1!  | HG1!  | CPER | — |
+| ZN1!  | ZN1!  | IEF  | — |
+| ZB1!  | ZB1!  | TLT  | — |
+| BTC1! | BTC1! | IBIT | — |
+
+完整清單見 [`_FUTURES_ALIAS_MAP`](gex_suite/modules/tradingview/widget.py)。`—` 表示該 root 沒有適合的 index 對應（GEX Suite 採嚴格略過：對到 `None` 即略過該子圖並 log 原因）。
+
+### Layout 名稱 marker 規則
+
+支援的 marker（大小寫不敏感、英文）：
+
+| 模式 | marker |
+|---|---|
+| futures | `[futures]`、`[future]`、`[fut]` |
+| equity  | `[equity]`、`[etf]`、`[eq]` |
+| index   | `[index]`、`[idx]`、`[ix]` |
+
+- **0 marker**：整個 layout 走預設模式 **equity**。
+- **1 marker**：整個 layout 都走該模式。
+- **2+ marker**：依「子圖位置」配對 — 第 N 個 marker 對應第 N 個子圖（超過子圖數量的 marker 會被忽略；超過 marker 數量的子圖 fallback 到預設）。
+
+範例：
+
+| layout 名 | sub#0 | sub#1 | sub#2 |
+|---|---|---|---|
+| `ES1! + NQ1! + VIX`  | equity (預設) | equity | equity |
+| `ES1! + NQ1! [futures]` | futures | futures | (僅 1 marker = 整 layout) |
+| `ES1! [equity] + ES1! [index] + ES1! [future]` | equity | index | futures |
+
+### 期貨指標的 Start date 自動位移
+
+只要 subchart 的 symbol 命中 alias map（任何模式都算），GEX 指標的 **Start date (Monday)** 就會自動寫成「該週 Monday 的前一天 18:00」（亦即 Sunday 18:00 ET），對齊 CME globex 開盤時間；非期貨子圖（VIX、AAPL、SPY…）維持「Monday + 各 ticker 設定時間」。
+
+### 從 CME 抓資料如何進 DB
+
+Scraper 跑 CME 平台時會把 TV Code 寫入 `download_folder/CME/TV Code/TV_Codes_*.txt`。匯入 GEX DB 時，**TXT importer 會偵測路徑中的 `CME` segment，自動把 ticker 加上 `1!` 後綴**（`ES` → `ES1!`、`ZN` → `ZN1!` …），讓期貨 GEX 與 equity GEX 在 DB 各佔一個 key、互不覆蓋。
+
+如果你是用 Excel / Google Sheet 走 CME 匯入，可呼叫 `import_txt_files(..., force_source="cme")` 顯式強制（目前只 TXT 路徑有 force flag；其他路徑可後續視需要擴充）。
+
+### 預覽 log 速覽
+
+```
+▸ 版面「ES1! [equity] + ES1! [index] + ES1! [future]」（模式（依子圖序）：equity, index, futures）
+  URL：https://www.tradingview.com/chart/.../
+【預覽】子圖#0 圖上=CME_MINI:ES1! ticker=SPY  ...
+【預覽】子圖#1 圖上=CME_MINI:ES1! ticker=SPX  ...
+【預覽】子圖#2 圖上=CME_MINI:ES1! ticker=ES1! 將新增指標並填：一、二、三、四、五
+
+【略過｜alias 缺項】... 圖上=GC1! 模式=index
+  原因：alias map 中此 symbol 在 index 模式下無對應 ticker（可用模式：equity, futures）
+
+【略過｜資料庫】... ticker=IEF 週一起=2026-04-13
+  原因：資料庫中無 ticker=IEF 的資料
+```
+
+### 擴充 alias
+
+要新增期貨 root（例如加入 `YM1!` 道瓊期貨）只要編輯 [`_FUTURES_ALIAS_MAP`](gex_suite/modules/tradingview/widget.py) 加一筆：
+
+```python
+"YM1!": {"futures": "YM1!", "equity": "DIA", "index": "DJI"},
+```
+
+不必預先匯入 DB；對應 ticker 沒在 DB 時 runtime 會印【略過｜資料庫】提醒「資料庫中無 ticker=DIA 的資料」，去匯入即可，**不用回頭改程式**。
+
 ## 未來工作
 
 - [x] TradingView 自動貼上：以 Playwright `connect_over_cdp(...)` 接到使用者瀏覽器（批次寫入 GEX 指標欄位）

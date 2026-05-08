@@ -18,6 +18,12 @@ from gex_suite.shared import db
 from gex_suite.shared.paths import DATA_DIR
 
 
+def _q(s: str) -> str:
+    """Escape a string for embedding inside a Playwright text selector
+    single-quoted literal, e.g. ``:text('...')`` / ``:has-text('...')``."""
+    return str(s).replace("\\", "\\\\").replace("'", "\\'")
+
+
 @dataclass(frozen=True)
 class IndicatorInfo:
     title: str
@@ -765,7 +771,7 @@ class PlaywrightCDPAutomator(TVAutomator):
             if layout.subtitle and layout.subtitle not in txt:
                 continue
             return rows.nth(idx)
-        fallback = dialog.locator(f":text('{layout.name}')").first
+        fallback = dialog.locator(f":text('{_q(layout.name)}')").first
         if await fallback.count():
             return fallback
         return None
@@ -1289,8 +1295,8 @@ class PlaywrightCDPAutomator(TVAutomator):
         if match_index is None:
             # Last fallback: try exact text selector with caller-provided name.
             exact_row = page.locator(
-                f"[role='dialog'] [role='row']:has-text('{name}'), "
-                f"[role='dialog'] [class*='item']:has-text('{name}')"
+                f"[role='dialog'] [role='row']:has-text('{_q(name)}'), "
+                f"[role='dialog'] [class*='item']:has-text('{_q(name)}')"
             ).first
             if await exact_row.count():
                 await exact_row.click()
@@ -2137,10 +2143,10 @@ class PlaywrightCDPAutomator(TVAutomator):
         page = self._require_page()
         await page.bring_to_front()
         candidates = page.locator(
-            f"[data-name='legend-source-item']:has-text('{title_keyword}'), "
-            f"[class*='sourceItem']:has-text('{title_keyword}'), "
-            f"[class*='item'][class*='study']:has-text('{title_keyword}'), "
-            f"[data-name='legend'] [class*='item'][class*='study']:has-text('{title_keyword}')"
+            f"[data-name='legend-source-item']:has-text('{_q(title_keyword)}'), "
+            f"[class*='sourceItem']:has-text('{_q(title_keyword)}'), "
+            f"[class*='item'][class*='study']:has-text('{_q(title_keyword)}'), "
+            f"[data-name='legend'] [class*='item'][class*='study']:has-text('{_q(title_keyword)}')"
         )
         return await candidates.count()
 
@@ -4256,7 +4262,7 @@ class PlaywrightCDPAutomator(TVAutomator):
             needle = (text or "").strip()
             if not needle:
                 continue
-            hit = dialog.locator(f":text('{needle}')").first
+            hit = dialog.locator(f":text('{_q(needle)}')").first
             if await hit.count():
                 return True
         return False
@@ -4320,9 +4326,9 @@ class PlaywrightCDPAutomator(TVAutomator):
 
         # Strategy A: row-ish container with the label text and descendant inputs.
         candidates = dialog.locator(
-            f"div:has-text('{label}') input, "
-            f"label:has-text('{label}') ~ div input, "
-            f"*:has-text('{label}') input"
+            f"div:has-text('{_q(label)}') input, "
+            f"label:has-text('{_q(label)}') ~ div input, "
+            f"*:has-text('{_q(label)}') input"
         )
         if await candidates.count() > index:
             target = candidates.nth(index)
@@ -4512,7 +4518,7 @@ class PlaywrightCDPAutomator(TVAutomator):
         }
         keys = tab_map.get(tab_name.strip().lower(), (tab_name,))
         for key in keys:
-            tab = dialog.locator(f"[role='tab']:has-text('{key}')").first
+            tab = dialog.locator(f"[role='tab']:has-text('{_q(key)}')").first
             if await tab.count():
                 selected = (await tab.get_attribute("aria-selected")) == "true"
                 if not selected:
@@ -5040,7 +5046,7 @@ class PlaywrightCDPAutomator(TVAutomator):
             "全部版面",
         )
         for label in tab_labels:
-            tab = dialog.locator(f"[role='tab']:has-text('{label}')").first
+            tab = dialog.locator(f"[role='tab']:has-text('{_q(label)}')").first
             if await tab.count() == 0:
                 continue
             try:

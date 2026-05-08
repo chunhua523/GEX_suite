@@ -44,6 +44,7 @@ class WorkItem:
     chart_url: str | None = None
     note: str | None = None
     preview_status: str | None = None
+    is_futures: bool = False  # alias-mapped futures (e.g. ES1! → SPX); shifts indicator start to Sun 18:00
 
 
 @dataclass(frozen=True)
