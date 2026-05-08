@@ -1139,11 +1139,12 @@ class PlaywrightCDPAutomator(TVAutomator):
         if not lines:
             return None
         # Prefer concise symbol-like lines.
+        # `!` is included so continuous-futures roots like `CL1!`, `HG1!`, `ES1!` survive.
         for ln in lines:
-            if re.fullmatch(r"[A-Z0-9._:-]{1,20}", ln):
+            if re.fullmatch(r"[A-Z0-9._:!-]{1,20}", ln):
                 return ln
         # Fallback: regex search inside noisy text blocks.
-        m = re.search(r"\b[A-Z]{1,8}(?::[A-Z0-9._-]{1,16})?\b", text)
+        m = re.search(r"\b[A-Z]{1,8}\d*!?(?::[A-Z0-9._!-]{1,16})?(?=\W|$)", text)
         return m.group(0) if m else None
 
     # ---------- Phase A helpers (active chart only) ----------
