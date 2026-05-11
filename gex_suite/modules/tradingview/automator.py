@@ -158,6 +158,7 @@ class PlaywrightCDPAutomator(TVAutomator):
         self._scope_attr = "data-gex-scope-target"
         self._chart_settings_misopen_count = 0
         self._chart_settings_misopen_limit = 3
+        self._primary_modifier_cache: str | None = None
 
     def set_logger(self, logger) -> None:
         """Inject an optional callable(str) used for verbose runtime logs."""
@@ -236,7 +237,7 @@ class PlaywrightCDPAutomator(TVAutomator):
         await page.bring_to_front()
         await page.keyboard.press("Alt+S")
         await page.wait_for_timeout(200)
-        await page.keyboard.press("Control+A")
+        await page.keyboard.press(await self._select_all_shortcut())
         await page.keyboard.type(symbol, delay=20)
         await page.keyboard.press("Enter")
         await page.wait_for_timeout(800)
@@ -257,7 +258,7 @@ class PlaywrightCDPAutomator(TVAutomator):
 
         await page.bring_to_front()
         await page.locator("div.view-lines").first.click()
-        await page.keyboard.press("Control+A")
+        await page.keyboard.press(await self._select_all_shortcut())
         await page.keyboard.press("Delete")
         await page.keyboard.type(cleaned_code, delay=0)
         await page.wait_for_timeout(250)
@@ -266,7 +267,7 @@ class PlaywrightCDPAutomator(TVAutomator):
         page = self._require_page()
         indicator_name = name.strip()
         await page.bring_to_front()
-        await page.keyboard.press("Control+S")
+        await page.keyboard.press(f"{await self._primary_modifier()}+S")
         await page.wait_for_timeout(500)
         if indicator_name:
             if await page.locator("input[type='text']").count():
@@ -543,7 +544,7 @@ class PlaywrightCDPAutomator(TVAutomator):
         page = self._require_page()
         await page.bring_to_front()
         try:
-            await page.keyboard.press("Control+S")
+            await page.keyboard.press(f"{await self._primary_modifier()}+S")
             await page.wait_for_timeout(260)
         except Exception:
             # Keep non-fatal: save failures should not crash whole batch.
@@ -4395,7 +4396,7 @@ class PlaywrightCDPAutomator(TVAutomator):
             target = editable.nth(field_index)
             await target.scroll_into_view_if_needed()
             await target.click()
-            await page.keyboard.press("Control+A")
+            await page.keyboard.press(await self._select_all_shortcut())
             await page.keyboard.type(value, delay=0)
             await page.keyboard.press("Enter")
             return True
@@ -4502,11 +4503,13 @@ class PlaywrightCDPAutomator(TVAutomator):
         page = self._require_page()
         dialog = page.locator("[role='dialog'][data-name='indicator-properties-dialog']").last
         await self._select_indicator_tab("Visibility")
-        for names in (("Days", "天"), ("Weeks", "週"), ("Months", "月")):
-            label = dialog.locator(
-                "xpath=.//label[.//*[contains(normalize-space(.), "
-                f"{self._xpath_literal(names[0])}) or contains(normalize-space(.), {self._xpath_literal(names[1])})]]"
-            ).first
+        # Days renders as `日` in zh-TW and `天` in zh-CN; cover both.
+        for tokens in (("Days", "天", "日"), ("Weeks", "週"), ("Months", "月")):
+            conditions = " or ".join(
+                f"contains(normalize-space(.), {self._xpath_literal(tok)})"
+                for tok in tokens
+            )
+            label = dialog.locator(f"xpath=.//label[.//*[{conditions}]]").first
             if await label.count() == 0:
                 continue
             for _ in range(2):
@@ -4628,7 +4631,7 @@ class PlaywrightCDPAutomator(TVAutomator):
         except Exception:
             pass
         await target.click()
-        await page.keyboard.press("Control+A")
+        await page.keyboard.press(await self._select_all_shortcut())
         await page.keyboard.type(value, delay=0)
         await page.keyboard.press("Enter")
 
@@ -4785,6 +4788,7 @@ class PlaywrightCDPAutomator(TVAutomator):
         for _ in range(6):
             search_input = dialog.locator(
                 "input[placeholder*='Search'], input[placeholder*='search'], "
+                "input[placeholder*='搜尋'], input[placeholder*='搜索'], "
                 "input[type='search'], input[aria-label*='Search'], input[aria-label*='搜尋']"
             ).first
             if await search_input.count() == 0:
@@ -4810,14 +4814,26 @@ class PlaywrightCDPAutomator(TVAutomator):
                 pass
             return
 
-    async def _select_all_shortcut(self) -> str:
-        """Return platform-appropriate Select-All shortcut."""
+    async def _primary_modifier(self) -> str:
+        """Return platform-appropriate primary modifier (Meta on macOS, Control elsewhere).
+
+        Cached after first call. TradingView and Chromium dispatch shortcuts like
+        Save/Select-All against Cmd on macOS, so sending literal `Control+S` there
+        is silently dropped — see https://playwright.dev/docs/api/class-keyboard.
+        """
+        if self._primary_modifier_cache is not None:
+            return self._primary_modifier_cache
         page = self._require_page()
         try:
             platform = str(await page.evaluate("() => navigator.platform || ''")).lower()
         except Exception:
             platform = ""
-        return "Meta+A" if "mac" in platform else "Control+A"
+        self._primary_modifier_cache = "Meta" if "mac" in platform else "Control"
+        return self._primary_modifier_cache
+
+    async def _select_all_shortcut(self) -> str:
+        """Return platform-appropriate Select-All shortcut."""
+        return f"{await self._primary_modifier()}+A"
 
     async def _focus_chart_for_shortcuts(self) -> None:
         """Best-effort focus transfer back to chart so '.' shortcut works."""
@@ -4977,7 +4993,13 @@ class PlaywrightCDPAutomator(TVAutomator):
 
     def _layout_dialog_locator(self):
         page = self._require_page()
+        # Stable data-name hooks come first; the dialog title text on zh-TW is
+        # literally「版面」(no「配置」suffix), so :has-text('版面配置') misses.
         return page.locator(
+            "[role='dialog'][data-name='load-layout-dialog'], "
+            "[role='dialog'][data-dialog-name*='版面'], "
+            "[role='dialog'][data-dialog-name*='佈局'], "
+            "[role='dialog'][data-dialog-name*='Layout'], "
             "[role='dialog']:has-text('Layouts'), "
             "[role='dialog']:has-text('LAYOUT NAME'), "
             "[role='dialog']:has-text('版面配置'), "
@@ -5150,10 +5172,15 @@ class PlaywrightCDPAutomator(TVAutomator):
     def _layout_rows_locator(dialog):
         # Keep this strict to avoid matching the dialog itself, header
         # elements or unrelated toolbar buttons via [data-name*='layout'].
+        # zh-TW build exposes each row as `[data-name='load-chart-dialog-item']`
+        # with `role='row'` and an `href` attribute on the row itself.
         return dialog.locator(
+            "[data-name='load-chart-dialog-item'], "
+            "[data-role='list-item'], "
             "[role='listbox'] [role='option'], "
             "[role='option'], "
             "[role='list'] [role='listitem'], "
+            "[role='row']:has([data-name='list-item-title']), "
             "[data-name*='layout-item']"
         )
 
