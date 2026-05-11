@@ -22,14 +22,34 @@ def _get_db_path() -> Path:
     return CHART_DB_PATH
 
 
+def _apply_pragmas(conn: sqlite3.Connection) -> None:
+    # journal_mode=WAL is persistent (DB-file level); re-applying is a no-op.
+    # synchronous=NORMAL is per-connection and must be set every open.
+    # Both together cut fsync cost dramatically for bulk writes on Windows.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+
+
 @contextmanager
 def connect() -> Iterator[sqlite3.Connection]:
     """Context manager yielding a SQLite connection."""
     conn = sqlite3.connect(_get_db_path())
     try:
+        _apply_pragmas(conn)
         yield conn
     finally:
         conn.close()
+
+
+def open_batch() -> sqlite3.Connection:
+    """Open a long-lived connection for bulk writes.
+
+    Caller owns commit + close. Used by importers so a whole batch becomes
+    one transaction instead of one-fsync-per-row.
+    """
+    conn = sqlite3.connect(_get_db_path())
+    _apply_pragmas(conn)
+    return conn
 
 
 def init_db() -> None:
@@ -45,6 +65,13 @@ def init_db() -> None:
                 value  REAL NOT NULL
             )
             """
+        )
+        # The (ticker, date, label) lookup runs on every insert/update via
+        # row_exists / insert_only / upsert / insert_or_existing. Without
+        # an index this is a full table scan — O(N²) for bulk imports.
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_stock_data_key "
+            "ON stock_data(ticker, date, label)"
         )
         conn.commit()
 
@@ -170,55 +197,127 @@ def delete_ohlc(ticker: str, date_str: str) -> None:
         conn.commit()
 
 
-def upsert(ticker: str, date: str, label: str, value) -> bool:
-    """Insert or update a single row.
-
-    Returns ``True`` if a row was actually written (insert or update).
-    """
-    with connect() as conn:
-        cur = conn.cursor()
+def _upsert_on(conn: sqlite3.Connection, ticker: str, date: str, label: str, value) -> None:
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id FROM stock_data WHERE ticker=? AND date=? AND label=?",
+        (ticker, date, label),
+    )
+    existing = cur.fetchone()
+    if existing:
         cur.execute(
-            "SELECT id FROM stock_data WHERE ticker=? AND date=? AND label=?",
-            (ticker, date, label),
+            "UPDATE stock_data SET value=? WHERE id=?",
+            (value, existing[0]),
         )
-        existing = cur.fetchone()
-        if existing:
-            cur.execute(
-                "UPDATE stock_data SET value=? WHERE id=?",
-                (value, existing[0]),
-            )
-        else:
-            cur.execute(
-                "INSERT INTO stock_data (ticker, date, label, value) VALUES (?,?,?,?)",
-                (ticker, date, label, value),
-            )
-        conn.commit()
-    return True
-
-
-def insert_only(ticker: str, date: str, label: str, value) -> bool:
-    """Insert iff the row doesn't exist; return ``True`` on actual insert."""
-    with connect() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT id FROM stock_data WHERE ticker=? AND date=? AND label=?",
-            (ticker, date, label),
-        )
-        if cur.fetchone():
-            return False
+    else:
         cur.execute(
             "INSERT INTO stock_data (ticker, date, label, value) VALUES (?,?,?,?)",
             (ticker, date, label, value),
         )
-        conn.commit()
+
+
+def upsert(ticker: str, date: str, label: str, value, *, conn: sqlite3.Connection | None = None) -> bool:
+    """Insert or update a single row.
+
+    Pass ``conn`` to skip auto-commit (caller batches multiple writes into
+    one transaction). When ``conn=None`` opens its own connection and
+    commits per call — backwards-compatible single-write path.
+    """
+    if conn is not None:
+        _upsert_on(conn, ticker, date, label, value)
+        return True
+    with connect() as c:
+        _upsert_on(c, ticker, date, label, value)
+        c.commit()
     return True
 
 
-def row_exists(ticker: str, date: str, label: str) -> bool:
-    with connect() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT 1 FROM stock_data WHERE ticker=? AND date=? AND label=? LIMIT 1",
-            (ticker, date, label),
-        )
-        return cur.fetchone() is not None
+def _insert_only_on(conn: sqlite3.Connection, ticker: str, date: str, label: str, value) -> bool:
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id FROM stock_data WHERE ticker=? AND date=? AND label=?",
+        (ticker, date, label),
+    )
+    if cur.fetchone():
+        return False
+    cur.execute(
+        "INSERT INTO stock_data (ticker, date, label, value) VALUES (?,?,?,?)",
+        (ticker, date, label, value),
+    )
+    return True
+
+
+def insert_only(ticker: str, date: str, label: str, value, *, conn: sqlite3.Connection | None = None) -> bool:
+    """Insert iff the row doesn't exist; return ``True`` on actual insert.
+
+    See :func:`upsert` for ``conn`` semantics.
+    """
+    if conn is not None:
+        return _insert_only_on(conn, ticker, date, label, value)
+    with connect() as c:
+        wrote = _insert_only_on(c, ticker, date, label, value)
+        if wrote:
+            c.commit()
+        return wrote
+
+
+def _insert_or_existing_on(conn: sqlite3.Connection, ticker: str, date: str, label: str, value) -> bool:
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO stock_data (ticker, date, label, value) VALUES (?,?,?,?)",
+        (ticker, date, label, value),
+    )
+    return cur.rowcount > 0
+
+
+def insert_or_existing(ticker: str, date: str, label: str, value,
+                       *, conn: sqlite3.Connection | None = None) -> bool:
+    """Atomic single-statement insert.
+
+    Returns ``True`` if the row was newly inserted, ``False`` if the
+    ``(ticker, date, label)`` key already existed. Relies on the
+    ``idx_stock_data_key`` UNIQUE index. Pair with :func:`update_value`
+    for the overwrite branch.
+    """
+    if conn is not None:
+        return _insert_or_existing_on(conn, ticker, date, label, value)
+    with connect() as c:
+        wrote = _insert_or_existing_on(c, ticker, date, label, value)
+        if wrote:
+            c.commit()
+        return wrote
+
+
+def _update_value_on(conn: sqlite3.Connection, ticker: str, date: str, label: str, value) -> None:
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE stock_data SET value=? WHERE ticker=? AND date=? AND label=?",
+        (value, ticker, date, label),
+    )
+
+
+def update_value(ticker: str, date: str, label: str, value,
+                 *, conn: sqlite3.Connection | None = None) -> None:
+    """Update an existing row's value. No-op if the row doesn't exist."""
+    if conn is not None:
+        _update_value_on(conn, ticker, date, label, value)
+        return
+    with connect() as c:
+        _update_value_on(c, ticker, date, label, value)
+        c.commit()
+
+
+def _row_exists_on(conn: sqlite3.Connection, ticker: str, date: str, label: str) -> bool:
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT 1 FROM stock_data WHERE ticker=? AND date=? AND label=? LIMIT 1",
+        (ticker, date, label),
+    )
+    return cur.fetchone() is not None
+
+
+def row_exists(ticker: str, date: str, label: str, *, conn: sqlite3.Connection | None = None) -> bool:
+    if conn is not None:
+        return _row_exists_on(conn, ticker, date, label)
+    with connect() as c:
+        return _row_exists_on(c, ticker, date, label)

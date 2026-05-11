@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime as _dt
 import os
 import re
+import sqlite3
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Optional
 
@@ -35,7 +36,13 @@ ConflictResolver = Callable[[str, str, str], str]
 
 
 class _Inserter:
-    """Insert with conflict policy callback. Tracks counters in an ImportReport."""
+    """Insert with conflict policy callback. Tracks counters in an ImportReport.
+
+    Used standalone (one-shot single-row writes, e.g. ``_on_single_entry``)
+    or as a context manager (bulk import). When used as a context manager,
+    a single SQLite connection is held open for the duration and the
+    transaction is committed once on exit — avoiding one fsync per row.
+    """
 
     def __init__(self, resolver: Optional[ConflictResolver] = None,
                  default_policy: str = "overwrite") -> None:
@@ -44,6 +51,25 @@ class _Inserter:
         self.report = ImportReport()
         self._global_choice: Optional[str] = None
         self._apply_to_all: bool = False
+        self._conn: Optional[sqlite3.Connection] = None
+
+    def __enter__(self) -> "_Inserter":
+        self._conn = db.open_batch()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        conn, self._conn = self._conn, None
+        if conn is None:
+            return
+        try:
+            # Commit partial progress on cancel (matches the legacy
+            # per-row-commit behavior); roll back only on a real exception.
+            if exc_type is None:
+                conn.commit()
+            else:
+                conn.rollback()
+        finally:
+            conn.close()
 
     def _choose(self, ticker: str, date: str, label: str) -> str:
         if self._apply_to_all and self._global_choice:
@@ -60,19 +86,21 @@ class _Inserter:
     def insert(self, ticker: str, date: str, label: str, value) -> None:
         if self.report.cancelled:
             return
-        if db.row_exists(ticker, date, label):
-            choice = self._choose(ticker, date, label)
-            if choice == "cancel":
-                self.report.cancelled = True
-                return
-            if choice == "skip":
-                self.report.skipped += 1
-                return
-            db.upsert(ticker, date, label, value)
-            self.report.overwritten += 1
-        else:
-            if db.insert_only(ticker, date, label, value):
-                self.report.inserted += 1
+        conn = self._conn  # None outside `with` → helpers open per-row conn (legacy path)
+        # Try INSERT OR IGNORE first — one statement, no pre-SELECT. Only
+        # consult the resolver if the UNIQUE index rejected the row.
+        if db.insert_or_existing(ticker, date, label, value, conn=conn):
+            self.report.inserted += 1
+            return
+        choice = self._choose(ticker, date, label)
+        if choice == "cancel":
+            self.report.cancelled = True
+            return
+        if choice == "skip":
+            self.report.skipped += 1
+            return
+        db.update_value(ticker, date, label, value, conn=conn)
+        self.report.overwritten += 1
 
 
 def _is_cme_source_path(fp: str) -> bool:
@@ -125,45 +153,46 @@ def import_txt_files(
     """
     inserter = _Inserter(resolver)
     forced_cme = (force_source or "").lower() == "cme"
-    for fp in file_paths:
-        if inserter.report.cancelled:
-            break
-        filename = os.path.basename(fp)
-        is_cme = forced_cme or _is_cme_source_path(fp)
-        insert_fn = _make_cme_aware_insert(inserter, cme=is_cme)
+    with inserter:
+        for fp in file_paths:
+            if inserter.report.cancelled:
+                break
+            filename = os.path.basename(fp)
+            is_cme = forced_cme or _is_cme_source_path(fp)
+            insert_fn = _make_cme_aware_insert(inserter, cme=is_cme)
 
-        default_date = None
-        tv_match = re.search(r"TV_Codes_(\d{8})_\d{6}", filename)
-        date_match = tv_match if tv_match else re.search(r"(\d{8})", filename)
-        if date_match:
+            default_date = None
+            tv_match = re.search(r"TV_Codes_(\d{8})_\d{6}", filename)
+            date_match = tv_match if tv_match else re.search(r"(\d{8})", filename)
+            if date_match:
+                try:
+                    default_date = pd.to_datetime(date_match.group(1), format="%Y%m%d").date().isoformat()
+                except Exception:
+                    pass
+
+            current_date = default_date
             try:
-                default_date = pd.to_datetime(date_match.group(1), format="%Y%m%d").date().isoformat()
-            except Exception:
-                pass
-
-        current_date = default_date
-        try:
-            with open(fp, "r", encoding="utf-8") as f:
-                lines = [ln.strip() for ln in f.readlines() if ln.strip()]
-            for line in lines:
-                if inserter.report.cancelled:
-                    break
-                if ":" in line:
-                    use_date = current_date if current_date else _dt.date.today().isoformat()
-                    gex_parser.parse_gex_code(use_date, line, insert_fn)
-                else:
-                    candidate = line.split("_")[0]
-                    parsed = None
-                    for fmt in ("%Y%m%d", "%Y-%m-%d"):
-                        try:
-                            parsed = _dt.datetime.strptime(candidate, fmt).date()
-                            break
-                        except ValueError:
-                            continue
-                    if parsed is not None:
-                        current_date = parsed.isoformat()
-        except Exception as exc:
-            inserter.report.errors.append(f"{fp}: {exc}")
+                with open(fp, "r", encoding="utf-8") as f:
+                    lines = [ln.strip() for ln in f.readlines() if ln.strip()]
+                for line in lines:
+                    if inserter.report.cancelled:
+                        break
+                    if ":" in line:
+                        use_date = current_date if current_date else _dt.date.today().isoformat()
+                        gex_parser.parse_gex_code(use_date, line, insert_fn)
+                    else:
+                        candidate = line.split("_")[0]
+                        parsed = None
+                        for fmt in ("%Y%m%d", "%Y-%m-%d"):
+                            try:
+                                parsed = _dt.datetime.strptime(candidate, fmt).date()
+                                break
+                            except ValueError:
+                                continue
+                        if parsed is not None:
+                            current_date = parsed.isoformat()
+            except Exception as exc:
+                inserter.report.errors.append(f"{fp}: {exc}")
     return inserter.report
 
 
@@ -187,13 +216,14 @@ def _import_rows(ticker: str, df: pd.DataFrame, inserter: _Inserter,
 
 def import_excel(file_path: str, resolver: Optional[ConflictResolver] = None) -> ImportReport:
     inserter = _Inserter(resolver)
-    try:
-        xls = pd.ExcelFile(file_path)
-        for sheet in xls.sheet_names:
-            df = pd.read_excel(xls, sheet_name=sheet)
-            _import_rows(sheet.strip(), df, inserter)
-    except Exception as exc:
-        inserter.report.errors.append(str(exc))
+    with inserter:
+        try:
+            xls = pd.ExcelFile(file_path)
+            for sheet in xls.sheet_names:
+                df = pd.read_excel(xls, sheet_name=sheet)
+                _import_rows(sheet.strip(), df, inserter)
+        except Exception as exc:
+            inserter.report.errors.append(str(exc))
     return inserter.report
 
 
@@ -221,28 +251,29 @@ def import_google(sheet_ids: list[str], resolver: Optional[ConflictResolver] = N
     creds = ServiceAccountCredentials.from_json_keyfile_name(str(SERVICE_ACCOUNT_PATH), scope)
     client = gspread.authorize(creds)
 
-    for sid in sheet_ids:
-        try:
-            spreadsheet = client.open_by_key(sid)
-        except Exception as exc:
-            inserter.report.errors.append(f"open_by_key({sid}): {exc}")
-            continue
-
-        for ws in spreadsheet.worksheets():
-            ticker = ws.title.strip()
+    with inserter:
+        for sid in sheet_ids:
             try:
-                values = ws.get_all_values()
-                if not values:
-                    continue
-                headers = values[0]
-                if not headers or all(not h.strip() for h in headers):
-                    continue
-                df = pd.DataFrame(values[1:], columns=headers)
+                spreadsheet = client.open_by_key(sid)
             except Exception as exc:
-                inserter.report.errors.append(f"{ticker}: {exc}")
+                inserter.report.errors.append(f"open_by_key({sid}): {exc}")
                 continue
-            if "TV Code" not in df.columns:
-                continue
-            latest = db.get_latest_date_for_ticker(ticker) if only_latest else None
-            _import_rows(ticker, df, inserter, latest)
+
+            for ws in spreadsheet.worksheets():
+                ticker = ws.title.strip()
+                try:
+                    values = ws.get_all_values()
+                    if not values:
+                        continue
+                    headers = values[0]
+                    if not headers or all(not h.strip() for h in headers):
+                        continue
+                    df = pd.DataFrame(values[1:], columns=headers)
+                except Exception as exc:
+                    inserter.report.errors.append(f"{ticker}: {exc}")
+                    continue
+                if "TV Code" not in df.columns:
+                    continue
+                latest = db.get_latest_date_for_ticker(ticker) if only_latest else None
+                _import_rows(ticker, df, inserter, latest)
     return inserter.report
