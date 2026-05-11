@@ -64,6 +64,10 @@ class WeeklyGexSubchartCache:
     rows: list[WeeklyGexRowSnapshot]
     probe_complete: bool
     removed_expired: int = 0
+    # Expired rows that were detected but could not be deleted via the
+    # Properties-dialog Delete button on the final pass. Surfaced separately
+    # so the inline cleanup path can warn the user instead of failing silently.
+    expired_pending: int = 0
 
     @property
     def signature_set(self) -> frozenset[str]:
@@ -2151,30 +2155,6 @@ class PlaywrightCDPAutomator(TVAutomator):
         )
         return await candidates.count()
 
-    async def _remove_study_from_open_indicator_properties_dialog(self) -> bool:
-        """Click Remove/Delete in the already-open indicator properties dialog."""
-        page = self._require_page()
-        remove_btn = page.locator(
-            "[role='dialog'][data-name='indicator-properties-dialog'] button:has-text('Remove'), "
-            "[role='dialog'][data-name='indicator-properties-dialog'] button:has-text('Delete'), "
-            "[role='dialog'][data-name='indicator-properties-dialog'] button:has-text('移除'), "
-            "[role='dialog'][data-name='indicator-properties-dialog'] button:has-text('刪除')"
-        ).first
-        if not await remove_btn.count():
-            return False
-        try:
-            await remove_btn.click()
-            await page.wait_for_timeout(180)
-            await self._confirm_delete_dialog_if_present()
-            await self._close_chart_settings_if_open()
-            return True
-        except Exception:
-            try:
-                await self.close_settings(save=False)
-            except Exception:
-                pass
-            return False
-
     async def build_weekly_gex_subchart_cache(
         self,
         *,
@@ -2196,6 +2176,7 @@ class PlaywrightCDPAutomator(TVAutomator):
         final_rows: list[WeeklyGexRowSnapshot] = []
         probe_complete = True
         removed_expired = 0
+        expired_pending = 0
         for _round in range(96):
             candidates = await self._collect_any_indicator_locators(
                 title_keyword, active_only=True
@@ -2206,10 +2187,14 @@ class PlaywrightCDPAutomator(TVAutomator):
                 )
             if not candidates:
                 return WeeklyGexSubchartCache(
-                    rows=[], probe_complete=True, removed_expired=removed_expired
+                    rows=[],
+                    probe_complete=True,
+                    removed_expired=removed_expired,
+                    expired_pending=expired_pending,
                 )
             pass_rows: list[WeeklyGexRowSnapshot] = []
             removed = False
+            round_expired_failed = 0
             for cand in list(candidates):
                 opened = await self._open_settings_for_locator(cand, title_keyword)
                 if not opened:
@@ -2229,11 +2214,26 @@ class PlaywrightCDPAutomator(TVAutomator):
                     except ValueError:
                         row_monday = None
                 if cutoff is not None and row_monday is not None and row_monday < cutoff:
-                    if await self._remove_study_from_open_indicator_properties_dialog():
+                    # Close the Properties dialog first, then reuse the same
+                    # row-locator removal helper as the dedicated cleanup
+                    # button. The earlier inline path tried to click a
+                    # Delete button *inside* indicator-properties-dialog —
+                    # but that dialog has no such button on current TV, so
+                    # the call always returned False silently.
+                    await self.close_settings(save=False)
+                    deleted = await self._remove_indicator_by_locator(
+                        cand, title_keyword
+                    )
+                    if deleted:
                         removed_expired += 1
                         removed = True
+                        await page.wait_for_timeout(200)
                         break
-                    await self.close_settings(save=False)
+                    round_expired_failed += 1
+                    self._log(
+                        "[subchart_cache] expired-remove FAILED row=%s cutoff=%s"
+                        % (normalized or "?", cutoff.isoformat())
+                    )
                     probe_complete = False
                     continue
                 await self.close_settings(save=False)
@@ -2251,14 +2251,20 @@ class PlaywrightCDPAutomator(TVAutomator):
                 continue
             if len(pass_rows) != len(candidates):
                 probe_complete = False
+            # Only the final (no-removal) round's failures count toward
+            # ``expired_pending`` — earlier rounds' failures may have been
+            # resolved by a successful removal of a sibling row.
+            expired_pending = round_expired_failed
             final_rows = pass_rows
             break
         self._log(
-            "[subchart_cache] built rows=%s probe_complete=%s removed_expired=%s cutoff=%s"
+            "[subchart_cache] built rows=%s probe_complete=%s "
+            "removed_expired=%s expired_pending=%s cutoff=%s"
             % (
                 len(final_rows),
                 int(probe_complete),
                 removed_expired,
+                expired_pending,
                 cutoff.isoformat() if cutoff else "-",
             )
         )
@@ -2266,6 +2272,7 @@ class PlaywrightCDPAutomator(TVAutomator):
             rows=final_rows,
             probe_complete=probe_complete,
             removed_expired=removed_expired,
+            expired_pending=expired_pending,
         )
 
     async def _append_created_row_to_subchart_cache(

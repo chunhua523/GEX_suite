@@ -1918,8 +1918,27 @@ class TradingViewPage(QWidget):
                         subchart_cache = await automator.build_weekly_gex_subchart_cache(
                             keep_mondays=keep_mondays,
                         )
-                        if org_cleanup and subchart_cache.removed_expired > 0:
-                            layout_modified = True
+                        if org_cleanup:
+                            removed = subchart_cache.removed_expired
+                            pending = subchart_cache.expired_pending
+                            if removed > 0:
+                                layout_modified = True
+                            if removed > 0 or pending > 0:
+                                u = str(post.get("url") or "—")
+                                cutoff_iso = keep_mondays[0].isoformat() if keep_mondays else "—"
+                                self._exec_log(
+                                    f"【清理｜寫入前】版面={layout.name} URL={u} 子圖#{sub.index} "
+                                    f"圖上={chosen} ticker={target_ticker}\n"
+                                    f"  cutoff={cutoff_iso}｜已移除 {removed} 個過期指標"
+                                    + (f"｜未能刪除 {pending} 個" if pending > 0 else "")
+                                )
+                            if pending > 0:
+                                u = str(post.get("url") or "—")
+                                self._exec_log(
+                                    f"【清理失敗｜DOM】版面={layout.name} URL={u} 子圖#{sub.index} "
+                                    f"圖上={chosen} ticker={target_ticker}\n"
+                                    f"  原因：Properties 對話框已開啟但 Delete 按鈕未生效（{pending} 個過期指標仍在）"
+                                )
                         for monday in mondays:
                             if self._batch_should_stop():
                                 self._exec_log("【已停止】使用者中止批次。")
