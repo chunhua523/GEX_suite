@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 import secrets
 import re
@@ -1672,6 +1672,13 @@ class PlaywrightCDPAutomator(TVAutomator):
         return parsed.isoformat()
 
     @staticmethod
+    def _canonical_week_monday(d: date) -> date:
+        # Futures rows are written with Start date = trading-week Monday − 1 (Sunday 18:00).
+        # When comparing a row's stored date to a Monday cutoff, treat Sunday as the
+        # following Monday so legitimate futures rows are not deleted as "expired".
+        return d + timedelta(days=1) if d.weekday() == 6 else d
+
+    @staticmethod
     def _tokens_match_in_order(text: str, tokens: list[str]) -> bool:
         if not text or not tokens:
             return False
@@ -2213,7 +2220,10 @@ class PlaywrightCDPAutomator(TVAutomator):
                         row_monday = date.fromisoformat(normalized)
                     except ValueError:
                         row_monday = None
-                if cutoff is not None and row_monday is not None and row_monday < cutoff:
+                row_canonical = (
+                    self._canonical_week_monday(row_monday) if row_monday else None
+                )
+                if cutoff is not None and row_canonical is not None and row_canonical < cutoff:
                     # Close the Properties dialog first, then reuse the same
                     # row-locator removal helper as the dedicated cleanup
                     # button. The earlier inline path tried to click a
@@ -2723,7 +2733,10 @@ class PlaywrightCDPAutomator(TVAutomator):
         if len(keep_sorted) > 0 and len(retained_mondays) > len(keep_sorted):
             retained_mondays = retained_mondays[-len(keep_sorted):]
 
-        stale_exists = bool(cutoff and any(m < cutoff for m in snapshots.keys()))
+        stale_exists = bool(
+            cutoff
+            and any(self._canonical_week_monday(m) < cutoff for m in snapshots.keys())
+        )
         duplicate_rows = before_rows > len(snapshots)
         needs_reorder = before_rows > 1
         needs_cleanup = stale_exists or duplicate_rows or needs_reorder
@@ -2866,7 +2879,7 @@ class PlaywrightCDPAutomator(TVAutomator):
                     row_monday = date.fromisoformat(normalized)
                 except ValueError:
                     continue
-                if row_monday >= cutoff:
+                if self._canonical_week_monday(row_monday) >= cutoff:
                     continue
                 deleted = await self._remove_indicator_by_locator(cand, title_keyword)
                 if deleted:
@@ -4059,8 +4072,16 @@ class PlaywrightCDPAutomator(TVAutomator):
             if input_box is None:
                 await self._dump_dom(f"day_input_missing_{day.lower()}")
                 raise RuntimeError(f"Could not find {day} input in WEEKLY GEX LEVELS.")
-            await self._fill_input_value(input_box, code or "")
+            target_value = code or ""
+            await self._fill_input_value(input_box, target_value)
             await page.wait_for_timeout(80)
+            try:
+                actual = await input_box.input_value(timeout=600)
+            except Exception:
+                actual = None
+            if (actual or "") != target_value:
+                await self._fill_input_value(input_box, target_value)
+                await page.wait_for_timeout(80)
             if code is not None:
                 filled.append(day)
         return filled
@@ -4571,8 +4592,41 @@ class PlaywrightCDPAutomator(TVAutomator):
         return None
 
     async def _fill_input_value(self, target, value: str) -> None:
+        """Set input ``value`` via JS valueSetter; fall back to keystroke.
+
+        Why:逐字 ``keyboard.type`` 在 TV Code 等長字串會肉眼可見地慢
+        （N 個 keydown/keyup 事件）。改走 React-friendly 的 valueSetter
+        + dispatch input/change/blur，幾乎瞬間完成；只有當 DOM 讀回
+        對不上時才回退到原本的鍵盤模擬。
+        """
         page = self._require_page()
         await target.scroll_into_view_if_needed()
+        try:
+            ok = await target.evaluate(
+                """
+                (el, val) => {
+                  if (!(el instanceof HTMLInputElement)) return false;
+                  const setter = Object.getOwnPropertyDescriptor(
+                    HTMLInputElement.prototype,
+                    "value"
+                  )?.set;
+                  if (!setter) return false;
+                  el.focus();
+                  setter.call(el, val);
+                  el.dispatchEvent(new Event("input", { bubbles: true }));
+                  el.dispatchEvent(new Event("change", { bubbles: true }));
+                  el.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+                  el.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", bubbles: true }));
+                  el.dispatchEvent(new Event("blur", { bubbles: true }));
+                  return el.value === val;
+                }
+                """,
+                value,
+            )
+            if ok:
+                return
+        except Exception:
+            pass
         await target.click()
         await page.keyboard.press("Control+A")
         await page.keyboard.type(value, delay=0)
@@ -4941,9 +4995,66 @@ class PlaywrightCDPAutomator(TVAutomator):
         return await dialog.count() > 0
 
     async def _read_current_layout_name(self) -> str | None:
-        """Best-effort read current layout name from header toolbar control."""
+        """Best-effort read current layout name from header toolbar control.
+
+        TV's save/load button wraps the layout name in
+        ``<div class="js-button-text ..."><div class="textWrap-..."><span>NAME</span>
+        <span class="stateTitle-... hidden-...">Save</span></div></div>``.
+        The hash-suffixed class names shift between releases, so the JS path
+        scopes by container selectors first then falls back to the stable
+        ``js-button-text`` JS-hook class, skipping any state-indicator span.
+        """
         page = self._require_page()
+        try:
+            raw = await page.evaluate(
+                """
+                () => {
+                  const stateRe = /stateTitle|hidden/i;
+                  const pickText = (container) => {
+                    if (!container) return null;
+                    const wrapper = container.querySelector('[class*="js-button-text"]')
+                      || container;
+                    const spans = wrapper.querySelectorAll('span');
+                    for (const sp of spans) {
+                      const cls = (sp.className && sp.className.toString) ? sp.className.toString() : '';
+                      if (stateRe.test(cls)) continue;
+                      const t = (sp.innerText || sp.textContent || '').trim();
+                      if (t) return t;
+                    }
+                    return null;
+                  };
+                  const containerSelectors = [
+                    "[data-name='header-toolbar-save-load']",
+                    "#header-toolbar-save-load",
+                    "[data-name='header-toolbar-layouts']",
+                    "#header-toolbar-layouts",
+                    "button[aria-label*='Layout']",
+                    "button[aria-label*='Save']",
+                    "button[aria-label*='版面']",
+                    "button[aria-label*='佈局']",
+                  ];
+                  for (const sel of containerSelectors) {
+                    const found = pickText(document.querySelector(sel));
+                    if (found) return found;
+                  }
+                  const wrappers = document.querySelectorAll('[class*="js-button-text"]');
+                  for (const w of wrappers) {
+                    const found = pickText(w);
+                    if (found) return found;
+                  }
+                  return null;
+                }
+                """
+            )
+        except Exception:
+            raw = None
+        cleaned = self._clean_layout_name_text(raw)
+        if cleaned:
+            return cleaned
+        # Fallback: original locator-based read for environments where
+        # page.evaluate is blocked or the JS hook class is absent.
         selectors = [
+            "[data-name='header-toolbar-save-load']",
             "[data-name='header-toolbar-layouts']",
             "#header-toolbar-layouts",
             "button[aria-label*='Layout setup']",
@@ -4969,6 +5080,11 @@ class PlaywrightCDPAutomator(TVAutomator):
             cleaned_aria = self._clean_layout_name_text(aria)
             if cleaned_aria:
                 return cleaned_aria
+        try:
+            await self._dump_dom("layout_name_read_failed")
+        except Exception:
+            pass
+        self._log("[layout_name] read failed — all selectors empty")
         return None
 
     @staticmethod
