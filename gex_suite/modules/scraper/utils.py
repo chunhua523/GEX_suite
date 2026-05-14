@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+import time
 from datetime import datetime
 
 def setup_logging(log_widget=None):
@@ -60,10 +61,25 @@ def load_tickers_with_groups(filepath):
     
     if not os.path.exists(filepath):
         return {"Default": []}
-    
+
+    # Google Drive CloudStorage paths can briefly raise Errno 11 (EDEADLK) while
+    # the desktop client syncs the file. Retry a few times before giving up.
+    content = None
+    last_err = None
+    for attempt in range(5):
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+            break
+        except OSError as e:
+            last_err = e
+            if attempt < 4:
+                time.sleep(2 ** attempt)  # 1s, 2s, 4s, 8s
+    if content is None:
+        print(f"Error loading ticker file {filepath}: {last_err} (after 5 retries)")
+        return {"Default": []}
+
     try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            content = f.read().strip()
             
         # Try to parse as JSON first
         try:
