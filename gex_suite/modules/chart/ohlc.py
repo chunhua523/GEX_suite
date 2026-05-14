@@ -2,12 +2,23 @@
 from __future__ import annotations
 
 import datetime as _dt
+import math
 from typing import Optional
 
 import pandas as pd
 import yfinance as yf
 
 from gex_suite.shared import db
+
+
+def _safe_float(value) -> Optional[float]:
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(f) or math.isinf(f):
+        return None
+    return f
 
 
 def _yf_name(ticker: str) -> str:
@@ -53,12 +64,16 @@ def update_ohlc_for_date(date: _dt.date) -> int:
         try:
             row = data.iloc[0]
             ohlc = {
-                "Open": float(row["Open"]),
-                "High": float(row["High"]),
-                "Low": float(row["Low"]),
-                "Close": float(row["Close"]),
+                "Open": _safe_float(row["Open"]),
+                "High": _safe_float(row["High"]),
+                "Low": _safe_float(row["Low"]),
+                "Close": _safe_float(row["Close"]),
             }
         except (IndexError, KeyError, ValueError):
+            continue
+        if any(v is None for v in ohlc.values()):
+            # yfinance returned NaN for at least one OHLC field — skip rather
+            # than partial-write or trip the DB's NOT NULL constraint.
             continue
         db.delete_ohlc(t, str(date))
         for label, value in ohlc.items():
@@ -86,11 +101,13 @@ def update_ohlc_range(ticker: str, start: str, end: str) -> int:
     for idx, row in data.iterrows():
         date_str = idx.date().isoformat()
         ohlc = {
-            "Open": float(row["Open"]),
-            "High": float(row["High"]),
-            "Low": float(row["Low"]),
-            "Close": float(row["Close"]),
+            "Open": _safe_float(row["Open"]),
+            "High": _safe_float(row["High"]),
+            "Low": _safe_float(row["Low"]),
+            "Close": _safe_float(row["Close"]),
         }
+        if any(v is None for v in ohlc.values()):
+            continue
         db.delete_ohlc(ticker, date_str)
         for label, value in ohlc.items():
             db.upsert(ticker, date_str, label, value)
