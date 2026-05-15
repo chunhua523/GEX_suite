@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+import html as html_lib
 import os
 from pathlib import Path
 import re
@@ -19,8 +20,8 @@ import tempfile
 import time
 from urllib import request
 
-from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtCore import Qt, QThread, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -42,18 +43,21 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from gex_suite.shared import config as shared_config
 from gex_suite.shared import db
+from gex_suite.shared.paths import TRADINGVIEW_LOG_DIR
 from .automator import (
     IndicatorQuotaExceededError,
     LayoutInfo,
     PlaywrightCDPAutomator,
     WeeklyGexSubchartCache,
 )
+from .run_log import SEVERITY_CSS, TVRunLogWriter, latest_log_path, new_log_path
 from .engine import (
     BatchOptions,
     BatchReport,
@@ -129,6 +133,10 @@ _PREVIEW_COL_CHART_URL = 1
 _PREVIEW_URL_DISPLAY_MAX = 36
 
 
+def datetime_now_hms() -> str:
+    return datetime.now().strftime("%H:%M:%S")
+
+
 class _PhaseBScanThread(QThread):
     """Runs ``_phase_b_scan_flow`` on a dedicated event loop so the UI stays responsive."""
 
@@ -184,10 +192,12 @@ class TradingViewPage(QWidget):
     """Main TradingView helper page（批次 GEX 與手動檢視／複製 TV code）。"""
 
     _marshal_log = Signal(str)
+    _marshal_event = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._marshal_log.connect(self._exec_log_main_thread)
+        self._marshal_event.connect(self._log_event_main_thread)
         db.init_db()
 
         outer = QVBoxLayout(self)
@@ -309,6 +319,12 @@ class TradingViewPage(QWidget):
         self.b_phase_b_cleanup.setToolTip("刪除週起始早於近四週視窗的 Daily & Weekly GEX（不新增、不重填）")
         self.b_phase_b_cleanup.clicked.connect(self._on_phase_b_cleanup)
         row_btn2.addWidget(self.b_phase_b_cleanup)
+
+        self.b_open_log = QPushButton("🔍 開啟最新 log")
+        self.b_open_log.setToolTip("用瀏覽器開啟本次（或最近一次）執行的完整 HTML log")
+        self.b_open_log.setEnabled(False)
+        self.b_open_log.clicked.connect(self._on_open_latest_log)
+        row_btn2.addWidget(self.b_open_log)
         row_btn2.addStretch(1)
         gr.addLayout(row_btn2)
         batch_root.addWidget(grp_run)
@@ -405,10 +421,17 @@ class TradingViewPage(QWidget):
         outer.addWidget(self.progress)
 
         outer.addWidget(QLabel("執行紀錄（精簡）"))
-        self.log_box = QPlainTextEdit()
+        self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
         self.log_box.setMinimumHeight(160)
+        self.log_box.setAcceptRichText(True)
         self.log_box.setPlaceholderText("每次執行會清空並只保留版面、URL、ticker、更新／新增／刪除等摘要…")
+        # 暗主題等寬字 + 防止累積過慢
+        self.log_box.setStyleSheet(
+            "QTextEdit { background-color: #0d1117; color: #e6edf3; "
+            "font-family: 'SF Mono', 'Menlo', monospace; font-size: 12px; }"
+        )
+        self.log_box.document().setMaximumBlockCount(2000)
         outer.addWidget(self.log_box)
 
         self._reload_tickers()
@@ -426,7 +449,38 @@ class TradingViewPage(QWidget):
         self._cleanup_thread: _AsyncCoroThread | None = None
         self._open_urls_thread: _AsyncCoroThread | None = None
 
+        # Run-log state
+        self._run_log_writer: TVRunLogWriter | None = None
+        self._latest_log_path: Path | None = None
+        # Pre-populate "open latest" pointer from prior session if available
+        existing = latest_log_path(TRADINGVIEW_LOG_DIR)
+        if existing is not None:
+            self._latest_log_path = existing
+            if hasattr(self, "b_open_log"):
+                self.b_open_log.setEnabled(True)
+
     # ---------- 執行紀錄（產品向精簡） ----------
+    _SEVERITY_BY_TAG_PREFIX: tuple[tuple[str, str], ...] = (
+        # Order matters: longer / more specific prefixes first.
+        ("【完成】", "done"),
+        ("【摘要】", "summary"),
+        ("【預覽", "preview"),
+        ("【已停止】", "stop"),
+        ("【中止】", "stop"),
+        ("【Stop】", "stop"),
+        ("【略過", "skip"),
+        ("【失敗", "error"),
+        ("【整理失敗", "error"),
+        ("【清理失敗", "error"),
+        ("【批次失敗】", "error"),
+        ("【警告】", "warn"),
+        ("【注意", "warn"),
+        ("【重試後成功】", "done"),
+        ("【已儲存版面】", "done"),
+        ("【刪除過期指標】", "info"),
+        ("【清理｜寫入前】", "info"),
+    )
+
     def _exec_log_clear(self) -> None:
         self.log_box.clear()
 
@@ -437,10 +491,335 @@ class TradingViewPage(QWidget):
         self._exec_log_main_thread(message)
 
     def _exec_log_main_thread(self, message: str) -> None:
+        """Free-form fallback. Routes through the structured dispatcher.
+
+        Used by existing call sites that pass a complete multi-line string.
+        Detects the leading `【…】` sentinel to colour the UI line and writes
+        the full original text to the disk log as detail.
+        """
         text = (message or "").rstrip()
-        if text:
-            self.log_box.appendPlainText(text)
+        if not text:
+            QApplication.processEvents()
+            return
+        self._dispatch_freeform(text)
         QApplication.processEvents()
+
+    def _infer_severity(self, first_line: str) -> tuple[str, str]:
+        """Return ``(severity, tag)`` from a leading `【…】` sentinel.
+
+        ``tag`` is the bracket content (without the `【】`); empty if no sentinel.
+        """
+        m = re.match(r"^【([^】]+)】", first_line)
+        tag = m.group(1) if m else ""
+        for prefix, sev in self._SEVERITY_BY_TAG_PREFIX:
+            if first_line.startswith(prefix):
+                return sev, tag
+        return ("info", tag)
+
+    def _dispatch_freeform(self, text: str) -> None:
+        """Render a free-form message (potentially multi-line) as one UI line
+        + write the full text as a disk event."""
+        lines = text.splitlines()
+        first = lines[0] if lines else ""
+        rest = "\n".join(lines[1:]).strip() if len(lines) > 1 else ""
+        severity, tag = self._infer_severity(first)
+
+        # UI: collapse to one line — keep first line as-is (it already carries
+        # the 【…】sentinel); reason / detail goes only to disk.
+        ui_line = first.strip()
+        self._append_ui_line(severity, ui_line, is_raw=True)
+
+        # Disk: write the full original text so detail is preserved.
+        if self._run_log_writer is not None:
+            try:
+                # If there is a 【…】 prefix, strip it from msg to avoid double-prefix.
+                if tag and first.startswith(f"【{tag}】"):
+                    msg = first[len(f"【{tag}】"):].lstrip()
+                else:
+                    msg = first
+                self._run_log_writer.event(
+                    severity=severity,
+                    tag=tag or "info",
+                    text=msg,
+                    detail=rest or None,
+                )
+            except Exception:
+                pass  # never let logging break the batch
+
+    def _append_ui_line(
+        self,
+        severity: str,
+        body: str,
+        *,
+        is_raw: bool = False,
+    ) -> None:
+        """Append one HTML-coloured line to log_box.
+
+        ``is_raw=True`` means *body* already contains the 【…】 prefix; the
+        method splits it off so the tag can be coloured independently. When
+        ``is_raw=False`` the caller is the structured API and supplies the
+        tag separately via ``_append_ui_structured``.
+        """
+        color = SEVERITY_CSS.get(severity, SEVERITY_CSS["info"])
+        body_esc = html_lib.escape(body, quote=False)
+        if is_raw:
+            m = re.match(r"^【([^】]+)】\s*(.*)$", body)
+            if m:
+                tag = html_lib.escape(m.group(1), quote=False)
+                msg = html_lib.escape(m.group(2), quote=False)
+                line = (
+                    f"<span style=\"color:#6e7681\">[{datetime_now_hms()}]</span> "
+                    f"<span style=\"color:{color};font-weight:600\">【{tag}】</span> "
+                    f"<span>{msg}</span>"
+                )
+            else:
+                line = (
+                    f"<span style=\"color:#6e7681\">[{datetime_now_hms()}]</span> "
+                    f"<span>{body_esc}</span>"
+                )
+        else:
+            # body is already pre-formatted by caller
+            line = body
+        self.log_box.append(line)
+
+    def _log_event(
+        self,
+        severity: str,
+        tag: str,
+        text: str,
+        *,
+        layout: str | None = None,
+        subchart: int | None = None,
+        ticker: str | None = None,
+        detail: str | None = None,
+    ) -> None:
+        """Structured log event. Single coloured line in UI + full disk write.
+
+        Thread-safe: from a worker thread, marshals the payload (preserving
+        all structured fields) via ``_marshal_event``.
+        """
+        payload = {
+            "severity": severity,
+            "tag": tag,
+            "text": text,
+            "layout": layout,
+            "subchart": subchart,
+            "ticker": ticker,
+            "detail": detail,
+        }
+        if QThread.currentThread() is not self.thread():
+            self._marshal_event.emit(payload)
+            return
+        self._log_event_main_thread(payload)
+
+    def _log_event_main_thread(self, payload: dict) -> None:
+        if payload.get("tag") == "__begin_layout__":
+            self._handle_begin_layout(payload)
+            return
+        if payload.get("tag") == "__layout_header__":
+            self._emit_layout_header(
+                name=payload.get("layout") or payload.get("text") or "",
+                mode=payload.get("_layout_mode"),
+                url=payload.get("_layout_url"),
+            )
+            return
+        if payload.get("tag") == "__set_layout_total__":
+            self._handle_set_layout_total(payload)
+            return
+        severity = payload.get("severity") or "info"
+        tag = payload.get("tag") or "info"
+        text = payload.get("text") or ""
+        subchart = payload.get("subchart")
+        ticker = payload.get("ticker")
+        detail = payload.get("detail")
+
+        color = SEVERITY_CSS.get(severity, SEVERITY_CSS["info"])
+        sub_html = ""
+        if subchart is not None or ticker:
+            bits = []
+            if subchart is not None:
+                bits.append(f"#{subchart}")
+            if ticker:
+                bits.append(html_lib.escape(str(ticker), quote=False))
+            sub_html = f" <span style=\"color:#8b949e\">{' '.join(bits)}</span>"
+        line = (
+            f"<span style=\"color:#6e7681\">[{datetime_now_hms()}]</span> "
+            f"<span style=\"color:{color};font-weight:600\">"
+            f"【{html_lib.escape(tag, quote=False)}】</span>"
+            f"{sub_html} "
+            f"<span>{html_lib.escape(text, quote=False)}</span>"
+        )
+        self.log_box.append(line)
+        QApplication.processEvents()
+
+        if self._run_log_writer is not None:
+            try:
+                self._run_log_writer.event(
+                    severity=severity,
+                    tag=tag,
+                    text=text,
+                    subchart=subchart,
+                    ticker=ticker,
+                    detail=detail,
+                )
+            except Exception:
+                pass
+
+    # ---------- run-log lifecycle ----------
+    def _begin_run_log(self, kind: str, *, title_suffix: str = "") -> None:
+        """Open a new disk log file and enable the open-latest button."""
+        try:
+            TRADINGVIEW_LOG_DIR.mkdir(parents=True, exist_ok=True)
+            path = new_log_path(TRADINGVIEW_LOG_DIR, kind)
+            title = f"TradingView Run Log — {kind}"
+            if title_suffix:
+                title = f"{title} ({title_suffix})"
+            writer = TVRunLogWriter(path, title)
+            writer.open()
+            self._run_log_writer = writer
+            self._latest_log_path = path
+            if hasattr(self, "b_open_log"):
+                self.b_open_log.setEnabled(True)
+        except Exception:
+            self._run_log_writer = None  # disk log is best-effort
+
+    def _end_run_log(self, summary: dict | None = None) -> None:
+        """Close current writer (no-op if not open)."""
+        writer = self._run_log_writer
+        self._run_log_writer = None
+        if writer is None:
+            return
+        try:
+            writer.close(summary)
+        except Exception:
+            pass
+
+    def _set_layout_total_in_log(self, total: int) -> None:
+        """Record total layouts intended to scan; rendered in top summary."""
+        payload = {
+            "severity": "info",
+            "tag": "__set_layout_total__",
+            "text": "",
+            "layout": None,
+            "subchart": None,
+            "ticker": None,
+            "detail": None,
+            "_layout_total": int(total),
+        }
+        if QThread.currentThread() is not self.thread():
+            self._marshal_event.emit(payload)
+            return
+        self._handle_set_layout_total(payload)
+
+    def _handle_set_layout_total(self, payload: dict) -> None:
+        if self._run_log_writer is None:
+            return
+        try:
+            self._run_log_writer.set_layout_total(int(payload.get("_layout_total") or 0))
+        except Exception:
+            pass
+
+    def _emit_layout_header(
+        self,
+        *,
+        name: str,
+        mode: str | None = None,
+        url: str | None = None,
+    ) -> None:
+        """One-line UI header + open a new <details> block in disk log."""
+        if QThread.currentThread() is not self.thread():
+            payload = {
+                "severity": "info",
+                "tag": "__layout_header__",
+                "text": name or "",
+                "layout": name,
+                "subchart": None,
+                "ticker": None,
+                "detail": None,
+                "_layout_mode": mode,
+                "_layout_url": url,
+            }
+            self._marshal_event.emit(payload)
+            return
+        # UI line
+        parts = [f"▸ 版面「{html_lib.escape(name or '', quote=False)}」"]
+        if mode:
+            parts.append(html_lib.escape(mode, quote=False))
+        if url:
+            parts.append(f"<span style=\"color:#6e7681\">{html_lib.escape(url, quote=False)}</span>")
+        line = (
+            f"<span style=\"color:#6e7681\">[{datetime_now_hms()}]</span> "
+            f"<span style=\"color:#79c0ff;font-weight:600\">{parts[0]}</span>"
+            + ("　" + "　".join(parts[1:]) if len(parts) > 1 else "")
+        )
+        self.log_box.append(line)
+        QApplication.processEvents()
+        # Disk: open a new <details> block
+        if self._run_log_writer is not None:
+            try:
+                self._run_log_writer.begin_layout(name, mode=mode, url=url)
+            except Exception:
+                pass
+
+    def _begin_layout_in_log(
+        self,
+        name: str,
+        *,
+        mode: str | None = None,
+        url: str | None = None,
+    ) -> None:
+        # Marshalled through the same channel as events to avoid touching the
+        # writer from a worker thread.
+        payload = {
+            "severity": "info",
+            "tag": "__begin_layout__",
+            "text": name or "",
+            "layout": name,
+            "subchart": None,
+            "ticker": None,
+            "detail": None,
+            "_layout_mode": mode,
+            "_layout_url": url,
+        }
+        if QThread.currentThread() is not self.thread():
+            self._marshal_event.emit(payload)
+            return
+        self._handle_begin_layout(payload)
+
+    def _handle_begin_layout(self, payload: dict) -> None:
+        if self._run_log_writer is None:
+            return
+        try:
+            self._run_log_writer.begin_layout(
+                payload.get("layout") or payload.get("text") or "",
+                mode=payload.get("_layout_mode"),
+                url=payload.get("_layout_url"),
+            )
+        except Exception:
+            pass
+
+    # ---------- open-latest-log handler ----------
+    def _on_open_latest_log(self) -> None:
+        path = self._latest_log_path
+        if path is None or not Path(path).exists():
+            # Try a fresh scan in case the writer dir gained a file from another run.
+            path = latest_log_path(TRADINGVIEW_LOG_DIR)
+            if path is None:
+                QMessageBox.information(
+                    self,
+                    "尚無 log",
+                    "目前還沒有任何執行紀錄。\n跑一次「開始執行」、「預覽」或「整理」後再試。",
+                )
+                return
+            self._latest_log_path = path
+        try:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        except Exception:
+            try:
+                opener = "open" if sys.platform == "darwin" else "xdg-open"
+                subprocess.Popen([opener, str(path)])
+            except Exception as exc:
+                QMessageBox.warning(self, "無法開啟 log", f"{exc}")
 
     def _batch_should_stop(self) -> bool:
         return bool(self._cancel_batch_scan)
@@ -823,6 +1202,8 @@ class TradingViewPage(QWidget):
         self.b_stop.setEnabled(True)
         self.progress.setValue(0)
         self._exec_log_clear()
+        ticker_for_title = (opts.ticker or "all") if opts.ticker_scope == "ticker" else "all"
+        self._begin_run_log("scan", title_suffix=f"ticker={ticker_for_title}")
         if opts.ticker_scope == "all":
             self._exec_log(
                 "── 批次執行 ──\n"
@@ -884,6 +1265,7 @@ class TradingViewPage(QWidget):
         self.b_phase_b_cleanup.setEnabled(True)
         self._cancel_batch_scan = False
         self._scan_thread = None
+        self._end_run_log()
 
     def _on_phase_b_preview(self) -> None:
         opts = self._build_batch_options()
@@ -895,6 +1277,8 @@ class TradingViewPage(QWidget):
         self.b_stop.setEnabled(True)
         self._last_phase_b_layout_list_degraded = False
         self._exec_log_clear()
+        ticker_for_title = (opts.ticker or "all") if opts.ticker_scope == "ticker" else "all"
+        self._begin_run_log("preview", title_suffix=f"ticker={ticker_for_title}")
         if opts.ticker_scope == "all":
             self._exec_log(
                 f"── 預覽（不寫入）── ticker 範圍={opts.ticker_scope} 版面={opts.layout_scope}"
@@ -950,6 +1334,7 @@ class TradingViewPage(QWidget):
         self._cancel_batch_scan = False
         self.b_phase_b_preview.setEnabled(True)
         self._preview_thread = None
+        self._end_run_log()
 
     def _on_phase_b_cleanup(self) -> None:
         opts = self._build_batch_options()
@@ -961,6 +1346,8 @@ class TradingViewPage(QWidget):
         self.progress.setValue(0)
         self._last_phase_b_layout_list_degraded = False
         self._exec_log_clear()
+        ticker_for_title = (opts.ticker or "all") if opts.ticker_scope == "ticker" else "all"
+        self._begin_run_log("cleanup", title_suffix=f"ticker={ticker_for_title}")
         if opts.ticker_scope == "all":
             self._exec_log(
                 f"── 整理過期 GEX 指標 ──\n"
@@ -1003,6 +1390,7 @@ class TradingViewPage(QWidget):
         self.b_phase_b_cleanup.setEnabled(True)
         self.b_phase_b.setEnabled(True)
         self._cleanup_thread = None
+        self._end_run_log()
 
     async def _apply_work_item_with_automator(
         self,
@@ -1098,9 +1486,17 @@ class TradingViewPage(QWidget):
                     }
                     if all(code is None for code in missing_only_codes.values()):
                         u = await _page_url()
-                        self._exec_log(
-                            f"【略過｜快取】版面={layout_label} URL={u} 子圖#{sub_txt} 圖上={sym_txt} "
-                            f"ticker={ticker} 週一起={monday}\n  原因：該週可填欄位皆已有值（子圖載入前掃描）"
+                        self._log_event(
+                            "skip",
+                            "略過｜快取",
+                            f"週一起={monday}",
+                            layout=layout_label,
+                            subchart=int(sub_txt) if str(sub_txt).isdigit() else None,
+                            ticker=ticker,
+                            detail=(
+                                f"URL={u}\n圖上={sym_txt}\nticker={ticker}\n"
+                                f"週一起={monday}\n原因：該週可填欄位皆已有值（子圖載入前掃描）"
+                            ),
                         )
                         rit = (
                             replace(item, preview_status="略過：子圖快取顯示該週欄位已有值")
@@ -1116,9 +1512,17 @@ class TradingViewPage(QWidget):
                         planned = [d for d in _DAY_ORDER if missing_only_codes.get(d)]
                         fills = self._abbr_weekday_labels(planned)
                         u = await _page_url()
-                        self._exec_log(
-                            f"【預覽｜快取】版面={layout_label} URL={u} 子圖#{sub_txt} 圖上={sym_txt} "
-                            f"ticker={ticker} 週一起={monday}\n  執行時將填：{fills}"
+                        self._log_event(
+                            "preview",
+                            "預覽｜快取",
+                            f"週一起={monday} 將填 {fills}",
+                            layout=layout_label,
+                            subchart=int(sub_txt) if str(sub_txt).isdigit() else None,
+                            ticker=ticker,
+                            detail=(
+                                f"URL={u}\n圖上={sym_txt}\nticker={ticker}\n"
+                                f"週一起={monday}\n執行時將填：{fills}"
+                            ),
                         )
                         return BatchResultItem(
                             item=replace(item, preview_status=f"預覽：執行將填 {fills}"),
@@ -1135,9 +1539,17 @@ class TradingViewPage(QWidget):
                 u = await _page_url()
                 planned = [d for d in _DAY_ORDER if (codes.get(d) or "").strip()]
                 fills = self._abbr_weekday_labels(planned)
-                self._exec_log(
-                    f"【預覽】版面={layout_label} URL={u} 子圖#{sub_txt} 圖上={sym_txt} "
-                    f"ticker={ticker} 週一起={monday}\n  將新增指標並填：{fills}"
+                self._log_event(
+                    "preview",
+                    "預覽",
+                    f"週一起={monday} 新增指標並填 {fills}",
+                    layout=layout_label,
+                    subchart=int(sub_txt) if str(sub_txt).isdigit() else None,
+                    ticker=ticker,
+                    detail=(
+                        f"URL={u}\n圖上={sym_txt}\nticker={ticker}\n"
+                        f"週一起={monday}\n將新增指標並填：{fills}"
+                    ),
                 )
                 return BatchResultItem(
                     item=replace(
@@ -1158,9 +1570,14 @@ class TradingViewPage(QWidget):
                         f"expected={expected_start}, opened={opened_start}"
                     )
                     u = await _page_url()
-                    self._exec_log(
-                        f"【失敗｜週期不符】版面={layout_label} URL={u} 子圖#{sub_txt} "
-                        f"ticker={ticker} 週一起={monday}\n  原因：{msg}"
+                    self._log_event(
+                        "error",
+                        "失敗｜週期不符",
+                        f"週一起={monday} expected={expected_start} opened={opened_start}",
+                        layout=layout_label,
+                        subchart=int(sub_txt) if str(sub_txt).isdigit() else None,
+                        ticker=ticker,
+                        detail=f"URL={u}\nticker={ticker}\n週一起={monday}\n原因：{msg}",
                     )
                     rit = replace(item, preview_status=f"失敗：{msg}") if dry_run else item
                     return BatchResultItem(item=rit, status="failed", message=msg)
@@ -1202,17 +1619,27 @@ class TradingViewPage(QWidget):
                             f"expected={expected_date} {expected_time}, got={got_date or '-'} {got_time or '-'}"
                         )
                         u = await _page_url()
-                        self._exec_log(
-                            f"【失敗｜起始時間】版面={layout_label} URL={u} ticker={ticker} 週一起={monday}\n"
-                            f"  原因：{msg}"
+                        self._log_event(
+                            "error",
+                            "失敗｜起始時間",
+                            f"預覽 週一起={monday} expected={expected_date} {expected_time} got={got_date or '-'} {got_time or '-'}",
+                            layout=layout_label,
+                            subchart=int(sub_txt) if str(sub_txt).isdigit() else None,
+                            ticker=ticker,
+                            detail=f"URL={u}\nticker={ticker}\n週一起={monday}\n原因：{msg}",
                         )
                         rit = replace(item, preview_status=f"失敗：{msg}")
                         return BatchResultItem(item=rit, status="failed", message=msg)
                     await automator.close_settings(save=False)
                     u = await _page_url()
-                    self._exec_log(
-                        f"【預覽】版面={layout_label} URL={u} 子圖#{sub_txt} ticker={ticker} 週一起={monday}\n"
-                        f"  執行時將填：{fills}"
+                    self._log_event(
+                        "preview",
+                        "預覽",
+                        f"週一起={monday} 將填 {fills}",
+                        layout=layout_label,
+                        subchart=int(sub_txt) if str(sub_txt).isdigit() else None,
+                        ticker=ticker,
+                        detail=f"URL={u}\nticker={ticker}\n週一起={monday}\n執行時將填：{fills}",
                     )
                     return BatchResultItem(
                         item=replace(
@@ -1236,8 +1663,14 @@ class TradingViewPage(QWidget):
                     f"expected={expected_date} {expected_time}, got={got_date or '-'} {got_time or '-'}"
                 )
                 u = await _page_url()
-                self._exec_log(
-                    f"【失敗｜起始時間】版面={layout_label} URL={u} ticker={ticker} 週一起={monday}\n  原因：{msg}"
+                self._log_event(
+                    "error",
+                    "失敗｜起始時間",
+                    f"週一起={monday} expected={expected_date} {expected_time} got={got_date or '-'} {got_time or '-'}",
+                    layout=layout_label,
+                    subchart=int(sub_txt) if str(sub_txt).isdigit() else None,
+                    ticker=ticker,
+                    detail=f"URL={u}\nticker={ticker}\n週一起={monday}\n原因：{msg}",
                 )
                 rit = replace(item, preview_status=f"失敗：{msg}") if dry_run else item
                 return BatchResultItem(item=rit, status="failed", message=msg)
@@ -1256,19 +1689,28 @@ class TradingViewPage(QWidget):
                 )
             else:
                 start_line = f"  週一起：{monday}  開盤時間：{indicator_start_time}  已寫入：{fills}"
-            self._exec_log(
-                f"【{verb}】\n"
-                f"  版面：{layout_label}\n"
-                f"  URL：{u}\n"
-                f"  子圖#{sub_txt} 圖上商品：{sym_txt}  DB ticker：{ticker}\n"
-                f"{start_line}"
+            self._log_event(
+                "done",
+                verb,
+                f"週一起={monday} 已寫入 {fills}",
+                layout=layout_label,
+                subchart=int(sub_txt) if str(sub_txt).isdigit() else None,
+                ticker=ticker,
+                detail=(
+                    f"URL={u}\n圖上商品：{sym_txt}  DB ticker：{ticker}\n{start_line.strip()}"
+                ),
             )
             return BatchResultItem(item=item, status="done")
         except IndicatorQuotaExceededError as exc:
             u = await _page_url()
-            self._exec_log(
-                f"【略過｜指標配額】版面={layout_label} URL={u} 子圖#{sub_txt} "
-                f"ticker={ticker} 週一起={monday}\n  原因：{exc}"
+            self._log_event(
+                "skip",
+                "略過｜指標配額",
+                f"週一起={monday}",
+                layout=layout_label,
+                subchart=int(sub_txt) if str(sub_txt).isdigit() else None,
+                ticker=ticker,
+                detail=f"URL={u}\nticker={ticker}\n週一起={monday}\n原因：{exc}",
             )
             rit = replace(item, preview_status=f"略過：{exc}") if dry_run else item
             return BatchResultItem(item=rit, status="skipped", message=f"skip_quota: {exc}")
@@ -1277,8 +1719,14 @@ class TradingViewPage(QWidget):
             err = str(exc).replace("\n", " ")
             if len(err) > 200:
                 err = err[:197] + "…"
-            self._exec_log(
-                f"【失敗】版面={layout_label} URL={u} 子圖#{sub_txt} ticker={ticker} 週一起={monday}\n  錯誤：{err}"
+            self._log_event(
+                "error",
+                "失敗",
+                f"週一起={monday} {err}",
+                layout=layout_label,
+                subchart=int(sub_txt) if str(sub_txt).isdigit() else None,
+                ticker=ticker,
+                detail=f"URL={u}\nticker={ticker}\n週一起={monday}\n錯誤：{err}",
             )
             rit = replace(item, preview_status=f"失敗：{err}") if dry_run else item
             return BatchResultItem(item=rit, status="failed", message=str(exc))
@@ -1639,23 +2087,42 @@ class TradingViewPage(QWidget):
                 keep_mondays=keep_mondays,
             )
             u = str((await automator.get_runtime_snapshot()).get("url") or "—")
-            self._exec_log(
-                f"【刪除過期指標】版面={layout_label} URL={u} 子圖#{subchart_index} "
-                f"ticker={ticker} 圖上={subchart_symbol or '—'}\n"
-                f"  刪除前 {stats.get('before', 0)} 個｜已移除 {stats.get('removed', 0)} 個｜"
-                f"其他 {stats.get('recreated', 0)} 筆調整"
+            self._log_event(
+                "done",
+                "刪除過期指標",
+                f"已移除 {stats.get('removed', 0)} 個（之前 {stats.get('before', 0)} 個）",
+                layout=layout_label,
+                subchart=subchart_index,
+                ticker=ticker,
+                detail=(
+                    f"URL={u}\n圖上={subchart_symbol or '—'}\nticker={ticker}\n"
+                    f"刪除前 {stats.get('before', 0)} 個｜已移除 {stats.get('removed', 0)} 個｜"
+                    f"其他 {stats.get('recreated', 0)} 筆調整"
+                ),
             )
             return BatchResultItem(item=item, status="done")
         except IndicatorQuotaExceededError as exc:
             u = str((await automator.get_runtime_snapshot()).get("url") or "—")
-            self._exec_log(
-                f"【略過｜指標配額】版面={layout_label} URL={u} 子圖#{subchart_index} ticker={ticker}：{exc}"
+            self._log_event(
+                "skip",
+                "略過｜指標配額",
+                f"{exc}",
+                layout=layout_label,
+                subchart=subchart_index,
+                ticker=ticker,
+                detail=f"URL={u}\nticker={ticker}\n原因：{exc}",
             )
             return BatchResultItem(item=item, status="skipped", message=f"skip_quota: {exc}")
         except Exception as exc:  # noqa: BLE001
             u = str((await automator.get_runtime_snapshot()).get("url") or "—")
-            self._exec_log(
-                f"【整理失敗】版面={layout_label} URL={u} 子圖#{subchart_index} ticker={ticker}：{exc}"
+            self._log_event(
+                "error",
+                "整理失敗",
+                f"{exc}",
+                layout=layout_label,
+                subchart=subchart_index,
+                ticker=ticker,
+                detail=f"URL={u}\nticker={ticker}\n錯誤：{exc}",
             )
             return BatchResultItem(item=item, status="failed", message=str(exc))
         finally:
@@ -1670,6 +2137,7 @@ class TradingViewPage(QWidget):
             await automator.connect()
             layouts = await self._resolve_target_layouts(automator, opts)
             self._sync_last_phase_b_layout_snap(layouts)
+            self._set_layout_total_in_log(len(layouts))
             self._warn_if_layout_list_degraded(opts)
             seen_subchart_keys: set[tuple[str, int, str]] = set()
             for layout_idx, layout in enumerate(layouts):
@@ -1685,6 +2153,7 @@ class TradingViewPage(QWidget):
                     else:
                         self._exec_log(f"【略過版面】無法載入：{layout.name}")
                         continue
+                self._begin_layout_in_log(layout.name, mode="cleanup")
                 subcharts = await self._enumerate_subcharts_with_retry(
                     automator,
                     label="整理流程",
@@ -1747,6 +2216,7 @@ class TradingViewPage(QWidget):
             mondays = sorted(compute_target_mondays(opts.weeks))
             layouts = await self._resolve_target_layouts(automator, opts)
             self._sync_last_phase_b_layout_snap(layouts)
+            self._set_layout_total_in_log(len(layouts))
             self._warn_if_layout_list_degraded(opts)
 
             try:
@@ -1794,9 +2264,11 @@ class TradingViewPage(QWidget):
                         mode_annotation = f"模式：{layout_marker_seq[0]}"
                     else:
                         mode_annotation = f"模式（依子圖序）：{', '.join(layout_marker_seq)}"
-                    self._exec_log(
-                        f"▸ 版面「{layout.name}」（{mode_annotation}）\n"
-                        f"  URL：{str(post.get('url') or '—')}"
+                    # UI gets a one-line header; HTML gets a <details> summary instead of a duplicate event
+                    self._emit_layout_header(
+                        name=layout.name,
+                        mode=mode_annotation,
+                        url=str(post.get("url") or "—"),
                     )
                 locked_layout_name = (await automator.get_current_layout_name() or "").upper()
                 if not locked_layout_name:
@@ -1857,9 +2329,14 @@ class TradingViewPage(QWidget):
                                     f"alias map 中此 symbol 在 {layout_mode} 模式下無對應 ticker"
                                     + (f"（可用模式：{', '.join(available)}）" if available else "（此 root 三種模式皆無對應，需先匯入相關資料）")
                                 )
-                            self._exec_log(
-                                f"【略過｜alias 缺項】版面={layout.name} URL={u} 子圖#{sub.index} "
-                                f"圖上={search_symbol or '—'} 模式={layout_mode}\n  原因：{reason}"
+                            self._log_event(
+                                "skip",
+                                "略過｜alias 缺項",
+                                f"{search_symbol or '—'} ({layout_mode} 無映射)",
+                                layout=layout.name,
+                                subchart=sub.index,
+                                ticker=search_symbol,
+                                detail=f"URL={u}\n模式={layout_mode}\n原因：{reason}",
                             )
                             continue
                         parsed = self._extract_ticker_from_symbol(search_symbol)
@@ -1870,18 +2347,30 @@ class TradingViewPage(QWidget):
                             )
                         else:
                             reason = f"無法從 symbol 解析出 ticker（圖上={search_symbol or '—'}）"
-                        self._exec_log(
-                            f"【略過｜未匹配】版面={layout.name} URL={u} 子圖#{sub.index} "
-                            f"圖上={search_symbol or '—'}\n  原因：{reason}"
+                        self._log_event(
+                            "skip",
+                            "略過｜未匹配",
+                            f"{search_symbol or '—'}",
+                            layout=layout.name,
+                            subchart=sub.index,
+                            ticker=search_symbol,
+                            detail=f"URL={u}\n原因：{reason}",
                         )
                         continue
                     chosen_key = (chosen.upper(), layout_mode)
                     if chosen_key in matched_keys_in_layout:
                         u = str(post.get("url") or "—")
-                        self._exec_log(
-                            f"【略過｜重複】版面={layout.name} URL={u} 子圖#{sub.index} "
-                            f"圖上={chosen} ticker={target_ticker} 模式={layout_mode}\n"
-                            f"  原因：同版面前面子圖在相同模式下已處理過此 symbol"
+                        self._log_event(
+                            "skip",
+                            "略過｜重複",
+                            f"{chosen} ({layout_mode} 同版面已處理)",
+                            layout=layout.name,
+                            subchart=sub.index,
+                            ticker=target_ticker,
+                            detail=(
+                                f"URL={u}\n圖上={chosen}\nticker={target_ticker}\n"
+                                f"模式={layout_mode}\n原因：同版面前面子圖在相同模式下已處理過此 symbol"
+                            ),
                         )
                         continue
                     matched_keys_in_layout.add(chosen_key)
@@ -1926,18 +2415,34 @@ class TradingViewPage(QWidget):
                             if removed > 0 or pending > 0:
                                 u = str(post.get("url") or "—")
                                 cutoff_iso = keep_mondays[0].isoformat() if keep_mondays else "—"
-                                self._exec_log(
-                                    f"【清理｜寫入前】版面={layout.name} URL={u} 子圖#{sub.index} "
-                                    f"圖上={chosen} ticker={target_ticker}\n"
-                                    f"  cutoff={cutoff_iso}｜已移除 {removed} 個過期指標"
-                                    + (f"｜未能刪除 {pending} 個" if pending > 0 else "")
+                                summary = f"已移除 {removed} 個過期指標"
+                                if pending > 0:
+                                    summary += f"｜未能刪除 {pending} 個"
+                                self._log_event(
+                                    "info",
+                                    "清理｜寫入前",
+                                    summary,
+                                    layout=layout.name,
+                                    subchart=sub.index,
+                                    ticker=target_ticker,
+                                    detail=(
+                                        f"URL={u}\n圖上={chosen}\nticker={target_ticker}\n"
+                                        f"cutoff={cutoff_iso}\n{summary}"
+                                    ),
                                 )
                             if pending > 0:
                                 u = str(post.get("url") or "—")
-                                self._exec_log(
-                                    f"【清理失敗｜DOM】版面={layout.name} URL={u} 子圖#{sub.index} "
-                                    f"圖上={chosen} ticker={target_ticker}\n"
-                                    f"  原因：Properties 對話框已開啟但 Delete 按鈕未生效（{pending} 個過期指標仍在）"
+                                self._log_event(
+                                    "error",
+                                    "清理失敗｜DOM",
+                                    f"{pending} 個過期指標仍在",
+                                    layout=layout.name,
+                                    subchart=sub.index,
+                                    ticker=target_ticker,
+                                    detail=(
+                                        f"URL={u}\n圖上={chosen}\nticker={target_ticker}\n"
+                                        f"原因：Properties 對話框已開啟但 Delete 按鈕未生效（{pending} 個過期指標仍在）"
+                                    ),
                                 )
                         for monday in mondays:
                             if self._batch_should_stop():
@@ -1955,10 +2460,17 @@ class TradingViewPage(QWidget):
                                         f"{(monday + timedelta(days=4))}）皆無 TV Code"
                                     )
                                 u = str(post.get("url") or "—")
-                                self._exec_log(
-                                    f"【略過｜資料庫】版面={layout.name} URL={u} 子圖#{sub.index} "
-                                    f"圖上={chosen} ticker={target_ticker} 週一起={monday}\n"
-                                    f"  原因：{reason}"
+                                self._log_event(
+                                    "skip",
+                                    "略過｜資料庫",
+                                    f"{target_ticker} 週一起={monday}",
+                                    layout=layout.name,
+                                    subchart=sub.index,
+                                    ticker=target_ticker,
+                                    detail=(
+                                        f"URL={u}\n圖上={chosen}\nticker={target_ticker}\n"
+                                        f"週一起={monday}\n原因：{reason}"
+                                    ),
                                 )
                                 continue
                             snap = await automator.get_runtime_snapshot()

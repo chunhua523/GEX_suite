@@ -8,5 +8,8 @@ version = "0.1.0"
 description = "Integrated GEX desktop suite: scraper + chart + tradingview auto-paste."
 requires-python = ">=3.10"
 
+[project.scripts]
+gex-api = "gex_suite.api.server:main"
+
 [tool.setuptools.packages.find]
 include = ["gex_suite*"]

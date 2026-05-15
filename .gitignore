@@ -23,6 +23,7 @@ gex_suite/data/scraper/.stop_requested
 gex_suite/data/suite_config.json
 gex_suite/data/tradingview/auto_paste_config.json
 gex_suite/data/tradingview/debug/
+gex_suite/data/tradingview/logs/
 
 # macOS metadata
 .DS_Store

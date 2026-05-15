@@ -26,10 +26,13 @@ SCRAPER_DATA_DIR = DATA_DIR / "scraper"
 SCRAPER_LOG_DIR = SCRAPER_DATA_DIR / "logs"
 CHART_DATA_DIR = DATA_DIR
 TRADINGVIEW_DATA_DIR = DATA_DIR / "tradingview"
+TRADINGVIEW_LOG_DIR = TRADINGVIEW_DATA_DIR / "logs"
 
 CHART_DB_PATH = DATA_DIR / "stocks.db"
 SCRAPER_SETTINGS_PATH = SCRAPER_DATA_DIR / "settings.json"
 SCRAPER_STATE_PATH = SCRAPER_DATA_DIR / "state.json"
+SCRAPER_LAST_RESULT_PATH = SCRAPER_DATA_DIR / "last_result.json"
+SCRAPER_STOP_FLAG_PATH = SCRAPER_DATA_DIR / ".stop_requested"
 SCRAPER_TICKERS_DEFAULT = SCRAPER_DATA_DIR / "tickers_index.json"
 SCRAPER_CME_TICKERS_DEFAULT = SCRAPER_DATA_DIR / "tickers_index_cme.json"
 SUITE_CONFIG_PATH = DATA_DIR / "suite_config.json"
@@ -45,6 +48,7 @@ def ensure_dirs() -> None:
         SCRAPER_DATA_DIR,
         SCRAPER_LOG_DIR,
         TRADINGVIEW_DATA_DIR,
+        TRADINGVIEW_LOG_DIR,
     ):
         p.mkdir(parents=True, exist_ok=True)
 
