@@ -18,6 +18,9 @@ import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
+
+TW_TZ = ZoneInfo("Asia/Taipei")
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from fastapi.responses import JSONResponse
@@ -167,13 +170,13 @@ def _send_webhook(message: str) -> Dict[str, Any]:
 
 def _fmt_ts(raw: Any) -> str:
     if not raw:
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S") + " TW"
     s = str(raw).strip()
     try:
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        if dt.tzinfo is not None:
-            dt = dt.astimezone()
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(TW_TZ).strftime("%Y-%m-%d %H:%M:%S") + " TW"
     except Exception:
         return s
 
@@ -578,7 +581,7 @@ def status_scraper() -> ScraperStatus:
         failed_tasks = list(_last_failed_tasks)
 
     if running and started_at:
-        status_text = f"Running ({mode}, since {started_at[:19]})"
+        status_text = f"Running ({mode}, since {_fmt_ts(started_at)})"
     elif last_result:
         status_text = "Completed" if last_result.get("success") else "Completed (with errors)"
     else:
