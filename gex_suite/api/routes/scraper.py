@@ -39,6 +39,8 @@ from ..models import (
     CancelResponse,
     LoginStatus,
     RetryResponse,
+    ScheduleModeRequest,
+    ScheduleModeResponse,
     ScheduleStatus,
     ScheduleUpdateResponse,
     ScraperStatus,
@@ -577,12 +579,16 @@ def status_scraper() -> ScraperStatus:
         schedule_enabled=bool(settings.get("schedule_enabled", False)),
         schedule_time=str(settings.get("schedule_time", "20:00")),
         timezone=str(settings.get("schedule_timezone", "local")),
+        only_scraper=bool(settings.get("schedule_only_scraper", False)),
     )
 
     with _lock:
         running = _running
         mode = _mode
         started_at = _started_at
+        if not running:
+            # Pick up scraper runs driven by gex_chain (separate process)
+            _load_last_result_from_disk()
         last_result = _last_result
         failed_tasks = list(_last_failed_tasks)
 
@@ -613,6 +619,9 @@ def status_scraper() -> ScraperStatus:
 def retry_failed() -> Any:
     with _lock:
         running = _running
+        if not running:
+            # Pick up failed_tasks from chain-driven scraper runs too.
+            _load_last_result_from_disk()
         failed = list(_last_failed_tasks)
     if running:
         return JSONResponse(status_code=409,
@@ -633,6 +642,7 @@ def get_schedule() -> ScheduleStatus:
         schedule_enabled=bool(s.get("schedule_enabled", False)),
         schedule_time=str(s.get("schedule_time", "20:00")),
         timezone=str(s.get("schedule_timezone", "local")),
+        only_scraper=bool(s.get("schedule_only_scraper", False)),
     )
 
 
@@ -660,3 +670,14 @@ def set_schedule_time(body: SetTimeRequest) -> Any:
     s["schedule_time"] = body.time
     _save_settings(s)
     return ScheduleUpdateResponse(success=True, schedule_time=body.time)
+
+
+@router.post("/schedule/mode", response_model=ScheduleModeResponse)
+def set_schedule_mode(body: ScheduleModeRequest) -> Any:
+    mode = body.mode.strip().lower()
+    if mode not in ("chain", "scraper"):
+        raise HTTPException(status_code=400, detail="mode must be 'chain' or 'scraper'")
+    s = _load_settings()
+    s["schedule_only_scraper"] = (mode == "scraper")
+    _save_settings(s)
+    return ScheduleModeResponse(success=True, mode=mode)

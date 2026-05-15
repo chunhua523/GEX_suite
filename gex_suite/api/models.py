@@ -25,6 +25,16 @@ class ScheduleStatus(BaseModel):
     schedule_enabled: bool
     schedule_time: str
     timezone: str = "local"
+    only_scraper: bool = False
+
+
+class ScheduleModeRequest(BaseModel):
+    mode: str = Field(..., description="'chain' (full pipeline) or 'scraper' (scraper-only)")
+
+
+class ScheduleModeResponse(BaseModel):
+    success: bool
+    mode: str
 
 
 class ScheduleUpdateResponse(BaseModel):
@@ -56,3 +66,37 @@ class RetryResponse(BaseModel):
     status: str
     mode: str
     failed_count: int
+
+
+class ChainStepStatus(BaseModel):
+    name: str
+    status: str  # OK | WARN | FAIL | SKIP | PENDING
+    detail: str = ""
+    elapsed_seconds: Optional[float] = None
+
+
+class ChainStatus(BaseModel):
+    running: bool
+    status: str  # idle | running | completed | failed | stopped
+    pid: Optional[int] = None
+    pgid: Optional[int] = None
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    elapsed_seconds: Optional[float] = None
+    mode_summary: Optional[str] = None
+    steps: List[str] = []
+    current_step: Optional[str] = None
+    per_step: List[ChainStepStatus] = []
+    success: Optional[bool] = None
+    message: Optional[str] = None
+
+
+class ChainTriggerResponse(BaseModel):
+    status: str  # started | already_running | error
+    pid: Optional[int] = None
+    message: str
+
+
+class ChainStopResponse(BaseModel):
+    success: bool
+    message: str
