@@ -145,7 +145,13 @@ def _make_offscreen_app():
 
 
 def _create_widget_headless():
-    """Instantiate TradingViewPage with stdout logging instead of UI log box."""
+    """Instantiate TradingViewPage with stdout logging instead of UI log box.
+
+    Free-form _exec_log messages are tee'd to the disk run-log writer (when
+    one is open) so CLI runs produce the same HTML log file as GUI runs.
+    Structured _log_event calls already write to ``_run_log_writer`` inside
+    ``_log_event_main_thread`` — we leave that path untouched.
+    """
     from .widget import TradingViewPage
     page = TradingViewPage()
 
@@ -153,9 +159,32 @@ def _create_widget_headless():
 
     def _log(msg: str) -> None:
         text = (msg or "").rstrip()
-        if text:
-            print(text)
-            captured.append(text)
+        if not text:
+            return
+        print(text)
+        captured.append(text)
+        writer = getattr(page, "_run_log_writer", None)
+        if writer is None:
+            return
+        # Mirror _dispatch_freeform semantics: split off the leading 【tag】,
+        # infer severity, write the rest as detail.
+        lines = text.splitlines()
+        first = lines[0] if lines else ""
+        rest = "\n".join(lines[1:]).strip() if len(lines) > 1 else ""
+        try:
+            severity, tag = page._infer_severity(first)
+            if tag and first.startswith(f"【{tag}】"):
+                body = first[len(f"【{tag}】"):].lstrip()
+            else:
+                body = first
+            writer.event(
+                severity=severity,
+                tag=tag or "info",
+                text=body,
+                detail=rest or None,
+            )
+        except Exception:
+            pass
 
     # The widget's _exec_log marshals to the Qt main thread via a signal; both
     # paths funnel through _exec_log_main_thread. Override both to short-circuit
@@ -226,35 +255,69 @@ def main() -> int:
     print(f"▶️ TV batch: scope={opts.layout_scope} ticker_scope={opts.ticker_scope} "
           f"weeks={opts.weeks} dry_run={opts.dry_run} cdp={cdp_url}")
 
+    ticker_for_title = (opts.ticker or "all") if opts.ticker_scope == "ticker" else "all"
+    log_kind = "scan_cli_dry" if opts.dry_run else "scan_cli"
+    page._begin_run_log(
+        log_kind,
+        title_suffix=(
+            f"ticker={ticker_for_title} weeks={opts.weeks} "
+            f"layout={opts.layout_scope} dry_run={opts.dry_run}"
+        ),
+    )
+    log_path = getattr(page, "_latest_log_path", None)
+    if log_path:
+        print(f"📄 run log: {log_path}")
+
     start = time.monotonic()
     try:
-        report = asyncio.run(page._phase_b_scan_flow(opts))
-    except Exception as exc:
+        try:
+            report = asyncio.run(page._phase_b_scan_flow(opts))
+        except Exception as exc:
+            elapsed = time.monotonic() - start
+            msg = f"_phase_b_scan_flow raised: {type(exc).__name__}: {exc}"
+            print(f"❌ {msg}")
+            page._end_run_log({"note": msg})
+            if args.result_json:
+                Path(args.result_json).write_text(
+                    json.dumps({
+                        "ok": False, "error": msg, "elapsed_seconds": round(elapsed, 2),
+                        "log_tail": captured[-50:],
+                        "run_log": str(log_path) if log_path else None,
+                    }, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            return 1
+
         elapsed = time.monotonic() - start
-        msg = f"_phase_b_scan_flow raised: {type(exc).__name__}: {exc}"
-        print(f"❌ {msg}")
+        payload = _serialize_report(report, elapsed, captured)
+        if log_path:
+            payload["run_log"] = str(log_path)
+        print(f"✅ TV batch done in {elapsed:.1f}s — total={payload['total']} "
+              f"done={payload['done']} skipped={payload['skipped']} failed={payload['failed']}")
+
+        page._end_run_log({
+            "total": payload["total"],
+            "done": payload["done"],
+            "skipped": payload["skipped"],
+            "failed": payload["failed"],
+            "note": f"CLI 執行（耗時 {elapsed:.1f}s）",
+        })
+
         if args.result_json:
             Path(args.result_json).write_text(
-                json.dumps({
-                    "ok": False, "error": msg, "elapsed_seconds": round(elapsed, 2),
-                    "log_tail": captured[-50:],
-                }, ensure_ascii=False, indent=2),
+                json.dumps(payload, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-        return 1
 
-    elapsed = time.monotonic() - start
-    payload = _serialize_report(report, elapsed, captured)
-    print(f"✅ TV batch done in {elapsed:.1f}s — total={payload['total']} "
-          f"done={payload['done']} skipped={payload['skipped']} failed={payload['failed']}")
-
-    if args.result_json:
-        Path(args.result_json).write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-
-    return 1 if payload.get("failed", 0) > 0 else 0
+        return 1 if payload.get("failed", 0) > 0 else 0
+    finally:
+        # Belt-and-suspenders: ensure the writer is closed even if something
+        # unexpected slipped past the inner handlers.
+        if getattr(page, "_run_log_writer", None) is not None:
+            try:
+                page._end_run_log()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
