@@ -1151,6 +1151,15 @@ class PlaywrightCDPAutomator(TVAutomator):
         text = raw.strip().upper()
         if not text:
             return None
+        # Formula readouts (e.g. ``ES1!-SPX500``, ``SPX+ES1!``,
+        # ``QQQ-QQQ+NQ1!/QQQ``) must be returned intact so the widget's
+        # ``_is_formula_symbol`` guard can skip the subchart. Otherwise the
+        # fallback regex below silently collapses a formula to its first
+        # ticker, which then misroutes downstream indicator logic.
+        if re.search(r"[A-Z0-9!._:][\s]*[+*/][\s]*[A-Z0-9!._:]", text):
+            return text
+        if re.search(r"[A-Z0-9!._:]{2,}[\s]*-[\s]*[A-Z0-9!._:]{2,}", text):
+            return text
         lines = [ln.strip().upper() for ln in text.splitlines() if ln.strip()]
         if not lines:
             return None

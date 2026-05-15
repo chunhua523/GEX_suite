@@ -2020,6 +2020,26 @@ class TradingViewPage(QWidget):
         return fallback.group(0) if fallback else None
 
     @staticmethod
+    def _is_formula_symbol(symbol: str | None) -> bool:
+        """True if symbol looks like a TradingView formula (e.g. ``ES1!-SPX500``).
+
+        Formula charts join multiple tickers with arithmetic operators and
+        cannot host a single-ticker indicator, so we skip them upstream.
+
+        Heuristic: any of ``+ * /`` between two ticker-like tokens, or ``-``
+        between two tokens that are both 2+ chars (so real tickers like
+        ``BRK-B`` / ``BF-A`` with a single-letter right side are not flagged).
+        """
+        text = str(symbol or "").strip().upper()
+        if not text:
+            return False
+        if re.search(r"[A-Z0-9!._:][\s]*[+*/][\s]*[A-Z0-9!._:]", text):
+            return True
+        if re.search(r"[A-Z0-9!._:]{2,}[\s]*-[\s]*[A-Z0-9!._:]{2,}", text):
+            return True
+        return False
+
+    @staticmethod
     def _resolve_start_time_for_ticker(ticker: str) -> str:
         return shared_config.get_tradingview_start_time(ticker)
 
@@ -2169,6 +2189,8 @@ class TradingViewPage(QWidget):
                         automator,
                         expected_symbol=sub.symbol,
                     )
+                    if self._is_formula_symbol(search_symbol):
+                        continue
                     layout_mode = self._resolve_layout_mode_for_subchart(layout.name, sub.index)
                     target_ticker, _is_futures_unused = self._resolve_target_ticker_for_subchart(
                         search_symbol, opts, layout_mode=layout_mode
@@ -2306,6 +2328,21 @@ class TradingViewPage(QWidget):
                     )
                     if search_symbol:
                         seen_symbols.add(search_symbol)
+                    if self._is_formula_symbol(search_symbol):
+                        u = str(post.get("url") or "—")
+                        self._log_event(
+                            "skip",
+                            "略過｜公式圖",
+                            f"{search_symbol}",
+                            layout=layout.name,
+                            subchart=sub.index,
+                            ticker=search_symbol,
+                            detail=(
+                                f"URL={u}\n圖上={search_symbol}\n"
+                                f"原因：圖表上的 symbol 為公式（多商品以算術運算子組合），非單一商品，略過此子圖"
+                            ),
+                        )
+                        continue
                     layout_mode = self._resolve_layout_mode_for_subchart(
                         layout.name, sub.index
                     )
@@ -2863,6 +2900,8 @@ class TradingViewPage(QWidget):
                 )
                 if search_symbol:
                     seen_symbols.add(search_symbol)
+                if self._is_formula_symbol(search_symbol):
+                    continue
                 layout_mode = self._resolve_layout_mode_for_subchart(layout.name, sub.index)
                 target_ticker, is_futures_alias = self._resolve_target_ticker_for_subchart(
                     search_symbol, opts, layout_mode=layout_mode

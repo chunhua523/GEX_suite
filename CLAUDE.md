@@ -81,6 +81,7 @@ Every silent `continue` in `_phase_b_scan_flow` should produce a log line. Curre
 |---|---|
 | `【略過版面】無法載入` | `automator.load_layout()` returned False (non-first layout) |
 | `【警告】版面…無法取得子圖清單` | `_enumerate_subcharts_with_retry` returned empty |
+| `【略過｜公式圖】` | Subchart symbol is a TV formula (e.g. `ES1!-SPX500`) — multi-ticker arithmetic combo, not a single instrument |
 | `【略過｜alias 缺項】` | Symbol is in `_FUTURES_ALIAS_MAP` but the resolved mode has no mapping |
 | `【略過｜未匹配】` | Symbol can't be parsed to a ticker (or scope=ticker mismatch and not an alias) |
 | `【略過｜重複】` | `(chosen, layout_mode)` already processed in this layout |
