@@ -305,6 +305,11 @@ class ScraperPage(QWidget):
         self.entry_time.setPlaceholderText("HH:MM e.g. 09:00")
         self.entry_time.setFixedWidth(80)
         sched_row.addWidget(self.entry_time)
+        sched_row.addWidget(QLabel("TZ:"))
+        self.combo_schedule_tz = QComboBox()
+        self.combo_schedule_tz.addItems(["America/New_York", "Local"])
+        self.combo_schedule_tz.setFixedWidth(160)
+        sched_row.addWidget(self.combo_schedule_tz)
         self.chk_schedule = QCheckBox("Enable Auto-Run")
         sched_row.addWidget(self.chk_schedule)
         sched_row.addStretch(1)
@@ -627,7 +632,14 @@ class ScraperPage(QWidget):
     def _check_schedule(self) -> None:
         if not self.chk_schedule.isChecked():
             return
-        now = datetime.now()
+        tz_choice = self.combo_schedule_tz.currentText()
+        if tz_choice == "Local":
+            now = datetime.now().astimezone()
+        else:
+            try:
+                now = datetime.now(ZoneInfo(tz_choice))
+            except Exception:
+                now = datetime.now().astimezone()
         target = self.entry_time.text().strip()
         if not target:
             return
@@ -646,7 +658,7 @@ class ScraperPage(QWidget):
                 self._log(f"Auto-Schedule Skipped: US market closed ({reason})")
                 self.last_market_skip_date = key
             return
-        self._log(f"Auto-Schedule Triggered at {target} (US date: {us_date_str})")
+        self._log(f"Auto-Schedule Triggered at {target} {tz_choice} (US date: {us_date_str})")
         self.last_run_date = today
         self._on_start(skip_selection_dialog=True)
 
@@ -705,10 +717,27 @@ class ScraperPage(QWidget):
         self.chk_schedule.setChecked(bool(s.get("schedule_enabled", False)))
         if s.get("schedule_time"):
             self.entry_time.setText(s["schedule_time"])
+        tz_val = str(s.get("schedule_timezone", "")).strip()
+        if not tz_val or tz_val.lower() == "local":
+            self.combo_schedule_tz.setCurrentText("Local")
+        else:
+            if self.combo_schedule_tz.findText(tz_val) < 0:
+                self.combo_schedule_tz.addItem(tz_val)
+            self.combo_schedule_tz.setCurrentText(tz_val)
 
     def _save_settings(self) -> None:
         ensure_dirs()
-        s = {
+        # Merge over existing settings instead of overwriting — preserves keys
+        # this widget has no UI for (e.g. schedule_timezone), which the API
+        # layer and gex_chain rely on.
+        existing: dict = {}
+        if SCRAPER_SETTINGS_PATH.exists():
+            try:
+                with SCRAPER_SETTINGS_PATH.open("r", encoding="utf-8") as f:
+                    existing = json.load(f) or {}
+            except Exception as exc:
+                print(f"[Scraper] failed to read existing settings, will rewrite from scratch: {exc}")
+        existing.update({
             "ticker_filepath": self.ticker_filepath,
             "cme_ticker_filepath": self.cme_ticker_filepath,
             "download_folder": self.download_folder,
@@ -718,10 +747,14 @@ class ScraperPage(QWidget):
             "browser": "brave" if self.radio_brave.isChecked() else "chrome",
             "schedule_enabled": self.chk_schedule.isChecked(),
             "schedule_time": self.entry_time.text(),
-        }
+            "schedule_timezone": (
+                "local" if self.combo_schedule_tz.currentText() == "Local"
+                else self.combo_schedule_tz.currentText()
+            ),
+        })
         try:
             with SCRAPER_SETTINGS_PATH.open("w", encoding="utf-8") as f:
-                json.dump(s, f, indent=2, ensure_ascii=False)
+                json.dump(existing, f, indent=2, ensure_ascii=False)
         except Exception as exc:
             print(f"[Scraper] failed to save settings: {exc}")
 

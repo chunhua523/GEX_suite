@@ -523,11 +523,17 @@ def _schedule_worker() -> None:
 
 
 def start_schedule_worker() -> None:
-    """Called once at FastAPI startup."""
+    """Called once at FastAPI startup.
+
+    The auto-fire worker thread is disabled because the full chain
+    (scraper+import+paste) is now owned by tools/gex_chain (launchd →
+    run.py --use-settings-schedule), which reads the same settings.json
+    schedule_enabled/schedule_time keys. Re-enabling the thread would
+    double-trigger the scraper step. The /scraper/schedule REST endpoints
+    remain functional for Discord remote control of those settings.
+    """
     _load_last_result_from_disk()
-    t = threading.Thread(target=_schedule_worker, daemon=True, name="scraper-schedule")
-    t.start()
-    logger.info("[Schedule] worker thread started")
+    logger.info("[Schedule] worker thread NOT started (ownership moved to gex_chain)")
 
 
 # ---------------------------------------------------------------------------
