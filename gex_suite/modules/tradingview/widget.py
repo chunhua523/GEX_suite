@@ -2404,20 +2404,280 @@ class TradingViewPage(QWidget):
                         keep_mondays = (
                             self._compute_cleanup_keep_mondays(4) if org_cleanup else None
                         )
+
+                        # Pre-fetch every target week's codes once so the sweep
+                        # callback never hits the DB while the Properties
+                        # dialog is open (keeps the dialog lifetime tight).
+                        codes_by_monday: dict[date, dict[str, str | None]] = {
+                            m: db.fetch_tv_codes_for_week(ticker=target_ticker, monday=m)
+                            for m in mondays
+                        }
+                        url_for_log = str(post.get("url") or "—")
+                        chart_url_for_item = str(post.get("url") or "") or None
+
+                        def _db_skip_reason(target_monday: date) -> str:
+                            if target_ticker.upper() not in known_tickers:
+                                return f"資料庫中無 ticker={target_ticker} 的資料"
+                            return (
+                                f"資料庫有 ticker={target_ticker}，但此週（{target_monday}~"
+                                f"{(target_monday + timedelta(days=4))}）皆無 TV Code"
+                            )
+
+                        def _build_item(target_monday: date) -> WorkItem:
+                            codes_ = codes_by_monday.get(target_monday) or {}
+                            return WorkItem(
+                                ticker=target_ticker,
+                                monday=target_monday,
+                                codes=codes_,
+                                available_days=[
+                                    d for d, c in codes_.items() if c
+                                ],
+                                layout_id=layout.id,
+                                layout_name=layout.name,
+                                subchart_index=sub.index,
+                                subchart_symbol=chosen,
+                                chart_url=chart_url_for_item,
+                                is_futures=is_futures_alias,
+                            )
+
+                        async def on_target_row(
+                            row_monday: date,
+                            levels: dict[str, str | None],
+                        ) -> bool:
+                            """Sweep callback: existing row at ``row_monday`` matches a target week.
+
+                            Dialog is **already open** by the sweep. We must close it
+                            (save=True if we fill, save=False otherwise) before returning.
+                            """
+                            codes = codes_by_monday.get(row_monday) or {}
+                            available = [day for day, code in codes.items() if code]
+                            if not available:
+                                await automator.close_settings(save=False)
+                                self._log_event(
+                                    "skip",
+                                    "略過｜資料庫",
+                                    f"{target_ticker} 週一起={row_monday}",
+                                    layout=layout.name,
+                                    subchart=sub.index,
+                                    ticker=target_ticker,
+                                    detail=(
+                                        f"URL={url_for_log}\n圖上={chosen}\nticker={target_ticker}\n"
+                                        f"週一起={row_monday}\n原因：{_db_skip_reason(row_monday)}"
+                                    ),
+                                )
+                                results.append(
+                                    BatchResultItem(
+                                        item=_build_item(row_monday),
+                                        status="skipped",
+                                        message="略過｜資料庫",
+                                    )
+                                )
+                                return False
+
+                            if is_futures_alias:
+                                indicator_date = row_monday - timedelta(days=1)
+                                indicator_start_time = _FUTURES_START_TIME
+                            else:
+                                indicator_date = row_monday
+                                indicator_start_time = self._resolve_start_time_for_ticker(
+                                    target_ticker
+                                )
+                            expected_date_iso = indicator_date.isoformat()
+                            try:
+                                got_date_raw, _got_time = await automator.read_weekly_start_datetime()
+                            except Exception:
+                                got_date_raw = None
+                            got_date = (got_date_raw or "").strip()
+                            if got_date and got_date != expected_date_iso:
+                                await automator.close_settings(save=False)
+                                msg = (
+                                    "existing 指標週期不符，已中止以避免誤判 skip: "
+                                    f"expected={expected_date_iso}, opened={got_date}"
+                                )
+                                self._log_event(
+                                    "error",
+                                    "失敗｜週期不符",
+                                    f"週一起={row_monday} expected={expected_date_iso} opened={got_date}",
+                                    layout=layout.name,
+                                    subchart=sub.index,
+                                    ticker=target_ticker,
+                                    detail=(
+                                        f"URL={url_for_log}\nticker={target_ticker}\n"
+                                        f"週一起={row_monday}\n原因：{msg}"
+                                    ),
+                                )
+                                results.append(
+                                    BatchResultItem(
+                                        item=_build_item(row_monday),
+                                        status="failed",
+                                        message=msg,
+                                    )
+                                )
+                                return False
+
+                            missing_only_codes = {
+                                day: (
+                                    None
+                                    if (levels.get(day) or "").strip()
+                                    else code
+                                )
+                                for day, code in codes.items()
+                            }
+                            codes_to_fill = (
+                                missing_only_codes
+                                if opts.skip_filled_days
+                                else dict(codes)
+                            )
+                            item = _build_item(row_monday)
+                            if all(c is None for c in missing_only_codes.values()):
+                                await automator.close_settings(save=False)
+                                self._log_event(
+                                    "skip",
+                                    "略過｜快取",
+                                    f"週一起={row_monday}",
+                                    layout=layout.name,
+                                    subchart=sub.index,
+                                    ticker=target_ticker,
+                                    detail=(
+                                        f"URL={url_for_log}\n圖上={chosen}\nticker={target_ticker}\n"
+                                        f"週一起={row_monday}\n原因：該週可填欄位皆已有值（單次掃描內偵測）"
+                                    ),
+                                )
+                                results.append(
+                                    BatchResultItem(
+                                        item=item,
+                                        status="skipped",
+                                        message="該週可用天皆已有值",
+                                    )
+                                )
+                                return False
+
+                            if opts.dry_run:
+                                planned = [
+                                    d for d in _DAY_ORDER if missing_only_codes.get(d)
+                                ]
+                                fills = self._abbr_weekday_labels(planned)
+                                await automator.close_settings(save=False)
+                                self._log_event(
+                                    "preview",
+                                    "預覽",
+                                    f"週一起={row_monday} 將填 {fills}",
+                                    layout=layout.name,
+                                    subchart=sub.index,
+                                    ticker=target_ticker,
+                                    detail=(
+                                        f"URL={url_for_log}\nticker={target_ticker}\n"
+                                        f"週一起={row_monday}\n執行時將填：{fills}"
+                                    ),
+                                )
+                                results.append(
+                                    BatchResultItem(
+                                        item=replace(
+                                            item,
+                                            preview_status=f"預覽：執行將填 {fills}",
+                                        ),
+                                        status="skipped",
+                                        message="preview_would_fill",
+                                    )
+                                )
+                                return False
+
+                            try:
+                                filled_days = await automator.fill_weekly_levels(
+                                    codes_to_fill,
+                                    clear_missing=False,
+                                )
+                                await automator.close_settings(save=True)
+                            except Exception as exc:  # noqa: BLE001
+                                try:
+                                    await automator.close_settings(save=False)
+                                except Exception:
+                                    pass
+                                err = str(exc).replace("\n", " ")
+                                if len(err) > 200:
+                                    err = err[:197] + "…"
+                                self._log_event(
+                                    "error",
+                                    "失敗",
+                                    f"週一起={row_monday} {err}",
+                                    layout=layout.name,
+                                    subchart=sub.index,
+                                    ticker=target_ticker,
+                                    detail=(
+                                        f"URL={url_for_log}\nticker={target_ticker}\n"
+                                        f"週一起={row_monday}\n錯誤：{err}"
+                                    ),
+                                )
+                                results.append(
+                                    BatchResultItem(
+                                        item=item,
+                                        status="failed",
+                                        message=str(exc),
+                                    )
+                                )
+                                return False
+
+                            fills = (
+                                self._abbr_weekday_labels(filled_days)
+                                if filled_days
+                                else "—"
+                            )
+                            if is_futures_alias:
+                                start_line = (
+                                    f"  週一起：{row_monday}  指標起始：{indicator_date} {indicator_start_time}"
+                                    f"（期貨：{chosen}）  已寫入：{fills}"
+                                )
+                            else:
+                                start_line = (
+                                    f"  週一起：{row_monday}  開盤時間：{indicator_start_time}"
+                                    f"  已寫入：{fills}"
+                                )
+                            self._log_event(
+                                "done",
+                                "更新 GEX 指標欄位",
+                                f"週一起={row_monday} 已寫入 {fills}",
+                                layout=layout.name,
+                                subchart=sub.index,
+                                ticker=target_ticker,
+                                detail=(
+                                    f"URL={url_for_log}\n圖上商品：{chosen}  DB ticker：{target_ticker}\n"
+                                    f"{start_line.strip()}"
+                                ),
+                            )
+                            results.append(
+                                BatchResultItem(item=item, status="done")
+                            )
+                            return True
+
                         subchart_cache = await automator.build_weekly_gex_subchart_cache(
                             keep_mondays=keep_mondays,
+                            dedupe_duplicates=org_cleanup,
+                            target_mondays=set(mondays),
+                            on_target_row=on_target_row,
                         )
+                        if subchart_cache.modified_via_callback:
+                            layout_modified = True
+
                         if org_cleanup:
                             removed = subchart_cache.removed_expired
                             pending = subchart_cache.expired_pending
-                            if removed > 0:
+                            dup_removed = subchart_cache.removed_duplicates
+                            if removed > 0 or dup_removed > 0:
                                 layout_modified = True
-                            if removed > 0 or pending > 0:
-                                u = str(post.get("url") or "—")
-                                cutoff_iso = keep_mondays[0].isoformat() if keep_mondays else "—"
-                                summary = f"已移除 {removed} 個過期指標"
+                            if removed > 0 or dup_removed > 0 or pending > 0:
+                                cutoff_iso = (
+                                    keep_mondays[0].isoformat()
+                                    if keep_mondays
+                                    else "—"
+                                )
+                                parts: list[str] = []
+                                if removed > 0:
+                                    parts.append(f"過期 {removed}")
+                                if dup_removed > 0:
+                                    parts.append(f"重複週 {dup_removed}")
                                 if pending > 0:
-                                    summary += f"｜未能刪除 {pending} 個"
+                                    parts.append(f"未能刪除 {pending}")
+                                summary = "已清理：" + "、".join(parts)
                                 self._log_event(
                                     "info",
                                     "清理｜寫入前",
@@ -2426,12 +2686,24 @@ class TradingViewPage(QWidget):
                                     subchart=sub.index,
                                     ticker=target_ticker,
                                     detail=(
-                                        f"URL={u}\n圖上={chosen}\nticker={target_ticker}\n"
+                                        f"URL={url_for_log}\n圖上={chosen}\nticker={target_ticker}\n"
                                         f"cutoff={cutoff_iso}\n{summary}"
                                     ),
                                 )
+                            if dup_removed > 0:
+                                self._log_event(
+                                    "info",
+                                    "清理｜重複週",
+                                    f"已移除 {dup_removed} 個重複週指標（保留先掃到的）",
+                                    layout=layout.name,
+                                    subchart=sub.index,
+                                    ticker=target_ticker,
+                                    detail=(
+                                        f"URL={url_for_log}\n圖上={chosen}\nticker={target_ticker}\n"
+                                        f"原因：同一週於 legend 上出現多次，保留第一個出現的 row"
+                                    ),
+                                )
                             if pending > 0:
-                                u = str(post.get("url") or "—")
                                 self._log_event(
                                     "error",
                                     "清理失敗｜DOM",
@@ -2440,26 +2712,24 @@ class TradingViewPage(QWidget):
                                     subchart=sub.index,
                                     ticker=target_ticker,
                                     detail=(
-                                        f"URL={u}\n圖上={chosen}\nticker={target_ticker}\n"
+                                        f"URL={url_for_log}\n圖上={chosen}\nticker={target_ticker}\n"
                                         f"原因：Properties 對話框已開啟但 Delete 按鈕未生效（{pending} 個過期指標仍在）"
                                     ),
                                 )
+
                         for monday in mondays:
                             if self._batch_should_stop():
                                 self._exec_log("【已停止】使用者中止批次。")
                                 stop_all = True
                                 break
-                            codes = db.fetch_tv_codes_for_week(ticker=target_ticker, monday=monday)
+                            if monday in subchart_cache.handled_target_mondays:
+                                # Already processed during the sweep (existing
+                                # row updated, previewed, or skipped). Don't
+                                # double-process via create-new path.
+                                continue
+                            codes = codes_by_monday.get(monday) or {}
                             available = [day for day, code in codes.items() if code]
                             if not available:
-                                if target_ticker.upper() not in known_tickers:
-                                    reason = f"資料庫中無 ticker={target_ticker} 的資料"
-                                else:
-                                    reason = (
-                                        f"資料庫有 ticker={target_ticker}，但此週（{monday}~"
-                                        f"{(monday + timedelta(days=4))}）皆無 TV Code"
-                                    )
-                                u = str(post.get("url") or "—")
                                 self._log_event(
                                     "skip",
                                     "略過｜資料庫",
@@ -2468,25 +2738,12 @@ class TradingViewPage(QWidget):
                                     subchart=sub.index,
                                     ticker=target_ticker,
                                     detail=(
-                                        f"URL={u}\n圖上={chosen}\nticker={target_ticker}\n"
-                                        f"週一起={monday}\n原因：{reason}"
+                                        f"URL={url_for_log}\n圖上={chosen}\nticker={target_ticker}\n"
+                                        f"週一起={monday}\n原因：{_db_skip_reason(monday)}"
                                     ),
                                 )
                                 continue
-                            snap = await automator.get_runtime_snapshot()
-                            chart_url = str(snap.get("url") or "") or None
-                            item = WorkItem(
-                                ticker=target_ticker,
-                                monday=monday,
-                                codes=codes,
-                                available_days=available,
-                                layout_id=layout.id,
-                                layout_name=layout.name,
-                                subchart_index=sub.index,
-                                subchart_symbol=chosen,
-                                chart_url=chart_url,
-                                is_futures=is_futures_alias,
-                            )
+                            item = _build_item(monday)
                             result = await self._apply_work_item_with_retry(
                                 automator,
                                 item,

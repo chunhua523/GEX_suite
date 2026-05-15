@@ -7,9 +7,10 @@ implementation that can attach to a user-launched Chrome/Brave instance
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Awaitable, Callable
 import secrets
 import re
 
@@ -68,6 +69,16 @@ class WeeklyGexSubchartCache:
     # Properties-dialog Delete button on the final pass. Surfaced separately
     # so the inline cleanup path can warn the user instead of failing silently.
     expired_pending: int = 0
+    # Duplicate-canonical-Monday rows removed during the same pass (when
+    # ``dedupe_duplicates`` is enabled). The first occurrence is kept.
+    removed_duplicates: int = 0
+    # Canonical Mondays whose existing row was visited by ``on_target_row``
+    # during the sweep — the caller should skip "create new" for these.
+    handled_target_mondays: set[date] = field(default_factory=set)
+    # True if any ``on_target_row`` callback returned True (i.e. saved settings
+    # while the sweep was running) — the parent flow uses this to mark the
+    # layout as modified for the trailing layout-save.
+    modified_via_callback: bool = False
 
     @property
     def signature_set(self) -> frozenset[str]:
@@ -2167,13 +2178,29 @@ class PlaywrightCDPAutomator(TVAutomator):
         self,
         *,
         keep_mondays: list[date] | None = None,
+        dedupe_duplicates: bool = False,
+        target_mondays: set[date] | None = None,
+        on_target_row: Callable[
+            [date, dict[str, str | None]], Awaitable[bool]
+        ] | None = None,
         title_keyword: str = "Daily & Weekly GEX",
     ) -> WeeklyGexSubchartCache:
         """One pass per stable DOM: read each row's start date + weekday levels.
 
-        When ``keep_mondays`` is set, rows whose Monday is **strictly before**
-        ``min(keep_mondays)`` are removed during this pass (same rule as
-        ``remove_expired_weekly_gex_indicators``), avoiding a second sweep.
+        - ``keep_mondays`` set → rows older than ``min(keep_mondays)`` are
+          removed during this pass (cutoff = first kept canonical Monday).
+        - ``dedupe_duplicates`` → second-and-later occurrences of the same
+          canonical Monday are removed (first wins).
+        - ``target_mondays`` + ``on_target_row`` → when a row's canonical
+          Monday is in the target set, the callback is invoked **with the
+          row's Properties dialog already open**. The callback is responsible
+          for closing the dialog (whether it saves or not). Each canonical
+          Monday is visited at most once; later duplicates fall into the
+          dedupe path above if enabled.
+
+        The callback's return value (``True`` = saved) is OR'd into
+        :attr:`WeeklyGexSubchartCache.modified_via_callback` so the parent
+        flow can trigger a layout save without re-checking per row.
         """
         page = self._require_page()
         await page.bring_to_front()
@@ -2181,10 +2208,14 @@ class PlaywrightCDPAutomator(TVAutomator):
         allow_global_fallback = self._allow_global_indicator_fallback()
         keep_sorted = sorted(set(keep_mondays or []))
         cutoff = keep_sorted[0] if keep_sorted else None
+        target_set: set[date] = set(target_mondays or ())
         final_rows: list[WeeklyGexRowSnapshot] = []
         probe_complete = True
         removed_expired = 0
         expired_pending = 0
+        removed_duplicates = 0
+        handled_target_mondays: set[date] = set()
+        modified_via_callback = False
         for _round in range(96):
             candidates = await self._collect_any_indicator_locators(
                 title_keyword, active_only=True
@@ -2199,8 +2230,12 @@ class PlaywrightCDPAutomator(TVAutomator):
                     probe_complete=True,
                     removed_expired=removed_expired,
                     expired_pending=expired_pending,
+                    removed_duplicates=removed_duplicates,
+                    handled_target_mondays=handled_target_mondays,
+                    modified_via_callback=modified_via_callback,
                 )
             pass_rows: list[WeeklyGexRowSnapshot] = []
+            seen_canonical: set[date] = set()
             removed = False
             round_expired_failed = 0
             for cand in list(candidates):
@@ -2247,10 +2282,74 @@ class PlaywrightCDPAutomator(TVAutomator):
                     )
                     probe_complete = False
                     continue
+                if (
+                    dedupe_duplicates
+                    and row_canonical is not None
+                    and row_canonical in seen_canonical
+                ):
+                    await self.close_settings(save=False)
+                    deleted = await self._remove_indicator_by_locator(
+                        cand, title_keyword
+                    )
+                    if deleted:
+                        removed_duplicates += 1
+                        removed = True
+                        self._log(
+                            "[subchart_cache] duplicate row removed monday=%s"
+                            % row_canonical.isoformat()
+                        )
+                        await page.wait_for_timeout(200)
+                        break
+                    self._log(
+                        "[subchart_cache] duplicate-remove FAILED monday=%s"
+                        % row_canonical.isoformat()
+                    )
+                    probe_complete = False
+                    continue
+                if (
+                    on_target_row is not None
+                    and row_canonical is not None
+                    and row_canonical in target_set
+                    and row_canonical not in handled_target_mondays
+                ):
+                    try:
+                        saved = await on_target_row(row_canonical, dict(levels))
+                    except Exception as exc:  # noqa: BLE001
+                        self._log(
+                            "[subchart_cache] on_target_row raised monday=%s err=%s"
+                            % (row_canonical.isoformat(), exc)
+                        )
+                        saved = False
+                        try:
+                            await self.close_settings(save=False)
+                        except Exception:
+                            pass
+                    handled_target_mondays.add(row_canonical)
+                    if saved:
+                        modified_via_callback = True
+                    # Snapshot still records this row with the values we read
+                    # *before* the callback ran. Downstream code only uses
+                    # ``cache_dates`` (start_iso set) and ``signature_set``
+                    # from the cache; level deltas don't matter once the row
+                    # has been claimed via ``handled_target_mondays``.
+                    seen_canonical.add(row_canonical)
+                    if normalized and sig:
+                        pass_rows.append(
+                            WeeklyGexRowSnapshot(
+                                row_signature=sig,
+                                start_iso=normalized,
+                                levels=dict(levels),
+                            )
+                        )
+                    else:
+                        probe_complete = False
+                    continue
                 await self.close_settings(save=False)
                 if not normalized or not sig:
                     probe_complete = False
                     continue
+                if row_canonical is not None:
+                    seen_canonical.add(row_canonical)
                 pass_rows.append(
                     WeeklyGexRowSnapshot(
                         row_signature=sig,
@@ -2270,12 +2369,16 @@ class PlaywrightCDPAutomator(TVAutomator):
             break
         self._log(
             "[subchart_cache] built rows=%s probe_complete=%s "
-            "removed_expired=%s expired_pending=%s cutoff=%s"
+            "removed_expired=%s removed_duplicates=%s expired_pending=%s "
+            "handled=%s modified_via_cb=%s cutoff=%s"
             % (
                 len(final_rows),
                 int(probe_complete),
                 removed_expired,
+                removed_duplicates,
                 expired_pending,
+                len(handled_target_mondays),
+                int(modified_via_callback),
                 cutoff.isoformat() if cutoff else "-",
             )
         )
@@ -2284,6 +2387,9 @@ class PlaywrightCDPAutomator(TVAutomator):
             probe_complete=probe_complete,
             removed_expired=removed_expired,
             expired_pending=expired_pending,
+            removed_duplicates=removed_duplicates,
+            handled_target_mondays=handled_target_mondays,
+            modified_via_callback=modified_via_callback,
         )
 
     async def _append_created_row_to_subchart_cache(
