@@ -1,0 +1,2 @@
+# Optional: one-folder exe / app bundle (see README「打包」)
+pyinstaller>=6.0
