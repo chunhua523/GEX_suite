@@ -5,9 +5,13 @@
 #   chmod +x run_on_mac.sh
 #   ./run_on_mac.sh
 #
-# 若 GitHub 儲存庫名稱或帳號不同，請改下方 GITHUB_ZIP_URL。
+# 自我更新是「repo-aware」的（見下方），同一支 script 在以下兩種環境都安全：
+#   1. 外部使用者 clone 的獨立 GEX_suite repo → 會自我更新（git pull / 抓 zip）
+#   2. 開發者的 Jeff-Project monorepo（gex-suite 是子資料夾）→ 跳過自我更新
+#      （開發者請手動 pull monorepo；外部發布走 gex-suite/publish-to-public.sh）
 
-cd "$(dirname "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
 
 GITHUB_ZIP_URL="https://github.com/chunhua523/GEX_suite/archive/refs/heads/main.zip"
 ZIP_EXTRACT_DIR="GEX_suite-main"
@@ -16,32 +20,38 @@ echo "========================================"
 echo "           GEX Suite (macOS)"
 echo "========================================"
 
-# --- 可選：檢查網路並嘗試更新 ---
-echo "Checking internet connection..."
-if ping -c 1 github.com &> /dev/null; then
-    echo "Connected."
+# --- 自我更新（repo-aware）---
+# 判斷本機環境：
+#   repo root == 本 script 所在目錄 → 外部獨立 GEX_suite clone → 自我更新
+#   repo root 是上層（Jeff-Project monorepo）或其他 repo → 跳過（避免蓋掉整合版）
+#   沒有 .git（解 zip 的非 git 使用者）→ 抓 GEX_suite zip 覆蓋
+IS_STANDALONE=false
+HAS_GIT=false
+if command -v git &> /dev/null && git rev-parse --is-inside-work-tree &> /dev/null; then
+    HAS_GIT=true
+    if [ "$(git rev-parse --show-toplevel)" = "$SCRIPT_DIR" ]; then
+        IS_STANDALONE=true
+    fi
+fi
 
-    UPDATED=false
-
-    if [ -d ".git" ] && command -v git &> /dev/null; then
+if [ "$HAS_GIT" = true ] && [ "$IS_STANDALONE" = false ]; then
+    echo "偵測到 monorepo（非獨立 GEX_suite）— 跳過自我更新。"
+    echo "（開發者請在 repo 根手動 git pull；外部發布用 gex-suite/publish-to-public.sh）"
+elif ping -c 1 github.com &> /dev/null; then
+    echo "Checking for updates..."
+    if [ "$IS_STANDALONE" = true ]; then
         echo "Git repository detected. Updating via git..."
-        git pull origin main
-        if [ $? -eq 0 ]; then
-            UPDATED=true
+        if git pull origin main; then
             echo "Git update successful."
         else
-            echo "Git update failed. Trying direct download..."
+            echo "Git update failed — 繼續用現有版本啟動。"
         fi
-    fi
-
-    if [ "$UPDATED" = false ]; then
+    else
         echo "Downloading latest version from GitHub..."
         curl -L -o update.zip "$GITHUB_ZIP_URL"
-
         if [ -f "update.zip" ]; then
             echo "Download complete. Extracting..."
             unzip -q -o update.zip
-
             if [ -d "$ZIP_EXTRACT_DIR" ]; then
                 echo "Applying updates..."
                 cp -R "$ZIP_EXTRACT_DIR"/* .
@@ -53,7 +63,7 @@ if ping -c 1 github.com &> /dev/null; then
                 rm -f update.zip
             fi
         else
-            echo "Download failed."
+            echo "Download failed — 繼續用現有版本啟動。"
         fi
     fi
 else
