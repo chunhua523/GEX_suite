@@ -564,6 +564,11 @@ class ScrapedFilesDialog(QDialog):
         bf.addWidget(QPushButton("Select All", clicked=self._bt_select_all))
         bf.addWidget(QPushButton("Deselect All", clicked=self._bt_deselect_all))
         bf.addStretch(1)
+        self._bt_btn_compare = QPushButton("Compare")
+        self._bt_btn_compare.setStyleSheet("background:#D75BF6;color:white;font-weight:bold;")
+        self._bt_btn_compare.clicked.connect(self._bt_compare_gamma)
+        self._bt_btn_compare.setVisible(False)
+        bf.addWidget(self._bt_btn_compare)
         bo = QPushButton("Open Selected")
         bo.setStyleSheet("background:#2CC985;color:white;font-weight:bold;")
         bo.clicked.connect(self._bt_open_selected)
@@ -738,6 +743,7 @@ class ScrapedFilesDialog(QDialog):
         selected_model: str,
     ) -> None:
         self._clear_bt_scroll()
+        self._bt_btn_compare.setVisible(selected_model in ("Gamma", "CME - Gamma"))
         if not bt_grouped or selected_model in ("", "No Data"):
             lab = QLabel(
                 "No files found for the selected criteria."
@@ -884,3 +890,29 @@ class ScrapedFilesDialog(QDialog):
                 open_file_cross_platform(path)
             except Exception as exc:
                 print(f"Error creating aggregate TV file: {exc}")
+
+    def _bt_compare_gamma(self) -> None:
+        from . import gamma_parse
+
+        paths = [
+            str(data)
+            for cb, data in self._bt_file_vars
+            if cb.isChecked()
+            and not (isinstance(data, tuple) and data and data[0] == "TV_DATA")
+            and str(data).lower().endswith(".html")
+        ]
+        if not paths:
+            QMessageBox.warning(self, "Warning", "Select at least one Gamma .html file to compare.")
+            return
+
+        snapshots = gamma_parse.load_snapshots(paths)
+        if not snapshots:
+            QMessageBox.critical(
+                self,
+                "Error",
+                "Could not parse Gamma data from the selected file(s).",
+            )
+            return
+
+        dlg = gamma_parse.GammaCompareDialog(snapshots, self)
+        dlg.exec()

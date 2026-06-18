@@ -43,6 +43,7 @@ def main() -> int:
     step("import scraper.utils", lambda: __import__("gex_suite.modules.scraper.utils", fromlist=["*"]))
     step("import scraper.cli", lambda: __import__("gex_suite.modules.scraper.cli", fromlist=["*"]))
     step("import scraper.widget", lambda: __import__("gex_suite.modules.scraper.widget", fromlist=["*"]))
+    step("import scraper.gamma_parse", lambda: __import__("gex_suite.modules.scraper.gamma_parse", fromlist=["*"]))
     step("import chart.parser", lambda: __import__("gex_suite.modules.chart.parser", fromlist=["*"]))
     step("import chart.importers", lambda: __import__("gex_suite.modules.chart.importers", fromlist=["*"]))
     step("import chart.ohlc", lambda: __import__("gex_suite.modules.chart.ohlc", fromlist=["*"]))
