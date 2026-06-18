@@ -13,7 +13,7 @@ import tempfile
 from datetime import datetime
 from typing import Any, Optional
 
-from PySide6.QtCore import QDate
+from PySide6.QtCore import QDate, Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -579,6 +579,7 @@ class ScrapedFilesDialog(QDialog):
         self._bt_cached_grouped: dict = {}
         self._bt_cached_ticker = ""
         self._bt_cached_is_cme = False
+        self._gamma_compare_dlgs: list = []  # modeless Compare windows (prevent GC)
 
     def _bt_rebuild_model_checkboxes(self, is_cme: bool) -> None:
         while self._bt_model_grid.count():
@@ -914,5 +915,15 @@ class ScrapedFilesDialog(QDialog):
             )
             return
 
+        # Open modelessly (show, not exec): a nested modal exec() loop around a
+        # QWebEngineView hides this (modal) parent dialog on macOS when the child
+        # closes, leaving the app unclickable. Parent keeps ownership/cleanup; the
+        # ref list prevents premature GC.
         dlg = gamma_parse.GammaCompareDialog(snapshots, self)
-        dlg.exec()
+        dlg.setAttribute(Qt.WA_DeleteOnClose)
+        self._gamma_compare_dlgs.append(dlg)
+        dlg.destroyed.connect(lambda *_a, d=dlg: self._gamma_compare_dlgs.remove(d)
+                              if d in self._gamma_compare_dlgs else None)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
