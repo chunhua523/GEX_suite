@@ -13,7 +13,7 @@ import tempfile
 from datetime import datetime
 from typing import Any, Optional
 
-from PySide6.QtCore import QDate, Qt
+from PySide6.QtCore import QDate, Qt, QThread, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -55,6 +55,53 @@ def open_file_cross_platform(filepath: str) -> None:
         print(f"Failed to open file: {exc}")
 
 
+_SCAN_EXTS = (".html", ".txt", ".csv", ".pdf", ".png")
+
+
+class _FileIndexWorker(QThread):
+    """Walk ``download_folder`` once on a background thread and emit a flat index.
+
+    The download folder commonly lives on Google Drive CloudStorage (a FUSE-like
+    virtual FS) with tens of thousands of files; a synchronous ``os.walk`` on the
+    UI thread froze the whole app for minutes. This runs off-thread, prunes
+    ``__pycache__``, pre-filters by extension, and pre-splits the relative path so
+    the (instant) per-view filtering can reuse one cached list.
+    """
+
+    progress = Signal(int)
+    finished_index = Signal(list)  # list[tuple[str, list[str], str]] = (fp, parts, filename)
+
+    def __init__(self, download_folder: str) -> None:
+        super().__init__()
+        self._dl = download_folder
+        self._stop = False
+
+    def request_stop(self) -> None:
+        self._stop = True
+
+    def run(self) -> None:
+        index: list[tuple[str, list[str], str]] = []
+        count = 0
+        try:
+            for root, dirs, files in os.walk(self._dl):
+                if self._stop:
+                    return
+                dirs[:] = [d for d in dirs if d != "__pycache__"]
+                for file in files:
+                    if not file.endswith(_SCAN_EXTS):
+                        continue
+                    fp = os.path.join(root, file)
+                    rel_path = os.path.relpath(fp, self._dl)
+                    index.append((fp, rel_path.split(os.sep), file))
+                    count += 1
+                    if count % 500 == 0:
+                        self.progress.emit(count)
+        except Exception as exc:  # pragma: no cover
+            print(f"Error scanning files: {exc}")
+        if not self._stop:
+            self.finished_index.emit(index)
+
+
 class ScrapedFilesDialog(QDialog):
     def __init__(
         self,
@@ -75,6 +122,11 @@ class ScrapedFilesDialog(QDialog):
         self._date_file_vars: list[tuple[QCheckBox, Any]] = []
 
         self._bt_file_vars: list[tuple[QCheckBox, Any]] = []
+
+        # Cached file index (built once off-thread; reused by every view/filter).
+        self._file_index: Optional[list[tuple[str, list[str], str]]] = None
+        self._index_worker: Optional[_FileIndexWorker] = None
+        self._pending_after_index: list = []
 
         root = QVBoxLayout(self)
         top_bar = QFrame()
@@ -108,6 +160,56 @@ class ScrapedFilesDialog(QDialog):
 
         self._load_files_by_date()
 
+    # --- File index (background scan + cache) -------------------------------------
+    def _set_index_status(self, text: str) -> None:
+        for lbl in (getattr(self, "_lbl_date_status", None), getattr(self, "_bt_lbl_status", None)):
+            if lbl is not None:
+                lbl.setText(text)
+
+    def _ensure_index(self, on_ready) -> None:
+        """Run ``on_ready`` once the file index is available.
+
+        Cache hit → run immediately. Cache miss → queue the callback and kick off
+        a single background walk (concurrent callers share the same scan).
+        """
+        if self._file_index is not None:
+            on_ready()
+            return
+        self._pending_after_index.append(on_ready)
+        if self._index_worker is not None:
+            return  # a scan is already in flight
+        self._set_index_status("Scanning files…")
+        worker = _FileIndexWorker(self._dl)
+        self._index_worker = worker
+        worker.progress.connect(self._on_index_progress)
+        worker.finished_index.connect(self._on_index_ready)
+        worker.start()
+
+    def _on_index_progress(self, count: int) -> None:
+        self._set_index_status(f"Scanning files… {count}")
+
+    def _on_index_ready(self, index: list) -> None:
+        self._file_index = index
+        self._index_worker = None
+        callbacks = self._pending_after_index
+        self._pending_after_index = []
+        for cb in callbacks:
+            cb()
+
+    def _force_refresh(self) -> None:
+        """Re-scan disk from scratch (button: Load / Refresh Files)."""
+        if self._index_worker is not None:
+            return  # already scanning
+        self._file_index = None
+        self._load_files_by_date()
+
+    def closeEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        worker = self._index_worker
+        if worker is not None:
+            worker.request_stop()
+            worker.wait(3000)
+        super().closeEvent(event)
+
     def _on_mode_toggled(self, _checked: bool) -> None:
         if self._mode_date.isChecked():
             self._w_ticker.hide()
@@ -134,7 +236,7 @@ class ScrapedFilesDialog(QDialog):
         btn_today.clicked.connect(self._cal_set_today)
         lv.addWidget(btn_today)
         btn_refresh = QPushButton("Load / Refresh Files")
-        btn_refresh.clicked.connect(self._load_files_by_date)
+        btn_refresh.clicked.connect(self._force_refresh)
         lv.addWidget(btn_refresh)
         self._lbl_date_status = QLabel("Ready")
         self._lbl_date_status.setStyleSheet("color:gray;")
@@ -180,6 +282,9 @@ class ScrapedFilesDialog(QDialog):
         self._date_file_vars.clear()
 
     def _load_files_by_date(self) -> None:
+        self._ensure_index(self._apply_date_filter)
+
+    def _apply_date_filter(self) -> None:
         qd = self._cal.selectedDate()
         date_str = qd.toString("yyyy-MM-dd")
         try:
@@ -190,48 +295,42 @@ class ScrapedFilesDialog(QDialog):
             return
 
         self._grouped_files.clear()
-        try:
-            for root, _dirs, files in os.walk(self._dl):
-                for file in files:
-                    if search_str in file and file.endswith((".html", ".txt", ".csv", ".pdf", ".png")):
-                        fp = os.path.join(root, file)
-                        try:
-                            rel_path = os.path.relpath(fp, self._dl)
-                            parts = rel_path.split(os.sep)
-                            model_name = "Other"
-                            ticker_name = file
-                            if parts[0] == "CME":
-                                if len(parts) >= 3:
-                                    model_name = f"CME - {parts[1]}"
-                                    ticker_name = parts[2]
-                                elif "TV Code" in parts or file.lower().startswith("tv_codes"):
-                                    model_name = "CME - TV Code"
-                                    ticker_name = f"File_{file}"
-                            else:
-                                if len(parts) >= 2:
-                                    model_name = parts[0]
-                                    ticker_name = parts[1]
-                                elif "TV Code" in parts or file.lower().startswith("tv_codes"):
-                                    model_name = "TV Code"
-                                    ticker_name = f"File_{file}"
-                            try:
-                                time_part = file.split(search_str + "_")[1].split(".")[0]
-                                if len(time_part) >= 6:
-                                    dt_time = datetime.strptime(time_part[:6], "%H%M%S")
-                                else:
-                                    dt_time = datetime.now()
-                            except Exception:
-                                mnow = os.path.getmtime(fp)
-                                dt_time = datetime.fromtimestamp(mnow)
-                            if model_name not in self._grouped_files:
-                                self._grouped_files[model_name] = {}
-                            cur = self._grouped_files[model_name].get(ticker_name)
-                            if cur is None or dt_time > cur[1]:
-                                self._grouped_files[model_name][ticker_name] = (fp, dt_time)
-                        except Exception:
-                            pass
-        except Exception as exc:
-            print(f"Error scanning files: {exc}")
+        for fp, parts, file in (self._file_index or []):
+            if search_str not in file:
+                continue
+            try:
+                model_name = "Other"
+                ticker_name = file
+                if parts[0] == "CME":
+                    if len(parts) >= 3:
+                        model_name = f"CME - {parts[1]}"
+                        ticker_name = parts[2]
+                    elif "TV Code" in parts or file.lower().startswith("tv_codes"):
+                        model_name = "CME - TV Code"
+                        ticker_name = f"File_{file}"
+                else:
+                    if len(parts) >= 2:
+                        model_name = parts[0]
+                        ticker_name = parts[1]
+                    elif "TV Code" in parts or file.lower().startswith("tv_codes"):
+                        model_name = "TV Code"
+                        ticker_name = f"File_{file}"
+                try:
+                    time_part = file.split(search_str + "_")[1].split(".")[0]
+                    if len(time_part) >= 6:
+                        dt_time = datetime.strptime(time_part[:6], "%H%M%S")
+                    else:
+                        dt_time = datetime.now()
+                except Exception:
+                    mnow = os.path.getmtime(fp)
+                    dt_time = datetime.fromtimestamp(mnow)
+                if model_name not in self._grouped_files:
+                    self._grouped_files[model_name] = {}
+                cur = self._grouped_files[model_name].get(ticker_name)
+                if cur is None or dt_time > cur[1]:
+                    self._grouped_files[model_name][ticker_name] = (fp, dt_time)
+            except Exception:
+                pass
 
         total_files = sum(len(v) for v in self._grouped_files.values())
         self._lbl_date_status.setText(f"Found {total_files} files ({date_str})")
@@ -635,77 +734,79 @@ class ScrapedFilesDialog(QDialog):
             return
 
         is_cme = ticker in self._tickers_cme_set
-        bt_grouped: dict[str, dict[str, dict[str, tuple[str, datetime]]]] = {}
         self._bt_lbl_status.setText("Scanning...")
+        self._ensure_index(
+            lambda: self._apply_ticker_filter(ticker, selected_models, start_date, end_date, is_cme)
+        )
 
-        try:
-            for root, _dirs, files in os.walk(self._dl):
-                for file in files:
-                    if not file.endswith((".html", ".txt", ".csv", ".pdf", ".png")):
+    def _apply_ticker_filter(
+        self,
+        ticker: str,
+        selected_models: list[str],
+        start_date: datetime,
+        end_date: datetime,
+        is_cme: bool,
+    ) -> None:
+        bt_grouped: dict[str, dict[str, dict[str, tuple[str, datetime]]]] = {}
+        for fp, parts, file in (self._file_index or []):
+            try:
+                model_name = "Other"
+                ticker_name = file
+                if parts[0] == "CME":
+                    if len(parts) >= 3:
+                        model_name = f"CME - {parts[1]}"
+                        ticker_name = parts[2]
+                    elif "TV Code" in parts or file.lower().startswith("tv_codes"):
+                        model_name = "CME - TV Code"
+                        ticker_name = f"File_{file}"
+                else:
+                    if len(parts) >= 2:
+                        model_name = parts[0]
+                        ticker_name = parts[1]
+                    elif "TV Code" in parts or file.lower().startswith("tv_codes"):
+                        model_name = "TV Code"
+                        ticker_name = f"File_{file}"
+
+                if is_cme:
+                    if not model_name.startswith("CME - "):
                         continue
-                    fp = os.path.join(root, file)
-                    try:
-                        rel_path = os.path.relpath(fp, self._dl)
-                        parts = rel_path.split(os.sep)
-                        model_name = "Other"
-                        ticker_name = file
-                        if parts[0] == "CME":
-                            if len(parts) >= 3:
-                                model_name = f"CME - {parts[1]}"
-                                ticker_name = parts[2]
-                            elif "TV Code" in parts or file.lower().startswith("tv_codes"):
-                                model_name = "CME - TV Code"
-                                ticker_name = f"File_{file}"
-                        else:
-                            if len(parts) >= 2:
-                                model_name = parts[0]
-                                ticker_name = parts[1]
-                            elif "TV Code" in parts or file.lower().startswith("tv_codes"):
-                                model_name = "TV Code"
-                                ticker_name = f"File_{file}"
+                    raw_model = model_name[len("CME - ") :]
+                else:
+                    if model_name.startswith("CME - "):
+                        continue
+                    raw_model = model_name
 
-                        if is_cme:
-                            if not model_name.startswith("CME - "):
-                                continue
-                            raw_model = model_name[len("CME - ") :]
-                        else:
-                            if model_name.startswith("CME - "):
-                                continue
-                            raw_model = model_name
+                if raw_model not in selected_models:
+                    continue
 
-                        if raw_model not in selected_models:
-                            continue
+                is_tv_code = "TV Code" in model_name
+                if not is_tv_code and ticker_name != ticker:
+                    continue
 
-                        is_tv_code = "TV Code" in model_name
-                        if not is_tv_code and ticker_name != ticker:
-                            continue
+                date_match = re.search(r"(\d{8})_(\d{6})", file)
+                if not date_match:
+                    continue
+                file_date_str = date_match.group(1)
+                time_str_raw = date_match.group(2)
+                try:
+                    file_date = datetime.strptime(file_date_str, "%Y%m%d")
+                    file_dt = datetime.strptime(file_date_str + "_" + time_str_raw, "%Y%m%d_%H%M%S")
+                except Exception:
+                    continue
 
-                        date_match = re.search(r"(\d{8})_(\d{6})", file)
-                        if not date_match:
-                            continue
-                        file_date_str = date_match.group(1)
-                        time_str_raw = date_match.group(2)
-                        try:
-                            file_date = datetime.strptime(file_date_str, "%Y%m%d")
-                            file_dt = datetime.strptime(file_date_str + "_" + time_str_raw, "%Y%m%d_%H%M%S")
-                        except Exception:
-                            continue
+                if not (start_date <= file_date <= end_date):
+                    continue
 
-                        if not (start_date <= file_date <= end_date):
-                            continue
-
-                        date_key = file_date.strftime("%Y-%m-%d")
-                        bt_grouped.setdefault(date_key, {}).setdefault(model_name, {})
-                        if is_tv_code:
-                            bt_grouped[date_key][model_name][f"File_{file}"] = (fp, file_dt)
-                        else:
-                            cur = bt_grouped[date_key][model_name].get(ticker_name)
-                            if cur is None or file_dt > cur[1]:
-                                bt_grouped[date_key][model_name][ticker_name] = (fp, file_dt)
-                    except Exception:
-                        pass
-        except Exception as exc:
-            print(f"Error scanning files: {exc}")
+                date_key = file_date.strftime("%Y-%m-%d")
+                bt_grouped.setdefault(date_key, {}).setdefault(model_name, {})
+                if is_tv_code:
+                    bt_grouped[date_key][model_name][f"File_{file}"] = (fp, file_dt)
+                else:
+                    cur = bt_grouped[date_key][model_name].get(ticker_name)
+                    if cur is None or file_dt > cur[1]:
+                        bt_grouped[date_key][model_name][ticker_name] = (fp, file_dt)
+            except Exception:
+                pass
 
         total = sum(len(t) for d in bt_grouped.values() for t in d.values())
         date_count = len(bt_grouped)
