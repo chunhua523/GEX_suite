@@ -328,6 +328,131 @@ class PlaywrightCDPAutomator(TVAutomator):
     def set_apply_visibility_preset(self, enabled: bool) -> None:
         self.apply_visibility_preset = bool(enabled)
 
+    # ---------- Preflight: clear leftover blocking overlays ----------
+    # TradingView occasionally drops a full-page modal over the chart — most
+    # notably "We've closed this connection … exceeded your plan's limits"
+    # (session bumped because the account is open on too many tabs/devices).
+    # If that overlay is sitting on the tab when a batch starts, the Layouts
+    # dialog can't open → list_layouts() degrades to Current → total=0 and the
+    # whole paste silently no-ops. The chain still sees exit=0. So before
+    # reading layouts we detect such an overlay and clear it (dismiss button,
+    # else a hard reload of the chart, which drops transient overlays).
+    _BLOCKING_MODAL_NEEDLES = (
+        "closed this connection",
+        "exceeded your plan",
+        "plan's limits",
+        "restore connection",
+        "get more connections",
+        "已關閉這個連線",
+        "已超過方案",
+        "已超過你的方案",
+    )
+
+    async def detect_blocking_overlay(self) -> str | None:
+        """Return the offending line of text if a known blocking modal is up.
+
+        Detection is text-based against ``document.body.innerText`` — the needle
+        phrases are specific enough to the connection/plan-limit modal that they
+        won't false-positive on normal chart UI.
+        """
+        page = self._require_page()
+        try:
+            text = await page.evaluate(
+                "() => (document.body && document.body.innerText) || ''"
+            )
+        except Exception:
+            return None
+        low = (text or "").lower()
+        for needle in self._BLOCKING_MODAL_NEEDLES:
+            if needle in low:
+                for line in (text or "").splitlines():
+                    if needle in line.lower():
+                        return line.strip()[:160] or needle
+                return needle
+        return None
+
+    async def _try_dismiss_blocking_modal(self) -> bool:
+        """Click the modal's close/restore control; fall back to Escape.
+
+        Prefers 'Restore connection' (re-establishes the session) over the X so
+        the data feed comes back, and explicitly avoids the 'Get more
+        connections' upsell button.
+        """
+        page = self._require_page()
+        selectors = (
+            "button:has-text('Restore connection')",
+            "button:has-text('Restore')",
+            "button:has-text('還原連線')",
+            "#overlap-manager-root button[aria-label*='Close']",
+            "#overlap-manager-root [data-name='close']",
+            "#overlap-manager-root button:has-text('Close')",
+            "button[aria-label='Close']",
+            "button[aria-label*='關閉']",
+        )
+        for sel in selectors:
+            try:
+                btn = page.locator(sel).first
+                if await btn.count() and await btn.is_visible():
+                    await btn.click(timeout=1500)
+                    self._log(f"[preflight] clicked dismiss control: {sel}")
+                    return True
+            except Exception:
+                continue
+        try:
+            await page.keyboard.press("Escape")
+            return True
+        except Exception:
+            return False
+
+    async def clear_blocking_overlay(self, *, allow_reload: bool = True) -> dict:
+        """Best-effort clear of a leftover blocking modal before a batch.
+
+        Returns a dict: ``{"was_blocked", "cleared", "snippet", "reloaded"}``.
+        On the happy path (no overlay) this is a single cheap ``evaluate`` and
+        returns immediately with ``was_blocked=False``.
+        """
+        page = self._require_page()
+        await page.bring_to_front()
+        snippet = await self.detect_blocking_overlay()
+        result = {"was_blocked": snippet is not None, "cleared": True,
+                  "snippet": snippet, "reloaded": False}
+        if snippet is None:
+            return result
+        self._log(f"[preflight] blocking modal detected → {snippet!r}")
+
+        # Strategy 1: dismiss via the modal's own controls.
+        for _ in range(2):
+            if not await self._try_dismiss_blocking_modal():
+                break
+            await page.wait_for_timeout(450)
+            if await self.detect_blocking_overlay() is None:
+                self._log("[preflight] modal dismissed via control/Escape")
+                return result
+
+        # Strategy 2: hard reload — a fresh chart load drops transient overlays.
+        if allow_reload:
+            self._log("[preflight] modal persists → reloading chart")
+            try:
+                await page.reload(wait_until="domcontentloaded", timeout=30_000)
+            except Exception as exc:
+                self._log(f"[preflight] reload failed {exc!r}")
+            result["reloaded"] = True
+            await page.wait_for_timeout(2500)
+            # It may re-appear after reload (genuine session bump) → dismiss once more.
+            if await self.detect_blocking_overlay() is not None:
+                await self._try_dismiss_blocking_modal()
+                await page.wait_for_timeout(600)
+
+        still = await self.detect_blocking_overlay()
+        if still is None:
+            self._log("[preflight] chart clear")
+            return result
+        result["cleared"] = False
+        result["snippet"] = still
+        self._log(f"[preflight] modal STILL present → {still!r}")
+        await self._dump_dom("preflight_modal_stuck")
+        return result
+
     # ---------- Phase B helpers (layouts / sub-charts) ----------
     _LAYOUT_SCROLL_ATTR = "data-gex-layout-scroll"
 

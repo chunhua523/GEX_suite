@@ -2113,6 +2113,27 @@ class TradingViewPage(QWidget):
             len(layouts) == 1 and layouts[0].id == "current"
         )
 
+    async def _preflight_clear_overlay(self, automator: PlaywrightCDPAutomator) -> None:
+        """Clear a leftover blocking modal (e.g. TradingView's 'connection
+        closed / plan limit' overlay) before reading layouts — otherwise it
+        would silently degrade the run to total=0. Best-effort; never raises."""
+        try:
+            res = await automator.clear_blocking_overlay()
+        except Exception as exc:
+            self._exec_log(f"【Preflight】清除遮罩時發生例外（略過）：{exc!r}")
+            return
+        if not res.get("was_blocked"):
+            return
+        snippet = (res.get("snippet") or "").strip()
+        if res.get("cleared"):
+            how = "（已重新整理圖表）" if res.get("reloaded") else "（已關閉對話框）"
+            self._exec_log(f"【Preflight】偵測到 TradingView 阻擋遮罩並已清除{how}：{snippet}")
+        else:
+            self._exec_log(
+                "【Preflight｜未清除】TradingView 遮罩在重新整理後仍存在，"
+                f"版面清單可能讀不到。請手動處理該分頁：{snippet}"
+            )
+
     def _warn_if_layout_list_degraded(self, opts: BatchOptions) -> None:
         if opts.layout_scope != "all":
             return
@@ -2470,6 +2491,7 @@ class TradingViewPage(QWidget):
         automator.set_apply_visibility_preset(opts.apply_visibility_preset)
         try:
             await automator.connect()
+            await self._preflight_clear_overlay(automator)
             mondays = sorted(compute_target_mondays(opts.weeks))
             layouts = await self._resolve_target_layouts(automator, opts)
             self._sync_last_phase_b_layout_snap(layouts)
