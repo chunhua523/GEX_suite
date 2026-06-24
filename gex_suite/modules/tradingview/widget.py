@@ -1825,7 +1825,7 @@ class TradingViewPage(QWidget):
         item: WorkItem,
         *,
         skip_if_has_values: bool,
-        max_retry: int = 1,
+        max_retry: int = 2,
         subchart_cache: WeeklyGexSubchartCache | None = None,
         dry_run: bool = False,
     ) -> BatchResultItem:
@@ -1848,6 +1848,15 @@ class TradingViewPage(QWidget):
         if "新建 indicator 欄位非空白" in (result.message or "") or "opened a pre-existing indicator after add" in msg:
             self._exec_log(
                 f"【略過重試】ticker={item.ticker} 週一起={item.monday}：新增指標對位失敗（非暫態）。"
+            )
+            return result
+        if "週期不符" in (result.message or ""):
+            # Existing on-chart indicator is anchored to a different week than
+            # expected — a stable chart-state condition (safety abort), not a
+            # transient UI hiccup. Retrying re-reads the same date and fails
+            # identically, so skip the retry and surface it for manual fix.
+            self._exec_log(
+                f"【略過重試】ticker={item.ticker} 週一起={item.monday}：既有指標週期不符（需手動處理，非暫態）。"
             )
             return result
 
@@ -2109,10 +2118,29 @@ class TradingViewPage(QWidget):
         automator: PlaywrightCDPAutomator,
         opts: BatchOptions,
     ) -> list[LayoutInfo]:
+        if opts.layout_scope == "urls" or opts.layout_urls:
+            # Targeted re-scan: only the explicitly given chart URLs. Navigation
+            # happens in the scan loop via automator.load_layout() (page.goto);
+            # the real layout name is read off-page after load, so the
+            # placeholder name here just needs to be human-recognisable.
+            return [
+                LayoutInfo(id=f"url::{u}", name=self._label_from_chart_url(u), url=u)
+                for u in opts.layout_urls
+            ]
         if opts.layout_scope == "active":
             active_name = (await automator.get_current_layout_name() or "Current Layout").strip()
             return [LayoutInfo(id="active", name=active_name)]
         return await automator.list_layouts()
+
+    @staticmethod
+    def _label_from_chart_url(url: str) -> str:
+        """Short, recognisable label for a chart URL — the '/chart/<id>' tail."""
+        marker = "/chart/"
+        idx = url.find(marker)
+        if idx == -1:
+            return url.strip() or "URL"
+        chart_id = url[idx + len(marker):].strip("/").split("/")[0]
+        return f"URL:{chart_id}" if chart_id else url.strip()
 
     def _sync_last_phase_b_layout_snap(self, layouts: list[LayoutInfo]) -> None:
         self._last_phase_b_layouts = [
@@ -3134,7 +3162,7 @@ class TradingViewPage(QWidget):
                                 automator,
                                 item,
                                 skip_if_has_values=opts.skip_filled_days,
-                                max_retry=1,
+                                max_retry=2,
                                 subchart_cache=subchart_cache,
                                 dry_run=opts.dry_run,
                             )

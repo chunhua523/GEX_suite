@@ -71,6 +71,12 @@ def parse_args() -> argparse.Namespace:
                    help="Override weeks_mode from auto_paste_config.json.")
     p.add_argument("--layout-scope", default="", choices=["", "all", "active"],
                    help="Override layout_scope from auto_paste_config.json.")
+    p.add_argument("--layout-url", dest="layout_url", action="append", default=[],
+                   metavar="URL_OR_CHARTID",
+                   help="Scan ONLY these chart pages (repeatable). Accepts a full "
+                        "TradingView chart URL or a bare /chart/<id>. Forces "
+                        "layout-scope=urls; ideal for re-scanning pages that failed "
+                        "in an earlier run. Cache-aware: already-filled cells skip.")
     p.add_argument("--ticker-scope", default="", choices=["", "all", "ticker"],
                    help="Override ticker_scope from config.")
     p.add_argument("--ticker", default="", help="Used when --ticker-scope=ticker.")
@@ -196,16 +202,32 @@ def _ensure_cdp(cdp_url: str, *, browser: str, auto_launch: bool,
     return False
 
 
+def _normalize_chart_url(raw: str) -> str:
+    """Accept a full TradingView chart URL or a bare /chart/<id> and return a
+    canonical 'https://www.tradingview.com/chart/<id>/' URL."""
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    if s.startswith("http://") or s.startswith("https://"):
+        return s
+    cid = s.strip("/").split("/")[-1]
+    return f"https://www.tradingview.com/chart/{cid}/" if cid else ""
+
+
 def _build_options(config: dict, args: argparse.Namespace):
     """Construct BatchOptions from config defaults + CLI overrides."""
     from .engine import BatchOptions
     weeks = args.weeks or config.get("weeks_mode") or "this_week"
-    layout_scope = args.layout_scope or config.get("layout_scope") or "all"
+    layout_urls = tuple(
+        u for u in (_normalize_chart_url(x) for x in (args.layout_url or [])) if u
+    )
+    layout_scope = "urls" if layout_urls else (args.layout_scope or config.get("layout_scope") or "all")
     ticker_scope = args.ticker_scope or config.get("ticker_scope") or "all"
     ticker = args.ticker or config.get("ticker") or None
     start_rules = config.get("start_time_rules") or {}
     return BatchOptions(
         layout_scope=layout_scope,  # type: ignore[arg-type]
+        layout_urls=layout_urls,
         ticker_scope=ticker_scope,  # type: ignore[arg-type]
         ticker=ticker,
         weeks=weeks,  # type: ignore[arg-type]
@@ -342,14 +364,21 @@ def main() -> int:
 
     print(f"▶️ TV batch: scope={opts.layout_scope} ticker_scope={opts.ticker_scope} "
           f"weeks={opts.weeks} dry_run={opts.dry_run} cdp={cdp_url}")
+    if opts.layout_urls:
+        print(f"   只掃 {len(opts.layout_urls)} 個指定版面：")
+        for u in opts.layout_urls:
+            print(f"     • {u}")
 
     ticker_for_title = (opts.ticker or "all") if opts.ticker_scope == "ticker" else "all"
+    layout_for_title = (
+        f"urls({len(opts.layout_urls)})" if opts.layout_urls else opts.layout_scope
+    )
     log_kind = "scan_cli_dry" if opts.dry_run else "scan_cli"
     page._begin_run_log(
         log_kind,
         title_suffix=(
             f"ticker={ticker_for_title} weeks={opts.weeks} "
-            f"layout={opts.layout_scope} dry_run={opts.dry_run}"
+            f"layout={layout_for_title} dry_run={opts.dry_run}"
         ),
     )
     log_path = getattr(page, "_latest_log_path", None)

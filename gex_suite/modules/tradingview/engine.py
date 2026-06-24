@@ -8,7 +8,7 @@ from typing import Awaitable, Callable, Iterable, Literal
 from gex_suite.shared import db
 
 
-LayoutScopeMode = Literal["active", "all"]
+LayoutScopeMode = Literal["active", "all", "urls"]
 TickerScopeMode = Literal["all", "ticker"]
 WeeksMode = Literal["this_week", "last_4_weeks"]
 
@@ -16,6 +16,10 @@ WeeksMode = Literal["this_week", "last_4_weeks"]
 @dataclass(frozen=True)
 class BatchOptions:
     layout_scope: LayoutScopeMode = "all"
+    # When layout_scope == "urls", scan ONLY these chart URLs (navigate via
+    # page.goto per URL) instead of enumerating the saved-layout list. Used by
+    # targeted re-scans of pages that failed in an earlier run.
+    layout_urls: tuple[str, ...] = ()
     ticker_scope: TickerScopeMode = "all"
     ticker: str | None = None
     weeks: WeeksMode = "this_week"

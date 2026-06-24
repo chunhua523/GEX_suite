@@ -15,6 +15,7 @@ import secrets
 import re
 
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from gex_suite.shared import db
 from gex_suite.shared.paths import DATA_DIR
 
@@ -1314,11 +1315,45 @@ class PlaywrightCDPAutomator(TVAutomator):
             out.append(SubChartInfo(index=idx, symbol=sym))
         return out
 
+    async def _wait_pane_count_stable(
+        self,
+        *,
+        settle_polls: int = 2,
+        interval_ms: int = 220,
+        max_wait_ms: int = 4000,
+    ) -> int:
+        """Poll the visible chart-widget count until it stops changing for
+        ``settle_polls`` consecutive reads (or ``max_wait_ms`` elapses), then
+        return the settled count.
+
+        TradingView renders panes progressively after a layout switch, so
+        reading the count too early undercounts subcharts. Observed 2026-06-24:
+        a 5-pane layout (ADI+MCHP+STM+ON+TXN) enumerated as 1 because only the
+        first pane had laid out when the count was read — the other 4 subcharts
+        were then silently skipped (no failure logged). The post-goto settle
+        wait returns at the *first* visible pane, which is not enough; this
+        guard waits for the count to actually stabilise.
+        """
+        page = self._require_page()
+        last = await self._count_visible_chart_widgets()
+        stable = 1
+        waited = 0
+        while waited < max_wait_ms and (stable < settle_polls or last == 0):
+            await page.wait_for_timeout(interval_ms)
+            waited += interval_ms
+            cur = await self._count_visible_chart_widgets()
+            if cur == last:
+                stable += 1
+            else:
+                stable = 1
+                last = cur
+        return last
+
     async def enumerate_subcharts(self) -> list[SubChartInfo]:
         """Enumerate visible sub-charts and read per-chart symbol best-effort."""
         page = self._require_page()
         await page.bring_to_front()
-        widget_count = await self._count_visible_chart_widgets()
+        widget_count = await self._wait_pane_count_stable()
         if widget_count == 0:
             # Fallback: single active chart
             return [SubChartInfo(index=0, symbol=await self.get_active_symbol())]
@@ -1751,7 +1786,18 @@ class PlaywrightCDPAutomator(TVAutomator):
                 "button:has-text('Indicators')"
             ).first
             if await fx_btn.count():
-                await fx_btn.click()
+                # Fail-fast: the button can be present-but-not-yet-actionable
+                # right after a subchart switch. A default-timeout click blocks
+                # the whole 30s before erroring; wait briefly for it to become
+                # clickable and cap the click so a transient lag fails quickly
+                # and lets the caller's retry loop take over instead of stalling
+                # the batch (observed 2026-06-24: 30s Indicators-button timeouts).
+                try:
+                    await fx_btn.wait_for(state="visible", timeout=5000)
+                    await fx_btn.click(timeout=5000)
+                except PlaywrightTimeoutError:
+                    self._log("[add_favorite_indicator] fx button not clickable within 5s; fail-fast")
+                    raise
                 await page.wait_for_timeout(350)
 
         await self._open_favorites_tab_if_present()
