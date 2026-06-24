@@ -208,11 +208,10 @@ def _format_result_text(result: Dict[str, Any]) -> str:
             if r and r not in reasons:
                 reasons.append(r)
         if reasons:
-            lines.append(f"Failed Reason   : {', '.join(reasons[:3])}")
-        preview = ", ".join([f"{x.get('model')}/{x.get('ticker')}" for x in failed[:5]])
-        if len(failed) > 5:
-            preview += f" ... 共 {len(failed)} 筆"
-        lines.append(f"Failed Items    : {preview}")
+            lines.append(f"Failed Reason   : {', '.join(reasons)}")
+        lines.append("Failed Items    :")
+        for x in failed:
+            lines.append(f"  - {x.get('model')}/{x.get('ticker')}")
     if failed_count > 0:
         lines.append("Retry Command   : /scraper retry-failed")
     lines.append("```")
