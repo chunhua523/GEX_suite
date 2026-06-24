@@ -39,6 +39,10 @@ SCRAPER_TICKERS_DEFAULT = SCRAPER_DATA_DIR / "tickers_index.json"
 SCRAPER_CME_TICKERS_DEFAULT = SCRAPER_DATA_DIR / "tickers_index_cme.json"
 SUITE_CONFIG_PATH = DATA_DIR / "suite_config.json"
 TRADINGVIEW_AUTO_PASTE_CONFIG_PATH = TRADINGVIEW_DATA_DIR / "auto_paste_config.json"
+# Distinct chart-page URLs that failed in the most recent scan/paste run.
+# Written by the tradingview CLI after every all/urls-scope run; read by the
+# /paste/retry-failed API endpoint (Discord `/paste retry-failed`).
+TRADINGVIEW_LAST_FAILED_PATH = TRADINGVIEW_DATA_DIR / "last_scan_failed.json"
 
 SERVICE_ACCOUNT_PATH = DATA_DIR / "service_account.json"
 

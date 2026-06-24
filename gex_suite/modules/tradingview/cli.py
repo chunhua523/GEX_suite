@@ -24,10 +24,14 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from gex_suite.shared.paths import TRADINGVIEW_AUTO_PASTE_CONFIG_PATH
+from gex_suite.shared.paths import (
+    TRADINGVIEW_AUTO_PASTE_CONFIG_PATH,
+    TRADINGVIEW_LAST_FAILED_PATH,
+)
 
 DEFAULT_CDP_URL = "http://127.0.0.1:9222"
 
@@ -315,6 +319,7 @@ def _serialize_report(report: Any, elapsed: float, captured_log: list[str]) -> d
             "layout_name": getattr(item, "layout_name", None),
             "subchart_index": getattr(item, "subchart_index", None),
             "subchart_symbol": getattr(item, "subchart_symbol", None),
+            "chart_url": getattr(item, "chart_url", None),
         })
     return {
         "ok": True,
@@ -326,6 +331,52 @@ def _serialize_report(report: Any, elapsed: float, captured_log: list[str]) -> d
         "items": items_out,
         "log_tail": captured_log[-50:],
     }
+
+
+def _record_last_scan_failed(payload: dict, opts: Any) -> None:
+    """Persist the distinct chart-page URLs that failed this run so the
+    /paste/retry-failed endpoint (Discord `/paste retry-failed`) can re-scan
+    exactly those pages.
+
+    Only written for whole-run scopes ("all" full daily run, or "urls" retry) —
+    a narrow ``--ticker-scope ticker`` scan covers only one ticker, so letting
+    it overwrite the record would drop the other pages that failed in the daily
+    run. A retry run ("urls") DOES overwrite, by design: it scanned exactly the
+    previously-failed pages, so its remaining-failed set is the new truth (and
+    becomes empty when everything passes).
+    """
+    if getattr(opts, "ticker_scope", "all") == "ticker":
+        return
+    seen: set[str] = set()
+    failed: list[dict] = []
+    for it in payload.get("items", []):
+        if it.get("status") != "failed":
+            continue
+        url = (it.get("chart_url") or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        failed.append({
+            "url": url,
+            "layout_name": it.get("layout_name"),
+            "ticker": it.get("ticker"),
+            "monday": it.get("monday"),
+            "message": it.get("message"),
+        })
+    record = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "weeks": getattr(opts, "weeks", None),
+        "layout_scope": getattr(opts, "layout_scope", None),
+        "failed_count": len(failed),
+        "urls": [f["url"] for f in failed],
+        "failed": failed,
+    }
+    try:
+        TRADINGVIEW_LAST_FAILED_PATH.write_text(
+            json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception as exc:
+        print(f"⚠️ 寫入 last_scan_failed.json 失敗：{exc}")
 
 
 def main() -> int:
@@ -409,6 +460,7 @@ def main() -> int:
         payload = _serialize_report(report, elapsed, captured)
         if log_path:
             payload["run_log"] = str(log_path)
+        _record_last_scan_failed(payload, opts)
         print(f"✅ TV batch done in {elapsed:.1f}s — total={payload['total']} "
               f"done={payload['done']} skipped={payload['skipped']} failed={payload['failed']}")
 

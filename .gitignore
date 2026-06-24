@@ -24,6 +24,7 @@ gex_suite/data/suite_config.json
 gex_suite/data/tradingview/auto_paste_config.json
 gex_suite/data/tradingview/debug/
 gex_suite/data/tradingview/logs/
+gex_suite/data/tradingview/last_scan_failed.json
 
 # Local test fixtures — real scraped Gamma snapshots (not committed)
 sample_data/

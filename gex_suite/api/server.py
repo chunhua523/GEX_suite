@@ -17,6 +17,7 @@ from fastapi import FastAPI
 from gex_suite.shared.paths import ensure_dirs
 
 from .routes import chain as chain_routes
+from .routes import paste as paste_routes
 from .routes import scraper as scraper_routes
 
 # Load DISCORD_NOTIFY_WEBHOOK from Jeff-Agent .env if not already in env.
@@ -53,6 +54,7 @@ app = FastAPI(
 )
 app.include_router(scraper_routes.router)
 app.include_router(chain_routes.router)
+app.include_router(paste_routes.router)
 
 
 @app.on_event("startup")
