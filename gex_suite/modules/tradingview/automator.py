@@ -1274,6 +1274,46 @@ class PlaywrightCDPAutomator(TVAutomator):
         except Exception:
             pass
 
+    async def _reread_symbol_settled(
+        self, idx: int, *, fallback: str | None, tries: int = 4, delay_ms: int = 160
+    ) -> str | None:
+        """Re-activate pane ``idx`` and read its symbol once the header settles.
+
+        Used only to disambiguate a *suspicious duplicate* — a pane that read the
+        same symbol as an earlier pane, which may be a stale header read (the
+        active-chart switch hadn't propagated yet). Re-activates to force the
+        switch, then waits for two consecutive equal reads. A genuine duplicate
+        (e.g. two panes really showing the same symbol) settles back to the same
+        value; a stale one corrects to the pane's true symbol.
+        """
+        page = self._require_page()
+        await self.activate_subchart(idx)
+        last: str | None = None
+        for _ in range(max(2, tries)):
+            await page.wait_for_timeout(delay_ms)
+            cur = await self.get_symbol_search_value()
+            if cur and cur == last:
+                return cur
+            last = cur
+        return last or fallback
+
+    async def _enumerate_subcharts_once(self, widget_count: int) -> list[SubChartInfo]:
+        out: list[SubChartInfo] = []
+        seen: set[str] = set()
+        for idx in range(widget_count):
+            await self.activate_subchart(idx)
+            sym = await self.get_symbol_search_value()
+            # A symbol already seen on an earlier pane is suspicious: it can be a
+            # stale header read from before the active-chart switch landed. Only
+            # then do we pay for a settle re-read; distinct reads stay on the
+            # fast path. Genuine duplicates survive the re-read unchanged.
+            if sym and sym in seen:
+                sym = await self._reread_symbol_settled(idx, fallback=sym)
+            if sym:
+                seen.add(sym)
+            out.append(SubChartInfo(index=idx, symbol=sym))
+        return out
+
     async def enumerate_subcharts(self) -> list[SubChartInfo]:
         """Enumerate visible sub-charts and read per-chart symbol best-effort."""
         page = self._require_page()
@@ -1283,10 +1323,22 @@ class PlaywrightCDPAutomator(TVAutomator):
             # Fallback: single active chart
             return [SubChartInfo(index=0, symbol=await self.get_active_symbol())]
 
-        out: list[SubChartInfo] = []
-        for idx in range(widget_count):
-            await self.activate_subchart(idx)
-            out.append(SubChartInfo(index=idx, symbol=await self.get_symbol_search_value()))
+        out = await self._enumerate_subcharts_once(widget_count)
+        # Degenerate guard: >1 pane but every pane resolved to the SAME symbol
+        # almost always means the active-chart switch never registered — the
+        # global header stayed frozen on pane #0's symbol, collapsing every
+        # subchart onto it (observed 2026-06-23: mag7 read AAPL for all 7 panes,
+        # ES1!+SPX+SPY read SPX for all 3). Re-hydrate and enumerate once more.
+        distinct = {s.symbol for s in out if s.symbol}
+        if widget_count > 1 and len(distinct) <= 1:
+            await page.bring_to_front()
+            await page.wait_for_timeout(600)
+            # Warm up the active-chart machinery before the real pass.
+            await self.activate_subchart(0)
+            await page.wait_for_timeout(220)
+            retry = await self._enumerate_subcharts_once(widget_count)
+            if len({s.symbol for s in retry if s.symbol}) > len(distinct):
+                return retry
         return out
 
     async def activate_subchart(self, idx: int) -> None:

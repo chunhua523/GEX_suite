@@ -267,12 +267,25 @@ class TVRunLogWriter:
             f"<div id=\"layout-total\" data-total=\"{int(total)}\" hidden></div>\n"
         )
 
-    def begin_layout(self, name: str, mode: str | None = None, url: str | None = None) -> None:
+    def begin_layout(
+        self,
+        name: str,
+        mode: str | None = None,
+        url: str | None = None,
+        subchart_count: int | None = None,
+    ) -> None:
         if self._layout_open:
             self.end_layout()
         meta_bits = []
         if mode:
-            meta_bits.append(f"模式：{_esc(mode)}")
+            # Callers may pass either a bare mode ("cleanup") or a pre-formatted
+            # annotation that already starts with "模式…" ("模式：equity（預設）",
+            # "模式（依子圖序）：index, equity"). Only add the prefix when it's
+            # missing, so we don't render the doubled "模式：模式：".
+            mode_str = _esc(mode)
+            meta_bits.append(mode_str if mode_str.startswith("模式") else f"模式：{mode_str}")
+        if subchart_count is not None:
+            meta_bits.append(f"子圖：{int(subchart_count)}")
         if url:
             meta_bits.append(f"URL：{_esc(url)}")
         meta_html = (

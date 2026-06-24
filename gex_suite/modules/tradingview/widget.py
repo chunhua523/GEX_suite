@@ -638,6 +638,7 @@ class TradingViewPage(QWidget):
                 name=payload.get("layout") or payload.get("text") or "",
                 mode=payload.get("_layout_mode"),
                 url=payload.get("_layout_url"),
+                subchart_count=payload.get("_layout_subchart_count"),
             )
             return
         if payload.get("tag") == "__set_layout_total__":
@@ -742,6 +743,7 @@ class TradingViewPage(QWidget):
         name: str,
         mode: str | None = None,
         url: str | None = None,
+        subchart_count: int | None = None,
     ) -> None:
         """One-line UI header + open a new <details> block in disk log."""
         if QThread.currentThread() is not self.thread():
@@ -755,6 +757,7 @@ class TradingViewPage(QWidget):
                 "detail": None,
                 "_layout_mode": mode,
                 "_layout_url": url,
+                "_layout_subchart_count": subchart_count,
             }
             self._marshal_event.emit(payload)
             return
@@ -764,6 +767,8 @@ class TradingViewPage(QWidget):
             parts.append(html_lib.escape(mode, quote=False))
         if url:
             parts.append(f"<span style=\"color:#6e7681\">{html_lib.escape(url, quote=False)}</span>")
+        if subchart_count is not None:
+            parts.append(f"子圖 {int(subchart_count)}")
         line = (
             f"<span style=\"color:#6e7681\">[{datetime_now_hms()}]</span> "
             f"<span style=\"color:#79c0ff;font-weight:600\">{parts[0]}</span>"
@@ -774,7 +779,9 @@ class TradingViewPage(QWidget):
         # Disk: open a new <details> block
         if self._run_log_writer is not None:
             try:
-                self._run_log_writer.begin_layout(name, mode=mode, url=url)
+                self._run_log_writer.begin_layout(
+                    name, mode=mode, url=url, subchart_count=subchart_count
+                )
             except Exception:
                 pass
 
@@ -784,6 +791,7 @@ class TradingViewPage(QWidget):
         *,
         mode: str | None = None,
         url: str | None = None,
+        subchart_count: int | None = None,
     ) -> None:
         # Marshalled through the same channel as events to avoid touching the
         # writer from a worker thread.
@@ -797,6 +805,7 @@ class TradingViewPage(QWidget):
             "detail": None,
             "_layout_mode": mode,
             "_layout_url": url,
+            "_layout_subchart_count": subchart_count,
         }
         if QThread.currentThread() is not self.thread():
             self._marshal_event.emit(payload)
@@ -811,6 +820,7 @@ class TradingViewPage(QWidget):
                 payload.get("layout") or payload.get("text") or "",
                 mode=payload.get("_layout_mode"),
                 url=payload.get("_layout_url"),
+                subchart_count=payload.get("_layout_subchart_count"),
             )
         except Exception:
             pass
@@ -2429,11 +2439,13 @@ class TradingViewPage(QWidget):
                     else:
                         self._exec_log(f"【略過版面】無法載入：{layout.name}")
                         continue
-                self._begin_layout_in_log(layout.name, mode="cleanup")
                 subcharts = await self._enumerate_subcharts_with_retry(
                     automator,
                     label="整理流程",
                     retries=1,
+                )
+                self._begin_layout_in_log(
+                    layout.name, mode="cleanup", subchart_count=len(subcharts)
                 )
                 if not subcharts:
                     self._exec_log(f"【警告】版面「{layout.name}」無法取得子圖清單，已略過。")
@@ -2535,6 +2547,7 @@ class TradingViewPage(QWidget):
                     else:
                         self._exec_log(f"【略過版面】無法載入：{layout.name}")
                         continue
+                    mode_annotation = None
                 else:
                     layout_marker_seq = self._parse_layout_marker_sequence(layout.name)
                     if not layout_marker_seq:
@@ -2543,12 +2556,6 @@ class TradingViewPage(QWidget):
                         mode_annotation = f"模式：{layout_marker_seq[0]}"
                     else:
                         mode_annotation = f"模式（依子圖序）：{', '.join(layout_marker_seq)}"
-                    # UI gets a one-line header; HTML gets a <details> summary instead of a duplicate event
-                    self._emit_layout_header(
-                        name=layout.name,
-                        mode=mode_annotation,
-                        url=str(post.get("url") or "—"),
-                    )
                 locked_layout_name = (await automator.get_current_layout_name() or "").upper()
                 if not locked_layout_name:
                     locked_layout_name = layout.name.upper()
@@ -2558,6 +2565,17 @@ class TradingViewPage(QWidget):
                     label="批次掃描",
                     retries=1,
                 )
+                # Header emitted AFTER enumeration so the summary can carry the
+                # subchart count. Skipped on the degraded (load-failed) path,
+                # which has no mode annotation — matches prior behaviour.
+                if mode_annotation is not None:
+                    # UI gets a one-line header; HTML gets a <details> summary instead of a duplicate event
+                    self._emit_layout_header(
+                        name=layout.name,
+                        mode=mode_annotation,
+                        url=str(post.get("url") or "—"),
+                        subchart_count=len(subcharts),
+                    )
                 if not subcharts:
                     self._exec_log(
                         f"【警告】版面「{layout.name}」無法取得子圖清單"
