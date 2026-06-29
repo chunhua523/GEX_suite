@@ -388,9 +388,6 @@ class ScrapedFilesDialog(QDialog):
         for group_name in sorted(grouped_tickers.keys()):
             items = grouped_tickers[group_name]
             items.sort(key=lambda x: x[0])
-            gb = QGroupBox(f"{group_name} ({len(items)} tickers)")
-            gb.setCheckable(True)
-            gb.setChecked(True)
             chk_list: list[tuple[QCheckBox, Any]] = []
 
             cont = QWidget()
@@ -403,27 +400,9 @@ class ScrapedFilesDialog(QDialog):
                 self._date_file_vars.append((cb, fp))
                 chk_list.append((cb, fp))
 
-            hdr = QHBoxLayout()
-            btn_all = QPushButton("☑")
-            btn_all.setFixedWidth(36)
-
-            def sel_all(lst: list[tuple[QCheckBox, Any]]) -> None:
-                def _() -> None:
-                    all_on = all(x[0].isChecked() for x in lst)
-                    for c, _ in lst:
-                        c.setChecked(not all_on)
-
-                return _
-
-            btn_all.clicked.connect(sel_all(chk_list))
-            hdr.addWidget(btn_all)
-            hdr.addStretch(1)
-
-            outer = QVBoxLayout()
-            outer.addLayout(hdr)
-            outer.addWidget(cont)
-            gb.setLayout(outer)
-            gb.toggled.connect(lambda c, dc=cont: dc.setVisible(c))
+            gb = self._make_collapsible_group(
+                f"{group_name} ({len(items)} tickers)", chk_list, cont
+            )
             self._date_scroll_layout.insertWidget(self._date_scroll_layout.count() - 1, gb)
 
         if ungrouped:
@@ -492,9 +471,6 @@ class ScrapedFilesDialog(QDialog):
 
             for group_name in sorted(grouped_tv.keys()):
                 group_items = grouped_tv[group_name]
-                gb = QGroupBox(f"{group_name} ({len(group_items)} tickers)")
-                gb.setCheckable(True)
-                gb.setChecked(True)
                 cont = QWidget()
                 cl = QVBoxLayout(cont)
                 tv_group_checkboxes: list[tuple[QCheckBox, Any]] = []
@@ -505,26 +481,9 @@ class ScrapedFilesDialog(QDialog):
                     self._date_file_vars.append((cb, ("TV_DATA", t_label, content)))
                     tv_group_checkboxes.append((cb, ("TV_DATA", t_label, content)))
 
-                hdr = QHBoxLayout()
-                btn_all = QPushButton("☑")
-                btn_all.setFixedWidth(36)
-
-                def sel_all_tv(lst: list[tuple[QCheckBox, Any]]) -> None:
-                    def _() -> None:
-                        all_on = all(x[0].isChecked() for x in lst)
-                        for c, _ in lst:
-                            c.setChecked(not all_on)
-
-                    return _
-
-                btn_all.clicked.connect(sel_all_tv(tv_group_checkboxes))
-                hdr.addWidget(btn_all)
-                hdr.addStretch(1)
-                outer = QVBoxLayout()
-                outer.addLayout(hdr)
-                outer.addWidget(cont)
-                gb.setLayout(outer)
-                gb.toggled.connect(lambda c, dc=cont: dc.setVisible(c))
+                gb = self._make_collapsible_group(
+                    f"{group_name} ({len(group_items)} tickers)", tv_group_checkboxes, cont
+                )
                 self._date_scroll_layout.insertWidget(self._date_scroll_layout.count() - 1, gb)
 
             if ungrouped_tv:
@@ -541,6 +500,88 @@ class ScrapedFilesDialog(QDialog):
             err = QLabel(f"Error processing TV Code files: {exc}")
             err.setStyleSheet("color:red;")
             self._date_scroll_layout.insertWidget(0, err)
+
+    def _make_collapsible_group(
+        self,
+        title: str,
+        chk_list: "list[tuple[QCheckBox, Any]]",
+        content: QWidget,
+    ) -> QGroupBox:
+        """A collapsible section with collapse and selection kept separate.
+
+        Layout::
+
+            ▼  title (k/n 已選)
+            ☑
+            [ file checkboxes … ]
+
+        - The ▼/▶ arrow (left of the title) only shows/hides the body — it never
+          changes selection (a checkbox there was read as "selected", which
+          caused hidden-but-checked files to be opened anyway).
+        - The ☑ button (own row, left-aligned, below the title) selects /
+          deselects every checkbox in the group; it hides with the body.
+        - The title shows a live ``k/n`` selected count, so a *collapsed* group
+          still reveals how many of its items are checked.
+        """
+        gb = QGroupBox()
+        outer = QVBoxLayout(gb)
+        outer.setContentsMargins(6, 6, 6, 6)
+
+        title_lbl = QLabel()
+        title_lbl.setStyleSheet("font-weight:bold;")
+        n = len(chk_list)
+
+        def update_title() -> None:
+            k = sum(1 for c, _ in chk_list if c.isChecked())
+            title_lbl.setText(f"{title}  ({k}/{n} 已選)")
+
+        # No-border/no-padding so the glyph isn't clipped by the button chrome.
+        btn_collapse = QPushButton("▼")
+        btn_collapse.setFixedSize(22, 22)
+        btn_collapse.setStyleSheet("QPushButton{border:none;padding:0px;}")
+
+        # Body holds the select-all row + the file list; collapsing hides it all.
+        body = QWidget()
+        body_l = QVBoxLayout(body)
+        body_l.setContentsMargins(0, 0, 0, 0)
+
+        btn_all = QPushButton("☑")
+        btn_all.setFixedWidth(36)
+
+        def toggle_all() -> None:
+            if not chk_list:
+                return
+            all_on = all(c.isChecked() for c, _ in chk_list)
+            for c, _ in chk_list:
+                c.setChecked(not all_on)
+
+        btn_all.clicked.connect(toggle_all)
+
+        sel_row = QHBoxLayout()
+        sel_row.addWidget(btn_all)
+        sel_row.addStretch(1)
+        body_l.addLayout(sel_row)
+        body_l.addWidget(content)
+
+        def toggle_collapse() -> None:
+            vis = not body.isVisible()
+            body.setVisible(vis)
+            btn_collapse.setText("▼" if vis else "▶")
+
+        btn_collapse.clicked.connect(toggle_collapse)
+
+        for c, _ in chk_list:
+            c.toggled.connect(update_title)
+        update_title()
+
+        hdr = QHBoxLayout()
+        hdr.addWidget(btn_collapse)
+        hdr.addWidget(title_lbl)
+        hdr.addStretch(1)
+
+        outer.addLayout(hdr)
+        outer.addWidget(body)
+        return gb
 
     def _date_select_all(self) -> None:
         for cb, _ in self._date_file_vars:
@@ -922,33 +963,9 @@ class ScrapedFilesDialog(QDialog):
                     self._bt_file_vars.append((cb, fp_n))
                     date_chk_list.append((cb, fp_n))
 
-            gb_date = QGroupBox(f"{date_key}  ({title_count})")
-            gb_date.setCheckable(True)
-            gb_date.setChecked(True)
-
-            hdr = QHBoxLayout()
-            btn_sel_date = QPushButton("☑")
-            btn_sel_date.setFixedWidth(36)
-
-            def make_date_sel_all(lst: list[tuple[QCheckBox, Any]]) -> None:
-                def _() -> None:
-                    if not lst:
-                        return
-                    all_sel = all(v.isChecked() for v, _ in lst)
-                    for v, _ in lst:
-                        v.setChecked(not all_sel)
-
-                return _
-
-            btn_sel_date.clicked.connect(make_date_sel_all(date_chk_list))
-            hdr.addWidget(btn_sel_date)
-            hdr.addStretch(1)
-
-            box_layout = QVBoxLayout()
-            box_layout.addLayout(hdr)
-            box_layout.addWidget(date_content)
-            gb_date.setLayout(box_layout)
-            gb_date.toggled.connect(lambda c, dc=date_content: dc.setVisible(c))
+            gb_date = self._make_collapsible_group(
+                f"{date_key}  ({title_count})", date_chk_list, date_content
+            )
             self._bt_scroll_layout.insertWidget(self._bt_scroll_layout.count() - 1, gb_date)
 
     def _bt_select_all(self) -> None:
