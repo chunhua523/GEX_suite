@@ -375,6 +375,16 @@ class GammaCompareDialog(QDialog):
 
         tabs.addTab(self._build_strike_tab(), "Per-Strike Δ")
 
+    def closeEvent(self, event) -> None:
+        # Stop any in-flight load before teardown so the QWebEngineView render
+        # process isn't mid-navigation when WA_DeleteOnClose destroys it. (The
+        # main teardown-crash cause was opening this dialog inside the parent
+        # viewer's modal exec() loop — that parent is now modeless.)
+        if HAS_WEBENGINE:
+            for web in self.findChildren(QWebEngineView):
+                web.stop()
+        super().closeEvent(event)
+
     # -- shared helpers -------------------------------------------------------
     def _make_pair_combos(self) -> "tuple[QComboBox, QComboBox]":
         """Two date pickers defaulting to the two most recent days."""

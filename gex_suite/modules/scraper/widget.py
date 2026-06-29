@@ -432,13 +432,28 @@ class ScraperPage(QWidget):
         if not self.download_folder or not os.path.isdir(self.download_folder):
             QMessageBox.warning(self, "Warning", "Download folder is not set or invalid.")
             return
+        # Open modeless (show, not exec). The viewer's Compare feature spawns a
+        # modeless QWebEngineView dialog; if this parent ran a modal exec() loop,
+        # that child would (a) get stuck behind this window on macOS and (b)
+        # segfault when destroyed inside the nested modal loop. Keep a single
+        # live instance and just re-raise it if already open.
+        existing = getattr(self, "_scraped_files_dlg", None)
+        if existing is not None:
+            existing.raise_()
+            existing.activateWindow()
+            return
         dlg = ScrapedFilesDialog(
             self,
             self.download_folder,
             self.ticker_filepath,
             self.cme_ticker_filepath,
         )
-        dlg.exec()
+        dlg.setAttribute(Qt.WA_DeleteOnClose)
+        self._scraped_files_dlg = dlg
+        dlg.destroyed.connect(lambda *_a: setattr(self, "_scraped_files_dlg", None))
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
 
     def _manage_std_tickers(self) -> None:
         self._open_ticker_manager(self.ticker_filepath, "Standard Platform Tickers")
