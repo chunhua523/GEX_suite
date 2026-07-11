@@ -10,10 +10,8 @@ import asyncio
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 import html as html_lib
-import os
 from pathlib import Path
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -57,6 +55,9 @@ from .automator import (
     PlaywrightCDPAutomator,
     WeeklyGexSubchartCache,
 )
+from .browser_paths import browser_candidates
+from .groups_tab import LayoutGroupsTab
+from .qt_async import AsyncCoroThread
 from .run_log import SEVERITY_CSS, TVRunLogWriter, latest_log_path, new_log_path
 from .engine import (
     BatchOptions,
@@ -162,31 +163,7 @@ class _PhaseBScanThread(QThread):
             asyncio.set_event_loop(None)
 
 
-class _AsyncCoroThread(QThread):
-    """Runs a coroutine factory on a dedicated event loop and emits its result.
-
-    Use this for any TradingView async work triggered from the UI thread —
-    calling ``asyncio.run`` directly on the GUI thread would freeze the window.
-    """
-
-    succeeded = Signal(object)
-    failed = Signal(object)
-
-    def __init__(self, parent: QWidget, coro_factory) -> None:
-        super().__init__(parent)
-        self._coro_factory = coro_factory
-
-    def run(self) -> None:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            result = loop.run_until_complete(self._coro_factory())
-            self.succeeded.emit(result)
-        except BaseException as exc:  # noqa: BLE001
-            self.failed.emit(exc)
-        finally:
-            loop.close()
-            asyncio.set_event_loop(None)
+_AsyncCoroThread = AsyncCoroThread
 
 
 class TradingViewPage(QWidget):
@@ -423,6 +400,10 @@ class TradingViewPage(QWidget):
         man.addWidget(hint)
 
         tabs.addTab(tab_manual, "手動貼上")
+
+        # ----- Tab: 版面分組 -----
+        self.tab_groups = LayoutGroupsTab(log_fn=self._exec_log, parent=self)
+        tabs.addTab(self.tab_groups, "版面分組")
 
         # ----- Shared status / progress / log -----
         self.lbl_status = QLabel(
@@ -1168,46 +1149,7 @@ class TradingViewPage(QWidget):
         )
 
     def _browser_candidates(self, browser_type: str) -> list[str | None]:
-        kind = "brave" if str(browser_type).strip().lower() == "brave" else "chrome"
-        if kind == "brave":
-            if sys.platform.startswith("win"):
-                return [
-                    shutil.which("brave"),
-                    shutil.which("brave.exe"),
-                    os.path.join(os.environ.get("PROGRAMFILES", "C:\\Program Files"), "BraveSoftware\\Brave-Browser\\Application\\brave.exe"),
-                    os.path.join(os.environ.get("PROGRAMFILES(X86)", "C:\\Program Files (x86)"), "BraveSoftware\\Brave-Browser\\Application\\brave.exe"),
-                    os.path.join(os.environ.get("LOCALAPPDATA", ""), "BraveSoftware\\Brave-Browser\\Application\\brave.exe"),
-                ]
-            if sys.platform == "darwin":
-                return [
-                    shutil.which("brave"),
-                    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
-                ]
-            return [
-                shutil.which("brave-browser"),
-                shutil.which("brave"),
-            ]
-        if sys.platform.startswith("win"):
-            return [
-                shutil.which("chrome"),
-                shutil.which("chrome.exe"),
-                os.path.join(os.environ.get("PROGRAMFILES", "C:\\Program Files"), "Google\\Chrome\\Application\\chrome.exe"),
-                os.path.join(os.environ.get("PROGRAMFILES(X86)", "C:\\Program Files (x86)"), "Google\\Chrome\\Application\\chrome.exe"),
-                os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google\\Chrome\\Application\\chrome.exe"),
-            ]
-        if sys.platform == "darwin":
-            return [
-                shutil.which("google-chrome"),
-                shutil.which("chrome"),
-                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            ]
-        return [
-            shutil.which("google-chrome"),
-            shutil.which("google-chrome-stable"),
-            shutil.which("chromium-browser"),
-            shutil.which("chromium"),
-            shutil.which("chrome"),
-        ]
+        return browser_candidates(browser_type)
 
     def _copy_to_clipboard(self) -> None:
         from PySide6.QtWidgets import QApplication

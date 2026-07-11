@@ -51,6 +51,9 @@ def main() -> int:
     step("import chart.widget", lambda: __import__("gex_suite.modules.chart.widget", fromlist=["*"]))
     step("import tradingview.widget", lambda: __import__("gex_suite.modules.tradingview.widget", fromlist=["*"]))
     step("import tradingview.automator", lambda: __import__("gex_suite.modules.tradingview.automator", fromlist=["*"]))
+    step("import tradingview.layout_groups", lambda: __import__("gex_suite.modules.tradingview.layout_groups", fromlist=["*"]))
+    step("import tradingview.app_launcher", lambda: __import__("gex_suite.modules.tradingview.app_launcher", fromlist=["*"]))
+    step("import tradingview.groups_tab", lambda: __import__("gex_suite.modules.tradingview.groups_tab", fromlist=["*"]))
 
     print("DB sanity...")
     from gex_suite.shared import db

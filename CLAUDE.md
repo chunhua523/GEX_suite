@@ -129,6 +129,35 @@ Every silent `continue` in `_phase_b_scan_flow` should produce a log line. Curre
 
 If you add a new silent skip, add a corresponding log line — historical pattern is "every skip explains itself".
 
+## 版面分組（layout groups）— TradingView 頁第三分頁
+
+Files: `layout_groups.py`（model/persistence，無 Qt）、`app_launcher.py`（桌面 app
+CDP 驅動，無 Qt）、`groups_tab.py`（UI）、`qt_async.py`/`browser_paths.py`（自
+widget.py 搬出的共用件）。資料檔 `data/tradingview/layout_groups.json`。
+一組＝一視窗、組內版面＝分頁；App 與瀏覽器兩種開啟模式。
+
+**TradingView 桌面 app 自動化 — 實測結論（3.3.0，勿走回頭路）**：
+
+- app 接受 `--remote-debugging-port` → 全功能 CDP。開新視窗＝對任一 page target
+  `Input.dispatchKeyEvent` Cmd+N（modifiers=4）；開分頁＝在圖表 tab 裡
+  `Runtime.evaluate("window.open(url)")`（app 攔截成原生分頁）；新視窗的預設
+  new-tab 分頁用 `location.href` 就地導航（不留空分頁）。
+- **file:// → https 導航會換 CDP targetId** — 導航後要用 URL 片段或
+  「新出現的 chart target」重新尋標（`app_launcher.open_group_in_app`）。
+- 死路：`open -a TradingView <url>` 只 activate（macOS open-url handler 只餵
+  AuthenticationHandler）；`tradingview://` scheme 同樣只做登入 redirect；
+  AX/System Events 點原生選單（New window、Open link from clipboard）點得到
+  但 Electron handler 不會觸發。
+- app 未帶 debug port 時 `ensure_app_cdp` 會自動 quit（Apple Event）＋
+  `open -a … --args --remote-debugging-port=9333` 重啟；視窗分頁由 app 自行還原。
+
+**瀏覽器模式**：同 `--user-data-dir`（`$TMPDIR/gex_tv_cdp_profile`）argv
+forwarding —— `Popen([bin, --user-data-dir=…, --new-window, url1, url2…])` 由
+既有 instance 開一個新視窗、URL 依序成分頁；冷啟補 9222 debug 旗標＋
+`--no-first-run`。不可用 Playwright `ctx.new_page()`（tab 會落在既有視窗）。
+
+CLI 探測（不開 GUI）：`python -m gex_suite.modules.tradingview.app_launcher <url>…`。
+
 ## Stop button (Preview / Scan / Cleanup)
 
 `_cancel_batch_scan` flag is read at multiple checkpoint sites in `_phase_b_scan_flow`. To wire Stop to a new flow:
