@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QGroupBox,
     QHBoxLayout,
     QInputDialog,
@@ -46,10 +47,13 @@ from .layout_groups import (
     LayoutGroupsState,
     apply_scan_results_to_disk,
     chart_id_from_url,
+    get_configured_path,
+    layout_groups_path,
     load_layout_groups,
     new_group_id,
     normalize_chart_url,
     save_layout_groups,
+    set_configured_path,
     subchart_title,
 )
 from .qt_async import AsyncCoroThread
@@ -207,6 +211,21 @@ class LayoutGroupsTab(QWidget):
         hint.setStyleSheet("color:#888; font-size:11px;")
         root.addWidget(hint)
 
+        # ----- 設定檔位置 -----
+        row_path = QHBoxLayout()
+        row_path.addWidget(QLabel("設定檔："))
+        self.lbl_path = QLabel()
+        self.lbl_path.setStyleSheet("color:#888; font-size:11px;")
+        self.lbl_path.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        row_path.addWidget(self.lbl_path, 1)
+        b_path_change = QPushButton("變更…")
+        b_path_change.clicked.connect(self._on_change_path)
+        row_path.addWidget(b_path_change)
+        self.b_path_reset = QPushButton("還原預設")
+        self.b_path_reset.clicked.connect(self._on_reset_path)
+        row_path.addWidget(self.b_path_reset)
+        root.addLayout(row_path)
+
         if sys.platform != "darwin":
             for b in (self.b_open_app, self.b_open_all_app):
                 b.setEnabled(False)
@@ -214,6 +233,7 @@ class LayoutGroupsTab(QWidget):
 
         self._refresh_groups_list()
         self._refresh_scan_info()
+        self._refresh_path_label()
 
     # ---------- 共用 ----------
     def _save(self) -> None:
@@ -267,11 +287,45 @@ class LayoutGroupsTab(QWidget):
         self._refresh_scan_info()
         self._refresh_groups_list()
 
+    # ---------- 設定檔位置 ----------
+    def _refresh_path_label(self) -> None:
+        path = layout_groups_path()
+        custom = get_configured_path() is not None
+        self.lbl_path.setText(f"{path}" + ("（自訂）" if custom else "（預設）"))
+        self.lbl_path.setToolTip(str(path))
+        self.b_path_reset.setEnabled(custom)
+
+    def _on_change_path(self) -> None:
+        if self._busy():
+            return
+        start_dir = str(layout_groups_path().parent)
+        picked, _ = QFileDialog.getOpenFileName(
+            self,
+            "選擇既有的 layout_groups.json 檔案（只改指向，不搬移現有資料）",
+            start_dir,
+            "JSON (*.json)",
+        )
+        if not picked:
+            return
+        set_configured_path(picked)
+        self._reload_state()
+        self._refresh_path_label()
+        self._log(f"【版面分組｜設定檔】已指向：{picked}")
+
+    def _on_reset_path(self) -> None:
+        if self._busy():
+            return
+        set_configured_path(None)
+        self._reload_state()
+        self._refresh_path_label()
+        self._log(f"【版面分組｜設定檔】已還原預設位置：{layout_groups_path()}")
+
     def showEvent(self, event) -> None:  # noqa: N802 - Qt override
         super().showEvent(event)
         # 切到本分頁時撿起外部行程（每日 CLI、批次貼上）寫入的最新快取。
         if self._busy_thread is None:
             self._reload_state()
+            self._refresh_path_label()
 
     def _current_group(self) -> LayoutGroup | None:
         item = self.list_groups.currentItem()

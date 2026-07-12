@@ -14,11 +14,55 @@ import json
 import re
 import secrets
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from gex_suite.shared.paths import TRADINGVIEW_LAYOUT_GROUPS_PATH, ensure_dirs
 
 _CHART_ID_RE = re.compile(r"/chart/([A-Za-z0-9_-]{4,})")
+
+# suite_config.json 內存放自訂路徑的鍵；空/None → 用預設 TRADINGVIEW_LAYOUT_GROUPS_PATH。
+_CONFIG_PATH_KEY = "layout_groups_path"
+# 測試/驗證用的行程內覆寫（優先於 config）；正式流程不設。
+_PATH_OVERRIDE: Path | None = None
+
+
+def set_path_override(path: str | Path | None) -> None:
+    """行程內強制指定資料檔位置（主要給測試用；設 None 還原為 config/預設）."""
+    global _PATH_OVERRIDE
+    _PATH_OVERRIDE = Path(path).expanduser() if path else None
+
+
+def get_configured_path() -> str | None:
+    """讀 suite_config.json 內的自訂路徑（未設回 None）."""
+    try:
+        from gex_suite.shared import config as _shared_config
+
+        raw = _shared_config.load_config().get(_CONFIG_PATH_KEY)
+    except Exception:
+        return None
+    raw = str(raw or "").strip()
+    return raw or None
+
+
+def set_configured_path(path: str | Path | None) -> None:
+    """把自訂路徑寫進 suite_config.json（GUI 與每日排程共讀；None/空＝還原預設）."""
+    from gex_suite.shared import config as _shared_config
+
+    cfg = _shared_config.load_config()
+    resolved = str(Path(path).expanduser()) if str(path or "").strip() else None
+    cfg[_CONFIG_PATH_KEY] = resolved
+    _shared_config.save_config(cfg)
+
+
+def layout_groups_path() -> Path:
+    """目前生效的資料檔位置：行程覆寫 > config 自訂 > 內建預設."""
+    if _PATH_OVERRIDE is not None:
+        return _PATH_OVERRIDE
+    configured = get_configured_path()
+    if configured:
+        return Path(configured).expanduser()
+    return TRADINGVIEW_LAYOUT_GROUPS_PATH
 
 _DEFAULT_SETTINGS: dict[str, Any] = {
     # App 模式走 CDP：TradingView 以 --remote-debugging-port=<app_cdp_port> 啟動，
@@ -262,10 +306,11 @@ def apply_scan_results_to_disk(
 
 def load_layout_groups() -> LayoutGroupsState:
     ensure_dirs()
-    if not TRADINGVIEW_LAYOUT_GROUPS_PATH.exists():
+    path = layout_groups_path()
+    if not path.exists():
         return LayoutGroupsState()
     try:
-        with TRADINGVIEW_LAYOUT_GROUPS_PATH.open("r", encoding="utf-8") as f:
+        with path.open("r", encoding="utf-8") as f:
             data = json.load(f)
         settings = dict(_DEFAULT_SETTINGS)
         raw_settings = data.get("settings")
@@ -294,5 +339,7 @@ def load_layout_groups() -> LayoutGroupsState:
 
 def save_layout_groups(state: LayoutGroupsState) -> None:
     ensure_dirs()
-    with TRADINGVIEW_LAYOUT_GROUPS_PATH.open("w", encoding="utf-8") as f:
+    path = layout_groups_path()
+    path.parent.mkdir(parents=True, exist_ok=True)  # 自訂路徑的父目錄可能還不存在
+    with path.open("w", encoding="utf-8") as f:
         json.dump(state.to_dict(), f, indent=2, ensure_ascii=False)

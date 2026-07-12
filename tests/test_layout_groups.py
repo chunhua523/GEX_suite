@@ -127,7 +127,8 @@ def test_apply_scan_results_partial_upserts_no_prune() -> None:
 
 
 def test_state_round_trip(tmp_dir: Path) -> None:
-    lg.TRADINGVIEW_LAYOUT_GROUPS_PATH = tmp_dir / "layout_groups.json"
+    data_path = tmp_dir / "layout_groups.json"
+    lg.set_path_override(data_path)
 
     state = lg.LayoutGroupsState()
     g = lg.LayoutGroup(group_id="g-11223344", name="指數期貨")
@@ -159,12 +160,12 @@ def test_state_round_trip(tmp_dir: Path) -> None:
     assert loaded.settings["delay_per_url_ms"] == 1800
 
     # Corrupt file → tolerant empty state.
-    lg.TRADINGVIEW_LAYOUT_GROUPS_PATH.write_text("{not json", encoding="utf-8")
+    data_path.write_text("{not json", encoding="utf-8")
     broken = lg.load_layout_groups()
     assert broken.groups == [] and broken.scanned_layouts == []
 
     # Bad entries inside an otherwise valid file are dropped, not fatal.
-    lg.TRADINGVIEW_LAYOUT_GROUPS_PATH.write_text(
+    data_path.write_text(
         json.dumps(
             {
                 "groups": [
@@ -178,6 +179,47 @@ def test_state_round_trip(tmp_dir: Path) -> None:
     partial = lg.load_layout_groups()
     assert len(partial.groups) == 1
     assert [l.layout_id for l in partial.groups[0].layouts] == ["AbCd1234"]
+    lg.set_path_override(None)
+
+
+def test_path_resolver_precedence(tmp_dir: Path) -> None:
+    from gex_suite.shared import config as shared_config
+
+    # 隔離 suite_config.json 到 temp，避免動到真實設定。
+    orig_cfg_path = shared_config.SUITE_CONFIG_PATH
+    shared_config.SUITE_CONFIG_PATH = tmp_dir / "suite_config.json"
+    try:
+        lg.set_path_override(None)
+        default = lg.layout_groups_path()
+        assert default == lg.TRADINGVIEW_LAYOUT_GROUPS_PATH
+        assert lg.get_configured_path() is None
+
+        # config 自訂 → 生效，且能被讀回。
+        custom = tmp_dir / "synced" / "groups.json"
+        lg.set_configured_path(custom)
+        assert lg.get_configured_path() == str(custom)
+        assert lg.layout_groups_path() == custom
+
+        # 存進自訂路徑後父目錄自動建立、可讀回。
+        st = lg.LayoutGroupsState()
+        st.groups.append(lg.LayoutGroup(group_id="g-x", name="同步群組"))
+        lg.save_layout_groups(st)
+        assert custom.exists()
+        assert [g.name for g in lg.load_layout_groups().groups] == ["同步群組"]
+
+        # 行程覆寫優先於 config。
+        override = tmp_dir / "override.json"
+        lg.set_path_override(override)
+        assert lg.layout_groups_path() == override
+
+        # 還原 config（None）→ 回預設。
+        lg.set_path_override(None)
+        lg.set_configured_path(None)
+        assert lg.get_configured_path() is None
+        assert lg.layout_groups_path() == lg.TRADINGVIEW_LAYOUT_GROUPS_PATH
+    finally:
+        shared_config.SUITE_CONFIG_PATH = orig_cfg_path
+        lg.set_path_override(None)
 
 
 def main() -> int:
@@ -193,6 +235,7 @@ def main() -> int:
             ("apply_scan_full", test_apply_scan_results_full_prunes_and_updates),
             ("apply_scan_partial", test_apply_scan_results_partial_upserts_no_prune),
             ("state_round_trip", lambda: test_state_round_trip(tmp_dir)),
+            ("path_resolver_precedence", lambda: test_path_resolver_precedence(tmp_dir)),
         ]
         for name, fn in tests:
             try:

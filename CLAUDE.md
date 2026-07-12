@@ -152,6 +152,19 @@ widget.py 搬出的共用件）。資料檔 `data/tradingview/layout_groups.json
   （名稱＋子圖標題，不顯示 chart id；filter 可用子圖標題篩）。`groups_tab`
   的 `showEvent` 會 reload，撿起外部行程（每日 CLI、批次貼上）寫的最新快取。
 
+**資料檔位置可自訂**（分組頁底部「設定檔：… / 變更… / 還原預設」）：
+
+- 生效路徑由 `layout_groups.layout_groups_path()` 解析：行程覆寫
+  （`set_path_override`，只給測試）> `suite_config.json` 的 `layout_groups_path`
+  鍵（`get/set_configured_path`）> 內建 `TRADINGVIEW_LAYOUT_GROUPS_PATH`。
+  `load/save_layout_groups`、`apply_scan_results_to_disk` 全走解析器，所以 GUI
+  與每日排程 CLI 讀寫同一份檔（把兩機的 GUI 都指到同一個雲端/同步資料夾即可
+  跨機共用群組）。
+- 變更＝選一個既有的 json 檔（`QFileDialog.getOpenFileName`），只改指向、不搬移
+  現有檔；典型用法是指到雲端/同步資料夾裡那份 `layout_groups.json`。
+- `suite_config.json` 是 per-machine（gitignored），自訂路徑不會自動同步到另一台，
+  需在該機 GUI 各自設定一次（或指向同一個已同步的資料夾）。
+
 **TradingView 桌面 app 自動化 — 實測結論（3.3.0，勿走回頭路）**：
 
 - app 接受 `--remote-debugging-port` → 全功能 CDP。開新視窗＝對任一 page target
