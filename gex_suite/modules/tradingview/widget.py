@@ -14,7 +14,6 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-import tempfile
 import time
 from urllib import request
 
@@ -55,7 +54,8 @@ from .automator import (
     PlaywrightCDPAutomator,
     WeeklyGexSubchartCache,
 )
-from .browser_paths import browser_candidates
+from . import layout_groups as layout_groups_mod
+from .browser_paths import browser_candidates, launch_cdp_browser
 from .groups_tab import LayoutGroupsTab
 from .qt_async import AsyncCoroThread
 from .run_log import SEVERITY_CSS, TVRunLogWriter, latest_log_path, new_log_path
@@ -1112,22 +1112,8 @@ class TradingViewPage(QWidget):
             )
             return
 
-        profile_dir = Path(tempfile.gettempdir()) / "gex_tv_cdp_profile"
-        profile_dir.mkdir(parents=True, exist_ok=True)
-
         try:
-            subprocess.Popen(
-                [
-                    browser_path,
-                    "--remote-debugging-port=9222",
-                    "--remote-debugging-address=127.0.0.1",
-                    f"--user-data-dir={profile_dir}",
-                    "--new-window",
-                    target_url,
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            launch_cdp_browser(browser_type, urls=[target_url])
         except Exception as exc:
             QMessageBox.critical(self, "啟動失敗", f"無法啟動瀏覽器：{exc}")
             self.lbl_status.setText(f"啟動 {app_name} 失敗。")
@@ -2491,6 +2477,8 @@ class TradingViewPage(QWidget):
             prev_layout_label: str | None = None
             prev_layout_modified = False
             stop_all = False
+            # 版面分組快取：url -> {name, subcharts, complete}，流程結尾 flush。
+            cache_entries: dict[str, dict] = {}
 
             for layout_idx, layout in enumerate(layouts):
                 if self._batch_should_stop():
@@ -2516,6 +2504,13 @@ class TradingViewPage(QWidget):
                         )
                     else:
                         self._exec_log(f"【略過版面】無法載入：{layout.name}")
+                        # 版面存在但載入失敗 → 仍登記（避免 full 同步誤刪），子圖沿用舊快取。
+                        self._cache_layout_entry(
+                            cache_entries,
+                            layout,
+                            runtime_url="",
+                            name=(layout.name if opts.layout_scope == "all" else ""),
+                        )
                         continue
                     mode_annotation = None
                 else:
@@ -2526,9 +2521,26 @@ class TradingViewPage(QWidget):
                         mode_annotation = f"模式：{layout_marker_seq[0]}"
                     else:
                         mode_annotation = f"模式（依子圖序）：{', '.join(layout_marker_seq)}"
-                locked_layout_name = (await automator.get_current_layout_name() or "").upper()
+                current_layout_display_name = (
+                    await automator.get_current_layout_name() or ""
+                ).strip()
+                locked_layout_name = current_layout_display_name.upper()
                 if not locked_layout_name:
                     locked_layout_name = layout.name.upper()
+                cache_entry: dict | None = None
+                if not degraded_current_layout:
+                    # scope=all 用清單裡的真實名稱；urls/active 用頁面上讀到的名稱
+                    #（LayoutInfo.name 是合成的 URL:xxx 標籤，不能進快取）。
+                    cache_entry = self._cache_layout_entry(
+                        cache_entries,
+                        layout,
+                        runtime_url=str(post.get("url") or ""),
+                        name=(
+                            layout.name
+                            if opts.layout_scope == "all"
+                            else current_layout_display_name
+                        ),
+                    )
                 matched_keys_in_layout: set[tuple[str, str]] = set()
                 subcharts = await self._enumerate_subcharts_with_retry(
                     automator,
@@ -2573,6 +2585,10 @@ class TradingViewPage(QWidget):
                     )
                     if search_symbol:
                         seen_symbols.add(search_symbol)
+                    if cache_entry is not None:
+                        title = self._subchart_title(search_symbol, sub.symbol)
+                        if title:
+                            cache_entry["subcharts"].append(title)
                     if self._is_formula_symbol(search_symbol):
                         u = str(post.get("url") or "—")
                         self._log_event(
@@ -3116,6 +3132,10 @@ class TradingViewPage(QWidget):
                         await automator.clear_indicator_scope_marker()
                     if stop_all:
                         break
+                else:
+                    # 子圖迴圈完整跑完（未 break）→ 子圖標題清單可信，寫入快取。
+                    if cache_entry is not None:
+                        cache_entry["complete"] = True
 
                 prev_layout_label = layout.name
                 prev_layout_modified = layout_modified
@@ -3125,6 +3145,8 @@ class TradingViewPage(QWidget):
             if not opts.dry_run and prev_layout_modified:
                 self._exec_log(f"【已儲存版面】{prev_layout_label or '—'}（批次結束）")
                 await automator.save_current_layout()
+
+            self._flush_layout_groups_cache(opts, layouts, cache_entries, stop_all)
 
             self._last_phase_b_symbols = sorted(seen_symbols)
             self._last_phase_b_matched_subcharts = matched_subcharts
@@ -3140,6 +3162,72 @@ class TradingViewPage(QWidget):
             )
         finally:
             await automator.close()
+
+    # ---------- 版面分組快取同步（掃圖流程附帶更新；GUI 與每日 CLI 共用此 flow） ----------
+
+    @staticmethod
+    def _cache_layout_entry(
+        cache_entries: dict[str, dict],
+        layout: LayoutInfo,
+        runtime_url: str,
+        name: str,
+    ) -> dict | None:
+        """登記本次掃描看到的版面；回傳 entry 供子圖標題累積（無法定位 URL 時回 None）."""
+        url = layout_groups_mod.normalize_chart_url(layout.url or runtime_url or "")
+        if not url:
+            return None
+        entry = cache_entries.setdefault(url, {"name": "", "subcharts": [], "complete": False})
+        # 空名（例：urls scope 的合成 URL:xxx 標籤）留空，讓快取沿用既有名稱。
+        if name.strip():
+            entry["name"] = name.strip()
+        return entry
+
+    @staticmethod
+    def _subchart_title(search_symbol: str | None, fallback: str | None) -> str:
+        return layout_groups_mod.subchart_title(search_symbol or fallback or "")
+
+    def _flush_layout_groups_cache(
+        self,
+        opts: BatchOptions,
+        layouts: list[LayoutInfo],
+        cache_entries: dict[str, dict],
+        stop_all: bool,
+    ) -> None:
+        """掃圖流程收尾：把看到的版面（含子圖標題）同步進版面分組快取.
+
+        scope=all 且完整跑完 → full 同步（快取整批替換；群組內 scan 來源的
+        已刪版面一併移除）。中止／局部 scope／版面清單降級 → 只 upsert 不刪。
+        """
+        try:
+            results = [
+                layout_groups_mod.GroupLayout(
+                    name=entry["name"],
+                    url=url,
+                    layout_id=layout_groups_mod.chart_id_from_url(url),
+                    source="scan",
+                    # 子圖迴圈沒跑完的版面不覆蓋舊子圖清單（留空 → 沿用快取）。
+                    subcharts=list(entry["subcharts"]) if entry["complete"] else [],
+                )
+                for url, entry in cache_entries.items()
+            ]
+            if not results:
+                return
+            degraded = len(layouts) == 1 and layouts[0].id in ("current", "active")
+            full = opts.layout_scope == "all" and not stop_all and not degraded
+            summary = layout_groups_mod.apply_scan_results_to_disk(
+                results,
+                full=full,
+                scanned_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+            )
+            msg = (
+                f"【版面分組｜同步】版面快取已更新（{'全量' if full else '局部'}）："
+                f"{summary['cache']} 個版面"
+            )
+            if summary["pruned"]:
+                msg += f"\n  已自群組移除 {summary['pruned']} 個已刪除的版面"
+            self._exec_log(msg)
+        except Exception as exc:
+            self._exec_log(f"【版面分組｜同步】快取更新失敗：{exc}")
 
     def _work_items_from_dry_run_report(self, report: BatchReport) -> list[WorkItem]:
         """Turn batch dry-run results into preview table rows (with ``preview_status``)."""

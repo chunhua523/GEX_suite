@@ -14,12 +14,8 @@ from __future__ import annotations
 import asyncio
 import subprocess
 import sys
-import tempfile
-import time
 from datetime import datetime
-from pathlib import Path
 from typing import Callable
-from urllib import request
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -42,17 +38,19 @@ from PySide6.QtWidgets import (
 
 from gex_suite.shared import config as shared_config
 from . import app_launcher
+from . import browser_paths
 from .automator import PlaywrightCDPAutomator
-from .browser_paths import browser_candidates
 from .layout_groups import (
     GroupLayout,
     LayoutGroup,
     LayoutGroupsState,
+    apply_scan_results_to_disk,
     chart_id_from_url,
     load_layout_groups,
     new_group_id,
     normalize_chart_url,
     save_layout_groups,
+    subchart_title,
 )
 from .qt_async import AsyncCoroThread
 
@@ -75,7 +73,7 @@ class _LayoutPickerDialog(QDialog):
         self.list_widget = QListWidget()
         self.list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
         for layout in scanned:
-            item = QListWidgetItem(f"{layout.name} — {layout.dedup_key()}")
+            item = QListWidgetItem(layout.display_label())
             item.setData(Qt.UserRole, layout)
             item.setToolTip(layout.url)
             if group.contains(layout):
@@ -90,10 +88,11 @@ class _LayoutPickerDialog(QDialog):
         root.addWidget(buttons)
 
     def _apply_filter(self, text: str) -> None:
-        needle = (text or "").strip().lower()
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
-            item.setHidden(bool(needle) and needle not in item.text().lower())
+            layout: GroupLayout | None = item.data(Qt.UserRole)
+            visible = layout.matches_filter(text) if layout is not None else True
+            item.setHidden(not visible)
 
     def selected_layouts(self) -> list[GroupLayout]:
         return [
@@ -109,6 +108,7 @@ class LayoutGroupsTab(QWidget):
         self._log = log_fn
         self._state: LayoutGroupsState = load_layout_groups()
         self._busy_thread: AsyncCoroThread | None = None
+        self._scan_cancelled = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -171,9 +171,13 @@ class LayoutGroupsTab(QWidget):
 
         # ----- 掃描列 -----
         row_scan = QHBoxLayout()
-        self.b_scan = QPushButton("掃描版面（CDP）")
+        self.b_scan = QPushButton("掃描版面（含子圖標題）")
         self.b_scan.clicked.connect(self._on_scan_layouts)
         row_scan.addWidget(self.b_scan)
+        self.b_scan_stop = QPushButton("停止掃描")
+        self.b_scan_stop.setEnabled(False)
+        self.b_scan_stop.clicked.connect(self._on_scan_stop)
+        row_scan.addWidget(self.b_scan_stop)
         self.lbl_scan_info = QLabel()
         row_scan.addWidget(self.lbl_scan_info)
         row_scan.addStretch(1)
@@ -254,7 +258,20 @@ class LayoutGroupsTab(QWidget):
     def _on_thread_finished(self, thread: AsyncCoroThread) -> None:
         if self._busy_thread is thread:
             self._busy_thread = None
+        self.b_scan_stop.setEnabled(False)
         self._set_running(False)
+
+    def _reload_state(self) -> None:
+        """從磁碟重載（每日排程／paste 流程也會更新同一份檔案）並刷新 UI."""
+        self._state = load_layout_groups()
+        self._refresh_scan_info()
+        self._refresh_groups_list()
+
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().showEvent(event)
+        # 切到本分頁時撿起外部行程（每日 CLI、批次貼上）寫入的最新快取。
+        if self._busy_thread is None:
+            self._reload_state()
 
     def _current_group(self) -> LayoutGroup | None:
         item = self.list_groups.currentItem()
@@ -288,7 +305,7 @@ class LayoutGroupsTab(QWidget):
         if group is not None:
             for layout in group.layouts:
                 suffix = "〔手動〕" if layout.source == "manual" else ""
-                item = QListWidgetItem(f"{layout.name}{suffix} — {layout.dedup_key()}")
+                item = QListWidgetItem(f"{layout.display_label()}{suffix}")
                 item.setData(Qt.UserRole, layout.dedup_key())
                 item.setToolTip(layout.url)
                 self.list_layouts.addItem(item)
@@ -462,69 +479,128 @@ class LayoutGroupsTab(QWidget):
         group.layouts = [by_key[key] for key in order if key in by_key]
         self._save()
 
-    # ---------- 掃描 ----------
+    # ---------- 掃描（走訪每個版面，讀子圖標題） ----------
     def _on_scan_layouts(self) -> None:
         if self._busy():
             return
         cfg = shared_config.load_tradingview_config()
         cdp_url = str(cfg.get("cdp_url") or "http://127.0.0.1:9222").strip()
-        self._log("【版面分組｜掃描】開始（CDP）")
+        kind = str(cfg.get("browser") or "chrome")
+        self._scan_cancelled = False
+        self.b_scan_stop.setEnabled(True)
+        self._log("【版面分組｜掃描】開始（逐版面讀取子圖標題，版面多時需數分鐘）")
         self._start_thread(
-            lambda: self._scan_layouts_coro(cdp_url),
+            lambda: self._scan_layouts_coro(cdp_url, kind),
             self._on_scan_done,
             lambda exc: self._on_scan_failed(cdp_url, exc),
         )
 
-    async def _scan_layouts_coro(self, cdp_url: str):
+    def _on_scan_stop(self) -> None:
+        self._scan_cancelled = True
+        self.b_scan_stop.setEnabled(False)
+        self._log("【版面分組｜掃描】已送出停止請求，將在目前版面完成後結束。")
+
+    async def _read_subchart_titles(self, automator: PlaywrightCDPAutomator) -> list[str]:
+        """走訪目前版面的每張子圖，讀 header symbol 作為標題（含公式圖原樣）."""
+        titles: list[str] = []
+        subs = await automator.enumerate_subcharts()
+        for sub in subs:
+            await automator.activate_subchart(sub.index)
+            raw = ""
+            for _ in range(3):  # hydration retry（同批次流程的讀法）
+                raw = (await automator.get_symbol_search_value() or "").strip()
+                if raw:
+                    break
+                await asyncio.sleep(0.2)
+            title = subchart_title(raw or sub.symbol or "")
+            if title:
+                titles.append(title)
+        return titles
+
+    async def _scan_layouts_coro(self, cdp_url: str, kind: str):
+        # 9222 沒開 → 自動啟動瀏覽器（沿用登入 profile）。
+        if not browser_paths.cdp_ready():
+            self._log("【版面分組｜掃描】9222 瀏覽器未啟動，自動啟動中…")
+            if browser_paths.launch_cdp_browser(kind) is None:
+                raise RuntimeError(f"找不到 {kind} 瀏覽器執行檔")
+            if not await asyncio.to_thread(browser_paths.wait_cdp_ready, 9222, 20.0):
+                raise RuntimeError(
+                    "瀏覽器已啟動但 9222 未就緒（可能已有非 CDP instance 在跑，請全部關閉後重試）"
+                )
+            await asyncio.sleep(5)  # 落地頁 hydration
         automator = PlaywrightCDPAutomator(cdp_url=cdp_url)
         automator.set_logger(lambda _m: None)
         try:
             await automator.connect()
             await automator.clear_blocking_overlay()
-            return await automator.list_layouts()
+            layouts = await automator.list_layouts()
+            if len(layouts) == 1 and layouts[0].id == "current":
+                return {"degraded": True, "results": [], "full": False, "skipped": 0}
+            results: list[GroupLayout] = []
+            skipped = 0
+            cancelled = False
+            for i, info in enumerate(layouts, 1):
+                if self._scan_cancelled:
+                    cancelled = True
+                    break
+                url = normalize_chart_url(info.url or "")
+                if not url:
+                    skipped += 1
+                    continue
+                self._log(f"【版面分組｜掃描】{i}/{len(layouts)}：{info.name}")
+                subcharts: list[str] = []
+                if await automator.load_layout(info):
+                    subcharts = await self._read_subchart_titles(automator)
+                else:
+                    self._log(f"【版面分組｜掃描】版面載入失敗，子圖沿用舊快取：{info.name}")
+                results.append(
+                    GroupLayout(
+                        name=info.name or f"URL:{chart_id_from_url(url)}",
+                        url=url,
+                        layout_id=chart_id_from_url(url),
+                        source="scan",
+                        subcharts=subcharts,
+                    )
+                )
+            return {
+                "degraded": False,
+                "results": results,
+                "full": not cancelled,
+                "skipped": skipped,
+            }
         finally:
             await automator.close()
 
-    def _on_scan_done(self, layouts) -> None:
-        layouts = list(layouts or [])
-        if len(layouts) == 1 and layouts[0].id == "current":
+    def _on_scan_done(self, payload) -> None:
+        payload = payload or {}
+        if payload.get("degraded"):
             QMessageBox.warning(
                 self,
                 "掃描不完整",
-                "無法開啟版面清單對話框（請確認 9222 瀏覽器停在圖表頁），\n"
+                "無法開啟版面清單對話框（請確認 9222 瀏覽器已登入並停在圖表頁），\n"
                 "已保留原有掃描快取。",
             )
             return
-        scanned: list[GroupLayout] = []
-        skipped = 0
-        for info in layouts:
-            url = normalize_chart_url(info.url or "")
-            if not url:
-                skipped += 1
-                continue
-            scanned.append(
-                GroupLayout(
-                    name=info.name or f"URL:{chart_id_from_url(url)}",
-                    url=url,
-                    layout_id=chart_id_from_url(url),
-                    source="scan",
-                )
-            )
-        self._state.scanned_layouts = scanned
-        self._state.scanned_at = datetime.now().astimezone().isoformat(timespec="seconds")
-        # 使用者在 TV 上改過名 → 同步群組內同版面的顯示名稱。
-        by_id = {l.layout_id: l for l in scanned if l.layout_id}
-        for group in self._state.groups:
-            for layout in group.layouts:
-                fresh = by_id.get(layout.layout_id or "")
-                if fresh is not None and fresh.name != layout.name:
-                    layout.name = fresh.name
-        self._save()
-        self._refresh_scan_info()
-        self._refresh_groups_list()
-        msg = f"【版面分組｜掃描】完成：{len(scanned)} 個版面"
+        results = list(payload.get("results") or [])
+        full = bool(payload.get("full"))
+        skipped = int(payload.get("skipped") or 0)
+        if not results:
+            self._log("【版面分組｜掃描】沒有掃到任何版面，快取未變更。")
+            return
+        summary = apply_scan_results_to_disk(
+            results,
+            full=full,
+            scanned_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+        )
+        self._reload_state()
+        msg = (
+            f"【版面分組｜掃描】{'完成' if full else '中止（已保留部分結果）'}："
+            f"{len(results)} 個版面已更新"
+        )
+        if summary["pruned"]:
+            msg += f"\n  已自群組移除 {summary['pruned']} 個已刪除的版面"
         if skipped:
-            msg += f"\n  原因：{skipped} 個無 URL 已略過"
+            msg += f"\n  {skipped} 個無 URL 已略過"
         self._log(msg)
 
     def _on_scan_failed(self, cdp_url: str, exc: BaseException) -> None:
@@ -532,8 +608,8 @@ class LayoutGroupsTab(QWidget):
         QMessageBox.warning(
             self,
             "掃描失敗",
-            f"無法透過 {cdp_url} 掃描版面清單。\n"
-            f"請先在「批次與整理」啟動並登入 9222 瀏覽器。\n\n錯誤：{exc}",
+            f"無法透過 {cdp_url} 完成版面掃描。\n"
+            f"若瀏覽器是剛自動啟動的，請確認 TradingView 已登入後再掃一次。\n\n錯誤：{exc}",
         )
 
     # ---------- App 模式 ----------
@@ -591,9 +667,7 @@ class LayoutGroupsTab(QWidget):
             return
         cfg = shared_config.load_tradingview_config()
         kind = str(cfg.get("browser") or "chrome")
-        browser_path = next(
-            (p for p in browser_candidates(kind) if p and Path(p).exists()), None
-        )
+        browser_path = browser_paths.find_browser(kind)
         if not browser_path:
             QMessageBox.warning(
                 self,
@@ -604,7 +678,7 @@ class LayoutGroupsTab(QWidget):
             return
         delay_ms = self._launch_settings_delay_browser()
         self._start_thread(
-            lambda: self._open_groups_in_browser_coro(browser_path, groups, delay_ms),
+            lambda: self._open_groups_in_browser_coro(kind, browser_path, groups, delay_ms),
             lambda _r: self._log("【版面分組｜瀏覽器】全部群組開啟完成"),
             lambda exc: QMessageBox.warning(self, "瀏覽器開啟失敗", f"錯誤：{exc}"),
         )
@@ -616,48 +690,31 @@ class LayoutGroupsTab(QWidget):
             return 2000
 
     async def _open_groups_in_browser_coro(
-        self, browser_path: str, groups: list[tuple[str, list[str]]], delay_ms: int
+        self, kind: str, browser_path: str, groups: list[tuple[str, list[str]]], delay_ms: int
     ) -> None:
-        profile_dir = Path(tempfile.gettempdir()) / "gex_tv_cdp_profile"
-        profile_dir.mkdir(parents=True, exist_ok=True)
         for i, (name, urls) in enumerate(groups):
             self._log(
                 f"【版面分組｜瀏覽器】開啟群組「{name}」（{len(urls)} 個版面 → 1 視窗）"
             )
-            args = [browser_path, f"--user-data-dir={profile_dir}"]
-            cold_start = not self._cdp_ready()
-            if cold_start:
+            if not browser_paths.cdp_ready():
                 # 冷啟：讓這個 instance 兼任 auto-paste 的 9222 CDP 瀏覽器。
-                # --no-first-run 抑制 chrome://intro（自動化冷啟時沒人幫忙點掉）。
-                args += [
-                    "--remote-debugging-port=9222",
-                    "--remote-debugging-address=127.0.0.1",
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                ]
-            args += ["--new-window", *urls]
-            subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if cold_start and not await asyncio.to_thread(self._wait_cdp_ready, 8.0):
-                self._log(
-                    "【版面分組｜瀏覽器】9222 尚未就緒\n"
-                    "  原因：瀏覽器可能已有非 CDP instance 在跑，後續群組仍會轉送開啟"
+                browser_paths.launch_cdp_browser(kind, urls=urls)
+                if not await asyncio.to_thread(browser_paths.wait_cdp_ready, 9222, 8.0):
+                    self._log(
+                        "【版面分組｜瀏覽器】9222 尚未就緒\n"
+                        "  原因：瀏覽器可能已有非 CDP instance 在跑，後續群組仍會轉送開啟"
+                    )
+            else:
+                # Warm：argv forwarding 給既有 instance（同 user-data-dir）。
+                subprocess.Popen(
+                    [
+                        browser_path,
+                        f"--user-data-dir={browser_paths.cdp_profile_dir()}",
+                        "--new-window",
+                        *urls,
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
                 )
             if i < len(groups) - 1:
                 await asyncio.sleep(delay_ms / 1000)
-
-    @staticmethod
-    def _cdp_ready(timeout: float = 1.0) -> bool:
-        try:
-            with request.urlopen("http://127.0.0.1:9222/json/version", timeout=timeout) as resp:
-                return resp.status == 200
-        except Exception:
-            return False
-
-    @classmethod
-    def _wait_cdp_ready(cls, timeout_sec: float) -> bool:
-        start = time.monotonic()
-        while time.monotonic() - start < timeout_sec:
-            if cls._cdp_ready():
-                return True
-            time.sleep(0.25)
-        return False

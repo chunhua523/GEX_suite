@@ -59,6 +59,73 @@ def test_group_dedup() -> None:
     assert not group.contains(b)
 
 
+def test_display_label_and_filter() -> None:
+    gl = lg.GroupLayout(
+        name="ES [equity]",
+        url="https://www.tradingview.com/chart/AbCd1234/",
+        layout_id="AbCd1234",
+        subcharts=["ES1!", "VIX"],
+    )
+    assert gl.display_label() == "ES [equity]（ES1!, VIX）"
+    assert gl.matches_filter("vix")
+    assert gl.matches_filter("es [eq")
+    assert not gl.matches_filter("QQQ")
+    bare = lg.GroupLayout(name="無子圖", url="https://www.tradingview.com/chart/XyZw9876/")
+    assert bare.display_label() == "無子圖"
+    assert bare.matches_filter("")
+
+
+def _gl(lid: str, name: str, subs: list[str] | None = None, source: str = "scan") -> lg.GroupLayout:
+    return lg.GroupLayout(
+        name=name,
+        url=f"https://www.tradingview.com/chart/{lid}/",
+        layout_id=lid,
+        source=source,
+        subcharts=list(subs or []),
+    )
+
+
+def test_apply_scan_results_full_prunes_and_updates() -> None:
+    state = lg.LayoutGroupsState()
+    state.scanned_layouts = [_gl("AAA11111", "舊名", ["ES1!"]), _gl("BBB22222", "會被刪", ["NQ1!"])]
+    group = lg.LayoutGroup(group_id="g-1", name="G")
+    group.layouts = [
+        _gl("AAA11111", "舊名", ["ES1!"]),                       # 會更新名稱+子圖
+        _gl("BBB22222", "會被刪", ["NQ1!"]),                     # scan 來源、已消失 → prune
+        _gl("CCC33333", "手動的", ["RTY1!"], source="manual"),   # manual → 保留
+    ]
+    state.groups = [group]
+
+    results = [_gl("AAA11111", "新名", ["ES1!", "VIX"])]
+    summary = lg.apply_scan_results(state, results, full=True, scanned_at="2026-07-12T09:00:00+08:00")
+
+    assert [l.layout_id for l in state.scanned_layouts] == ["AAA11111"]
+    assert state.scanned_at == "2026-07-12T09:00:00+08:00"
+    assert [l.layout_id for l in group.layouts] == ["AAA11111", "CCC33333"]
+    assert group.layouts[0].name == "新名"
+    assert group.layouts[0].subcharts == ["ES1!", "VIX"]
+    assert summary["pruned"] == 1
+    assert summary["cache"] == 1
+
+
+def test_apply_scan_results_partial_upserts_no_prune() -> None:
+    state = lg.LayoutGroupsState()
+    state.scanned_layouts = [_gl("AAA11111", "A", ["ES1!"]), _gl("BBB22222", "B", ["NQ1!"])]
+    group = lg.LayoutGroup(group_id="g-1", name="G")
+    group.layouts = [_gl("BBB22222", "B", ["NQ1!"])]
+    state.groups = [group]
+
+    # 局部執行只看到 AAA（且沒讀到子圖 → 沿用舊值）＋ 新版面 DDD
+    results = [_gl("AAA11111", "A 改名", []), _gl("DDD44444", "新版面", ["CL1!"])]
+    lg.apply_scan_results(state, results, full=False)
+
+    by_id = {l.layout_id: l for l in state.scanned_layouts}
+    assert set(by_id) == {"AAA11111", "BBB22222", "DDD44444"}
+    assert by_id["AAA11111"].name == "A 改名"
+    assert by_id["AAA11111"].subcharts == ["ES1!"]  # 空子圖 → 沿用舊快取
+    assert [l.layout_id for l in group.layouts] == ["BBB22222"]  # 不 prune
+
+
 def test_state_round_trip(tmp_dir: Path) -> None:
     lg.TRADINGVIEW_LAYOUT_GROUPS_PATH = tmp_dir / "layout_groups.json"
 
@@ -122,6 +189,9 @@ def main() -> int:
             ("chart_id_from_url", test_chart_id_from_url),
             ("group_layout_from_dict", test_group_layout_from_dict),
             ("group_dedup", test_group_dedup),
+            ("display_label_and_filter", test_display_label_and_filter),
+            ("apply_scan_full", test_apply_scan_results_full_prunes_and_updates),
+            ("apply_scan_partial", test_apply_scan_results_partial_upserts_no_prune),
             ("state_round_trip", lambda: test_state_round_trip(tmp_dir)),
         ]
         for name, fn in tests:

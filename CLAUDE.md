@@ -136,6 +136,22 @@ CDP 驅動，無 Qt）、`groups_tab.py`（UI）、`qt_async.py`/`browser_paths.
 widget.py 搬出的共用件）。資料檔 `data/tradingview/layout_groups.json`。
 一組＝一視窗、組內版面＝分頁；App 與瀏覽器兩種開啟模式。
 
+**版面清單 = 掃描快取（`scanned_layouts`），三處會更新同一份檔案**：
+
+- 分組頁「掃描版面」：`groups_tab._scan_layouts_coro` 逐版面 `load_layout` →
+  `enumerate_subcharts` 讀每張子圖 header symbol 當標題（`subchart_title` 取冒號
+  尾碼、公式圖原樣）。9222 沒開會自動 `launch_cdp_browser`；可中途停止。
+- 批次貼上（GUI）＋每日排程（`cli.py` 重用同一個 `_phase_b_scan_flow`）：流程
+  收尾呼叫 `widget._flush_layout_groups_cache`，把掃圖時看到的版面（含子圖標題）
+  同步進快取。
+- 同步語意在 `layout_groups.apply_scan_results`：`full=True`（scope=all 且完整
+  跑完）整批替換快取、且**群組內 `source=="scan"` 而版面已消失者一併移除**
+  （`source=="manual"` 永遠保留）；`full=False`（scope=urls/active/中止/降級）
+  只 upsert 不刪。子圖迴圈沒跑完的版面 `complete=False` → 不覆蓋舊子圖清單。
+- UI 顯示與 picker filter 都用 `GroupLayout.display_label()`／`matches_filter()`
+  （名稱＋子圖標題，不顯示 chart id；filter 可用子圖標題篩）。`groups_tab`
+  的 `showEvent` 會 reload，撿起外部行程（每日 CLI、批次貼上）寫的最新快取。
+
 **TradingView 桌面 app 自動化 — 實測結論（3.3.0，勿走回頭路）**：
 
 - app 接受 `--remote-debugging-port` → 全功能 CDP。開新視窗＝對任一 page target
