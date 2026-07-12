@@ -25,6 +25,11 @@ echo "========================================"
 #   repo root == 本 script 所在目錄 → 外部獨立 GEX_suite clone → 自我更新
 #   repo root 是上層（Jeff-Project monorepo）或其他 repo → 跳過（避免蓋掉整合版）
 #   沒有 .git（解 zip 的非 git 使用者）→ 抓 GEX_suite zip 覆蓋
+#
+# git 路徑用 fetch + ff / reset --hard（不用 git pull）：發布端曾 force push 覆蓋
+# public repo 舊 history，舊 clone 用 pull 會永遠卡在 divergent branches。
+# reset --hard 只影響 repo 內被 git 追蹤的檔案；使用者自己的設定與資料
+# （suite_config、db、scraper state…）都是 gitignored，不受影響。
 IS_STANDALONE=false
 HAS_GIT=false
 if command -v git &> /dev/null && git rev-parse --is-inside-work-tree &> /dev/null; then
@@ -37,14 +42,24 @@ fi
 if [ "$HAS_GIT" = true ] && [ "$IS_STANDALONE" = false ]; then
     echo "偵測到 monorepo（非獨立 GEX_suite）— 跳過自我更新。"
     echo "（開發者請在 repo 根手動 git pull；外部發布用 gex-suite/publish-to-public.sh）"
-elif ping -c 1 github.com &> /dev/null; then
+elif curl -sI --connect-timeout 5 https://github.com > /dev/null 2>&1; then
     echo "Checking for updates..."
     if [ "$IS_STANDALONE" = true ]; then
         echo "Git repository detected. Updating via git..."
-        if git pull origin main; then
-            echo "Git update successful."
+        if git fetch origin main; then
+            LOCAL_SHA="$(git rev-parse HEAD)"
+            REMOTE_SHA="$(git rev-parse FETCH_HEAD)"
+            if [ "$LOCAL_SHA" = "$REMOTE_SHA" ]; then
+                echo "已是最新版本（$(git rev-parse --short HEAD)）。"
+            elif git merge --ff-only FETCH_HEAD; then
+                echo "Git update successful → $(git rev-parse --short HEAD)"
+            else
+                echo "本機與遠端歷史分岔（或有本地修改）— 以遠端發布版覆蓋..."
+                git reset --hard FETCH_HEAD
+                echo "Git update successful → $(git rev-parse --short HEAD)"
+            fi
         else
-            echo "Git update failed — 繼續用現有版本啟動。"
+            echo "Git fetch 失敗 — 繼續用現有版本啟動。"
         fi
     else
         echo "Downloading latest version from GitHub..."
