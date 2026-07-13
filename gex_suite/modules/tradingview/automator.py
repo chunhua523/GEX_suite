@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Awaitable, Callable
+from urllib.parse import urlsplit
+import asyncio
 import secrets
 import re
 
@@ -18,6 +20,8 @@ from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from gex_suite.shared import db
 from gex_suite.shared.paths import DATA_DIR
+
+from .browser_paths import cdp_page_count, revive_windowless_cdp
 
 
 def _q(s: str) -> str:
@@ -237,9 +241,64 @@ class PlaywrightCDPAutomator(TVAutomator):
 
     async def connect(self) -> None:
         self._pw = await async_playwright().start()
+        await self._revive_windowless_browser()
         self._browser = await self._pw.chromium.connect_over_cdp(self.cdp_url)
         self._context = self._pick_context(self._browser)
         self._page = await self._pick_or_open_page(self._context)
+        await self._assert_logged_in()
+
+    async def is_logged_in(self) -> bool:
+        """TradingView 登入檢查：登入後才會有 .tradingview.com 的 sessionid
+        cookie（cookie 存在 CDP profile 裡）。不依賴 DOM，改版不受影響。"""
+        if self._context is None:
+            raise RuntimeError("Automator is not connected. Call connect() first.")
+        cookies = await self._context.cookies("https://www.tradingview.com/")
+        return any(c.get("name") == "sessionid" and c.get("value") for c in cookies)
+
+    async def _assert_logged_in(self) -> None:
+        """未登入就 fail fast，讓 chain/GUI 的失敗訊息直接寫明原因，而不是
+        之後版面清單打不開、降級 Current-only、total=0 的難解讀失敗。"""
+        if await self.is_logged_in():
+            return
+        msg = (
+            f"【中止｜未登入】TradingView 未登入（{self.cdp_url} 的 profile 無 "
+            "sessionid cookie）— 請在該瀏覽器登入 TradingView 後重跑"
+        )
+        self._log_or_print(msg)
+        raise RuntimeError(msg)
+
+    async def _revive_windowless_browser(self) -> None:
+        """視窗全關但行程常駐的 CDP 瀏覽器（macOS Dock 常駐）profile 已卸載：
+        /json/version 照常回應，但 connect_over_cdp 一律炸
+        「Browser.setDownloadBehavior: Browser context management is not
+        supported」。先用 PUT /json/new 開回一個分頁讓 profile 重新載入。"""
+        try:
+            parts = urlsplit(self.cdp_url)
+            port = parts.port or 9222
+        except ValueError:
+            return
+        host = parts.hostname or "127.0.0.1"
+        pages = await asyncio.to_thread(cdp_page_count, port, 2.0, host)
+        if pages != 0:
+            return
+        self._log_or_print(
+            f"【CDP 自癒】{host}:{port} 瀏覽器無任何視窗（profile 已卸載）→ 開分頁復原"
+        )
+        ok = await asyncio.to_thread(
+            revive_windowless_cdp, port, self.chart_url, 10.0, host
+        )
+        if not ok:
+            self._log_or_print("【CDP 自癒】開分頁失敗 — 請完全關閉該瀏覽器後重試")
+            return
+        # 開回來的 chart 頁需要幾秒 hydration，太早開版面對話框會降級成
+        # Current-only（同 groups_tab 冷啟後的等待）。
+        await asyncio.sleep(5.0)
+
+    def _log_or_print(self, message: str) -> None:
+        if self._logger is not None:
+            self._log(message)
+        else:
+            print(message)
 
     async def open_ticker(self, symbol: str) -> None:
         page = self._require_page()

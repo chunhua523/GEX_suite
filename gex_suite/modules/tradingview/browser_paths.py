@@ -1,6 +1,7 @@
 """Chrome/Brave 定位與 9222 CDP 瀏覽器啟動（shared by paste + 版面分組）."""
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -69,6 +70,46 @@ def wait_cdp_ready(port: int = DEFAULT_CDP_PORT, timeout_sec: float = 15.0) -> b
     start = time.monotonic()
     while time.monotonic() - start < timeout_sec:
         if cdp_ready(port):
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def cdp_page_count(
+    port: int = DEFAULT_CDP_PORT, timeout: float = 2.0, host: str = "127.0.0.1"
+) -> int | None:
+    """回傳 CDP 上 type=='page' 的 target 數；/json/list 打不到回 None."""
+    try:
+        with request.urlopen(
+            f"http://{host}:{port}/json/list", timeout=timeout
+        ) as resp:
+            targets = json.loads(resp.read().decode("utf-8"))
+        return sum(1 for t in targets if t.get("type") == "page")
+    except Exception:
+        return None
+
+
+def revive_windowless_cdp(
+    port: int = DEFAULT_CDP_PORT,
+    url: str = _DEFAULT_LANDING_URL,
+    timeout_sec: float = 10.0,
+    host: str = "127.0.0.1",
+) -> bool:
+    """自癒「視窗全關但行程常駐」的 CDP 瀏覽器（macOS 關掉所有視窗後 Chrome
+    留在 Dock，9222 仍佔線）。這種殭屍 instance 的 profile 已卸載：
+    /json/version 照常回應，但 Playwright connect_over_cdp 一律炸
+    「Browser.setDownloadBehavior: Browser context management is not
+    supported」。PUT /json/new 逼它開一個分頁讓 profile 重新載入即可恢復。
+    回傳自癒後是否至少有一個 page target。"""
+    req = request.Request(f"http://{host}:{port}/json/new?{url}", method="PUT")
+    try:
+        with request.urlopen(req, timeout=5.0):
+            pass
+    except Exception:
+        return False
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        if (cdp_page_count(port, host=host) or 0) > 0:
             return True
         time.sleep(0.25)
     return False

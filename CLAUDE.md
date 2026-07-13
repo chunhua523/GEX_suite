@@ -122,6 +122,8 @@ Every silent `continue` in `_phase_b_scan_flow` should produce a log line. Curre
 | `【略過｜指標配額】` | TradingView indicator quota exceeded |
 | `【更新 TO FUTURE】` | TO FUTURE Ratio/Offset written successfully for today |
 | `【預覽｜TO FUTURE】` | Dry-run: TO FUTURE write would happen |
+| `【中止｜未登入】` | `automator.connect()` 後 TradingView 登入檢查失敗（profile 無 `sessionid` cookie）— fail fast，整個 flow 中止 |
+| `【CDP 自癒】` | connect 前偵測到殭屍 CDP 瀏覽器（0 個 page target、profile 已卸載）→ `PUT /json/new` 開頁復原＋等 5s hydration |
 | `【略過｜週末】` | Today is Sat/Sun — TO FUTURE auto-fill skipped |
 | `【略過｜TO FUTURE 已有值】` | Daily or today's Ratio/Offset already non-default |
 | `【略過｜TO FUTURE 報價失敗】` | yfinance returned None for futures or compare leg |
