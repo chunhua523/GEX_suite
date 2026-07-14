@@ -76,6 +76,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tv-code-only", action="store_true", help="Only run TV Code (fast)")
     p.add_argument("--headless", action="store_true", help="Headless browser")
     p.add_argument("--no-cme", action="store_true", help="Skip CME platform")
+    p.add_argument("--no-std", action="store_true", help="Skip standard platform (CME only)")
+    p.add_argument("--cme-tickers", default="",
+                   help="Explicit CME ticker list (comma), overrides cme_ticker_filepath")
+    p.add_argument("--cme-exclude-tickers", default="",
+                   help="Exclude these tickers from the CME file list (comma)")
     p.add_argument("--parallel", action="store_true", default=None)
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--result-json", default="")
@@ -182,18 +187,29 @@ def main() -> int:
         models = [m.strip() for m in args.models.split(",")] if args.models else settings["selected_models"]
         cme_models = [m.strip() for m in args.cme_models.split(",")] if args.cme_models else settings["selected_cme_models"]
 
-    ticker_fp = settings.get("ticker_filepath", "")
-    if not ticker_fp or not os.path.exists(ticker_fp):
-        logger.error(f"❌ ticker_filepath invalid: {ticker_fp}")
-        return 1
-    groups = [g.strip() for g in args.groups.split(",")] if args.groups else []
-    tickers = get_tickers_for_groups(ticker_fp, groups)
+    if args.no_std:
+        tickers: list[str] = []
+    else:
+        ticker_fp = settings.get("ticker_filepath", "")
+        if not ticker_fp or not os.path.exists(ticker_fp):
+            logger.error(f"❌ ticker_filepath invalid: {ticker_fp}")
+            return 1
+        groups = [g.strip() for g in args.groups.split(",")] if args.groups else []
+        tickers = get_tickers_for_groups(ticker_fp, groups)
 
     if args.no_cme:
         cme_tickers: list[str] = []
+    elif args.cme_tickers.strip():
+        cme_tickers = [t.strip().upper() for t in args.cme_tickers.split(",") if t.strip()]
     else:
         cme_fp = settings.get("cme_ticker_filepath", "")
         cme_tickers = get_tickers_for_groups(cme_fp, []) if cme_fp and os.path.exists(cme_fp) else []
+        if args.cme_exclude_tickers.strip():
+            excluded = {t.strip().upper() for t in args.cme_exclude_tickers.split(",") if t.strip()}
+            before = len(cme_tickers)
+            cme_tickers = [t for t in cme_tickers if t.upper() not in excluded]
+            if len(cme_tickers) != before:
+                logger.info(f"📋 cme excluded: {sorted(excluded)} ({before} → {len(cme_tickers)})")
 
     parallel = settings.get("parallel", True)
     if args.parallel is not None:
