@@ -1370,14 +1370,11 @@ class TradingViewPage(QWidget):
         ticker = item.ticker
         monday = item.monday
         codes = item.codes
-        # Futures alias (e.g. ES1!→SPX): indicator anchors at Sunday 18:00 instead of Monday <ticker_time>.
-        # DB lookup still uses ``item.monday`` (the trading-week Monday).
-        if item.is_futures:
-            indicator_date = monday - timedelta(days=1)
-            indicator_start_time = _FUTURES_START_TIME
-        else:
-            indicator_date = monday
-            indicator_start_time = self._resolve_start_time_for_ticker(ticker)
+        # DB lookup still uses ``item.monday`` (the trading-week Monday); only
+        # the TV-side indicator start (date, time) is resolved per ticker.
+        indicator_date, indicator_start_time = self._resolve_indicator_start(
+            ticker, monday, item.is_futures
+        )
         start_time = indicator_start_time
         layout_label = item.layout_name or item.layout_id or "（目前圖表）"
         sub_txt = str(item.subchart_index) if item.subchart_index is not None else "—"
@@ -2269,6 +2266,23 @@ class TradingViewPage(QWidget):
     def _resolve_start_time_for_ticker(ticker: str) -> str:
         return shared_config.get_tradingview_start_time(ticker)
 
+    def _resolve_indicator_start(
+        self, ticker: str, monday: date, is_futures: bool
+    ) -> tuple[date, str]:
+        """指標起始 (date, "HH:MM")，優先序：
+
+        1. ``start_time_tz_rules``（當地時區定義 → 換算紐約時間；亞洲商品
+           如 NK2251!／KOSPI200，date 可能因換日提前到週日）
+        2. futures alias → 週日 + ``_FUTURES_START_TIME``（CME globex 開盤）
+        3. ``start_time_rules`` 的每-ticker 固定時間（週一當天）
+        """
+        tz_start = shared_config.get_tradingview_tz_start(ticker, monday)
+        if tz_start is not None:
+            return tz_start
+        if is_futures:
+            return monday - timedelta(days=1), _FUTURES_START_TIME
+        return monday, self._resolve_start_time_for_ticker(ticker)
+
     @staticmethod
     def _compute_cleanup_keep_mondays(weeks: int = 4, today: date | None = None) -> list[date]:
         """Compute keep-window Mondays using Sunday as week start."""
@@ -2776,14 +2790,11 @@ class TradingViewPage(QWidget):
                                 )
                                 return False
 
-                            if is_futures_alias:
-                                indicator_date = row_monday - timedelta(days=1)
-                                indicator_start_time = _FUTURES_START_TIME
-                            else:
-                                indicator_date = row_monday
-                                indicator_start_time = self._resolve_start_time_for_ticker(
-                                    target_ticker
+                            indicator_date, indicator_start_time = (
+                                self._resolve_indicator_start(
+                                    target_ticker, row_monday, is_futures_alias
                                 )
+                            )
                             expected_date_iso = indicator_date.isoformat()
                             try:
                                 got_date_raw, _got_time = await automator.read_weekly_start_datetime()

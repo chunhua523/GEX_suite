@@ -191,6 +191,17 @@ CME 連續期貨（如 `ES1!`、`NQ1!`、`GC1!`、`BTC1!`…）的 GEX 可以用
 
 只要 subchart 的 symbol 命中 alias map（任何模式都算），GEX 指標的 **Start date (Monday)** 就會自動寫成「該週 Monday 的前一天 18:00」（亦即 Sunday 18:00 ET），對齊 CME globex 開盤時間；非期貨子圖（VIX、AAPL、SPY…）維持「Monday + 各 ticker 設定時間」。
 
+### 亞洲商品的時區起始規則（start_time_tz_rules）
+
+`auto_paste_config.json` 的 `start_time_tz_rules` 可為個別 ticker 用「**當地時間**」定義指標起始，寫入前自動換算成紐約時間（跟著美國日光節約調整；date 可能因換日提前到週日）。**優先序高於**期貨週日 18:00 位移與 `start_time_rules`。預設內建：
+
+| ticker | 當地定義 | 夏令寫入（NY） | 冬令寫入（NY） |
+|---|---|---|---|
+| NK2251! | 週日 17:00 Asia/Seoul | 週日 04:00 | 週日 03:00 |
+| KOSPI200 | 週一 09:00 Asia/Seoul | 週日 20:00 | 週日 19:00 |
+
+格式：`"TICKER": {"timezone": "Asia/Seoul", "day_offset": -1, "time": "17:00"}`（`day_offset` 為相對該週週一的天數，`-1`＝週日）。
+
 ### 從 CME 抓資料如何進 DB
 
 Scraper 跑 CME 平台時會把 TV Code 寫入 `download_folder/CME/TV Code/TV_Codes_*.txt`。匯入 GEX DB 時，**TXT importer 會偵測路徑中的 `CME` segment，自動把 ticker 加上 `1!` 後綴**（`ES` → `ES1!`、`NK225` → `NK2251!` …），讓期貨 GEX 與 equity GEX 在 DB 各佔一個 key、互不覆蓋。ticker 開頭須為字母、其後可含數字（`KOSPI200`、`NK225`）。

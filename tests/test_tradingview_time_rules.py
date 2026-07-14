@@ -1,6 +1,7 @@
 """Unit checks for TradingView start-time mapping."""
 from __future__ import annotations
 
+import datetime as dt
 import sys
 import unittest
 from pathlib import Path
@@ -37,6 +38,52 @@ class TradingViewStartTimeRulesTests(unittest.TestCase):
             }
         }
         self.assertEqual(config.get_tradingview_start_time("VIX", cfg), "04:30")
+
+
+class TradingViewTzStartRulesTests(unittest.TestCase):
+    """start_time_tz_rules：當地時間定義 → 換算紐約時間。"""
+
+    def test_nk225_sunday_1700_kst(self) -> None:
+        # 夏令（EDT, UTC-4）：週日 17:00 KST = 週日 04:00 NY
+        self.assertEqual(
+            config.get_tradingview_tz_start("NK2251!", dt.date(2026, 7, 13)),
+            (dt.date(2026, 7, 12), "04:00"),
+        )
+        # 冬令（EST, UTC-5）：週日 17:00 KST = 週日 03:00 NY
+        self.assertEqual(
+            config.get_tradingview_tz_start("NK2251!", dt.date(2026, 1, 12)),
+            (dt.date(2026, 1, 11), "03:00"),
+        )
+
+    def test_kospi200_monday_0900_kst(self) -> None:
+        # 夏令：週一 09:00 KST = 週日 20:00 NY（換日提前一天）
+        self.assertEqual(
+            config.get_tradingview_tz_start("KOSPI200", dt.date(2026, 7, 13)),
+            (dt.date(2026, 7, 12), "20:00"),
+        )
+        # 冬令：週一 09:00 KST = 週日 19:00 NY
+        self.assertEqual(
+            config.get_tradingview_tz_start("KOSPI200", dt.date(2026, 1, 12)),
+            (dt.date(2026, 1, 11), "19:00"),
+        )
+
+    def test_unlisted_ticker_returns_none(self) -> None:
+        self.assertIsNone(config.get_tradingview_tz_start("ES1!", dt.date(2026, 7, 13)))
+        self.assertIsNone(config.get_tradingview_tz_start("", dt.date(2026, 7, 13)))
+
+    def test_custom_rule_and_invalid_rule(self) -> None:
+        cfg = {
+            "start_time_tz_rules": {
+                "NK2251!": {"timezone": "Asia/Tokyo", "day_offset": -1, "time": "16:30"},
+                "KOSPI200": {"timezone": "bad/zone", "day_offset": 0, "time": "09:00"},
+            }
+        }
+        self.assertEqual(
+            config.get_tradingview_tz_start("NK2251!", dt.date(2026, 7, 13), cfg),
+            (dt.date(2026, 7, 12), "03:30"),
+        )
+        # 無效 timezone → None（fallback 給呼叫端）
+        self.assertIsNone(config.get_tradingview_tz_start("KOSPI200", dt.date(2026, 7, 13), cfg))
 
 
 if __name__ == "__main__":
