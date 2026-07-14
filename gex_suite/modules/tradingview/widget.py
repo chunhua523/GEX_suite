@@ -117,6 +117,10 @@ _FUTURES_ALIAS_MAP: dict[str, dict[str, str | None]] = {
 
     # Crypto
     "BTC1!": {"futures": "BTC1!", "equity": "IBIT", "index": None},
+
+    # Nikkei 225 — TV chart is OSE continuous (NK2251!); DB rows come from the
+    # Lieta CME platform import (NK225 + "1!" suffix), so the names coincide.
+    "NK2251!": {"futures": "NK2251!", "equity": None, "index": None},
 }
 
 _FUTURES_START_TIME = "18:00"
