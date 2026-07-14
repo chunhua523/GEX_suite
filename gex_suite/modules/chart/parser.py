@@ -12,7 +12,7 @@ InsertFn = Callable[[str, str, str, object], None]
 
 def extract_date_from_tv_code(tv_code: str) -> Optional[_dt.date]:
     """If TV Code begins with ``TICKER YYYYMMDD ...``, return that date."""
-    m = re.match(r"^[A-Za-z\.]+\s+(\d{8})\b", tv_code)
+    m = re.match(r"^[A-Za-z][A-Za-z0-9\.]*\s+(\d{8})\b", tv_code)
     if m:
         return pd.to_datetime(m.group(1), format="%Y%m%d").date()
     return None
@@ -36,7 +36,8 @@ def parse_gex_code(orig_date: str, gex_code: str, insert: InsertFn) -> Optional[
     if not date_str:
         return None
 
-    m = re.search(r"([A-Za-z\.]+):", gex_code)
+    # Ticker must start with a letter but may contain digits (KOSPI200, NK225).
+    m = re.search(r"([A-Za-z][A-Za-z0-9\.]*):", gex_code)
     if not m:
         return None
     ticker = m.group(1).upper()

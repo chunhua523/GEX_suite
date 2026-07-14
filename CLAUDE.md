@@ -71,7 +71,9 @@ There is no cross-layout dedup. A previous version had `seen_runtime_keys` that 
 
 `force_source="cme"` parameter overrides path detection. Excel/Google importers don't have this yet — add similar wrapping if the user starts using those for CME.
 
-The parser (`gex_parser.parse_gex_code`) extracts ticker from the TV Code body via `[A-Za-z\.]+:` regex, so it produces `ES` from `ES:...`. The suffix transformation happens after parsing.
+The parser (`gex_parser.parse_gex_code`) extracts ticker from the TV Code body via `[A-Za-z][A-Za-z0-9\.]*:` regex (開頭須字母、其後可含數字), so it produces `ES` from `ES:...` and `KOSPI200` from `KOSPI200:...`. The suffix transformation happens after parsing.
+
+**Per-ticker index exception**: tickers in `_CME_INDEX_TICKERS` (importers.py, e.g. `KOSPI200`) are index products scraped from the CME platform — they are exempt from the `1!` suffix even when the file path is CME-detected. Add new CME-platform index products to that set.
 
 ## TO FUTURE 自動填入 (TradingView)
 
