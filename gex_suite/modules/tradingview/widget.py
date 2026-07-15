@@ -2071,6 +2071,20 @@ class TradingViewPage(QWidget):
         chart_id = url[idx + len(marker):].strip("/").split("/")[0]
         return f"URL:{chart_id}" if chart_id else url.strip()
 
+    @staticmethod
+    def _with_page_layout_name(
+        layout: LayoutInfo,
+        opts: BatchOptions,
+        page_name: str,
+    ) -> LayoutInfo:
+        """scope=urls 的 LayoutInfo.name 是合成的 URL:xxx 標籤 — 模式標記
+        （[future] 等）解析與 log 都必須用頁面上讀到的真實版面名稱，否則
+        marker 永遠找不到而 fallback 到預設模式。scope=all 沿用清單裡的
+        名稱（權威來源）。"""
+        if opts.layout_scope == "all" or not page_name or page_name == layout.name:
+            return layout
+        return replace(layout, name=page_name)
+
     def _sync_last_phase_b_layout_snap(self, layouts: list[LayoutInfo]) -> None:
         self._last_phase_b_layouts = [
             f"{layout.name}{f' | {layout.subtitle}' if layout.subtitle else ''}"
@@ -2413,6 +2427,12 @@ class TradingViewPage(QWidget):
                     else:
                         self._exec_log(f"【略過版面】無法載入：{layout.name}")
                         continue
+                if opts.layout_scope != "all":
+                    layout = self._with_page_layout_name(
+                        layout,
+                        opts,
+                        (await automator.get_current_layout_name() or "").strip(),
+                    )
                 subcharts = await self._enumerate_subcharts_with_retry(
                     automator,
                     label="整理流程",
@@ -2530,6 +2550,13 @@ class TradingViewPage(QWidget):
                             name=(layout.name if opts.layout_scope == "all" else ""),
                         )
                         continue
+                current_layout_display_name = (
+                    await automator.get_current_layout_name() or ""
+                ).strip()
+                layout = self._with_page_layout_name(
+                    layout, opts, current_layout_display_name
+                )
+                if degraded_current_layout:
                     mode_annotation = None
                 else:
                     layout_marker_seq = self._parse_layout_marker_sequence(layout.name)
@@ -2539,9 +2566,6 @@ class TradingViewPage(QWidget):
                         mode_annotation = f"模式：{layout_marker_seq[0]}"
                     else:
                         mode_annotation = f"模式（依子圖序）：{', '.join(layout_marker_seq)}"
-                current_layout_display_name = (
-                    await automator.get_current_layout_name() or ""
-                ).strip()
                 locked_layout_name = current_layout_display_name.upper()
                 if not locked_layout_name:
                     locked_layout_name = layout.name.upper()
@@ -3300,7 +3324,13 @@ class TradingViewPage(QWidget):
                 switched = await automator.load_layout(layout)
             if not switched and layout_idx > 0:
                 continue
-            locked_layout_name = (await automator.get_current_layout_name() or "").upper()
+            current_layout_display_name = (
+                await automator.get_current_layout_name() or ""
+            ).strip()
+            layout = self._with_page_layout_name(
+                layout, opts, current_layout_display_name
+            )
+            locked_layout_name = current_layout_display_name.upper()
             if not locked_layout_name:
                 locked_layout_name = layout.name.upper()
             matched_keys_in_layout: set[tuple[str, str]] = set()
