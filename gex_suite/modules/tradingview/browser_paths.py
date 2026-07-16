@@ -38,7 +38,18 @@ def launch_cdp_browser(
 
     Returns the binary path used, or ``None`` if no browser executable found.
     不等待 9222 就緒 — 呼叫端視需要接 :func:`wait_cdp_ready`。
+
+    port 已被佔用時**不冷啟第二個 instance**：第二個綁不到 127.0.0.1:port，
+    Chrome 會默默改綁 [::1]:port —— 看起來是 CDP 瀏覽器、也能登入，但 paste
+    連的是 127.0.0.1，永遠打不到它（2026-07-16 踩坑：使用者在假 9222 登入，
+    真 9222 仍未登入）。改為在既有 instance 逐一開分頁（URL 會落在該 instance
+    最後使用的視窗，不另開新視窗）。
     """
+    targets = list(urls) if urls else [_DEFAULT_LANDING_URL]
+    if cdp_ready(port):
+        for url in targets:
+            cdp_open_tab(url, port)
+        return f"(reused existing CDP instance on 127.0.0.1:{port})"
     path = find_browser(browser_type)
     if not path:
         return None
@@ -50,7 +61,7 @@ def launch_cdp_browser(
         "--no-first-run",
         "--no-default-browser-check",
         "--new-window",
-        *(urls if urls else [_DEFAULT_LANDING_URL]),
+        *targets,
     ]
     subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return path
@@ -89,6 +100,22 @@ def cdp_page_count(
         return None
 
 
+def cdp_open_tab(
+    url: str,
+    port: int = DEFAULT_CDP_PORT,
+    host: str = "127.0.0.1",
+    timeout: float = 5.0,
+) -> bool:
+    """PUT /json/new 在既有 CDP instance 開一個分頁（Chrome 會把該分頁帶到
+    其視窗最前，可用來「標示」哪個視窗才是真正佔住 port 的 instance）。"""
+    req = request.Request(f"http://{host}:{port}/json/new?{url}", method="PUT")
+    try:
+        with request.urlopen(req, timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
 def revive_windowless_cdp(
     port: int = DEFAULT_CDP_PORT,
     url: str = _DEFAULT_LANDING_URL,
@@ -101,11 +128,7 @@ def revive_windowless_cdp(
     「Browser.setDownloadBehavior: Browser context management is not
     supported」。PUT /json/new 逼它開一個分頁讓 profile 重新載入即可恢復。
     回傳自癒後是否至少有一個 page target。"""
-    req = request.Request(f"http://{host}:{port}/json/new?{url}", method="PUT")
-    try:
-        with request.urlopen(req, timeout=5.0):
-            pass
-    except Exception:
+    if not cdp_open_tab(url, port, host):
         return False
     deadline = time.monotonic() + timeout_sec
     while time.monotonic() < deadline:

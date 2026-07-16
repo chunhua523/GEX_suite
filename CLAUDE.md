@@ -126,7 +126,7 @@ Every silent `continue` in `_phase_b_scan_flow` should produce a log line. Curre
 | `【略過｜指標配額】` | TradingView indicator quota exceeded |
 | `【更新 TO FUTURE】` | TO FUTURE Ratio/Offset written successfully for today |
 | `【預覽｜TO FUTURE】` | Dry-run: TO FUTURE write would happen |
-| `【中止｜未登入】` | `automator.connect()` 後 TradingView 登入檢查失敗（profile 無 `sessionid` cookie）— fail fast，整個 flow 中止 |
+| `【中止｜未登入】` | `automator.connect()` 後 TradingView 登入檢查失敗（profile 無 `sessionid` cookie）— 中止前自動在「正確的」CDP instance 開一個 TradingView 分頁標示要登入的視窗（多開瀏覽器時使用者常登到錯的 instance），fail fast，整個 flow 中止 |
 | `【CDP 自癒】` | connect 前偵測到殭屍 CDP 瀏覽器（0 個 page target、profile 已卸載）→ `PUT /json/new` 開頁復原＋等 5s hydration |
 | `【略過｜週末】` | Today is Sat/Sun — TO FUTURE auto-fill skipped |
 | `【略過｜TO FUTURE 已有值】` | Daily or today's Ratio/Offset already non-default |
@@ -190,6 +190,10 @@ widget.py 搬出的共用件）。資料檔 `data/tradingview/layout_groups.json
 forwarding —— `Popen([bin, --user-data-dir=…, --new-window, url1, url2…])` 由
 既有 instance 開一個新視窗、URL 依序成分頁；冷啟補 9222 debug 旗標＋
 `--no-first-run`。不可用 Playwright `ctx.new_page()`（tab 會落在既有視窗）。
+**9222 已被別的 instance 佔住時，`launch_cdp_browser` 不會冷啟第二個**（第二
+個綁不到 127.0.0.1 只會默默綁 `[::1]` 成假 9222，paste 連不到），改用
+`PUT /json/new` 在既有 instance 開分頁 — 此時「一組一視窗」語意降級為
+「分頁落在該 instance 最後使用的視窗」。
 
 CLI 探測（不開 GUI）：`python -m gex_suite.modules.tradingview.app_launcher <url>…`。
 

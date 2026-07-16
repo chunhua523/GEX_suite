@@ -260,12 +260,45 @@ class PlaywrightCDPAutomator(TVAutomator):
         之後版面清單打不開、降級 Current-only、total=0 的難解讀失敗。"""
         if await self.is_logged_in():
             return
+        # 多開瀏覽器時使用者常登入到錯的 instance（例如第二個 Chrome 綁不到
+        # 127.0.0.1:9222、默默改綁 [::1] 的假 9222，2026-07-16 踩坑）— 中止前
+        # 先在「這個」instance 開一個 TradingView 分頁把正確視窗帶到前面，
+        # 登入位置不用猜。
+        tab_opened = await self._open_login_tab()
+        if tab_opened:
+            hint = (
+                "已在正確視窗開好 TradingView 分頁 — 請在該視窗登入後重跑"
+                "（多開瀏覽器時，其他視窗登入無效）"
+            )
+        else:
+            hint = (
+                f"請先執行 curl -X PUT '{self.cdp_url}/json/new?"
+                "https://tw.tradingview.com/' 讓正確視窗跳出分頁，"
+                "在該視窗登入後重跑"
+            )
         msg = (
             f"【中止｜未登入】TradingView 未登入（{self.cdp_url} 的 profile 無 "
-            "sessionid cookie）— 請在該瀏覽器登入 TradingView 後重跑"
+            f"sessionid cookie）— {hint}"
         )
         self._log_or_print(msg)
         raise RuntimeError(msg)
+
+    async def _open_login_tab(self) -> bool:
+        """在目前連上的 CDP instance 開一個 TradingView 分頁並帶到最前，
+        標示「要登入的是哪個視窗」。best-effort，失敗不擋中止流程。"""
+        if self._context is None:
+            return False
+        try:
+            page = await self._context.new_page()
+            await page.goto(
+                "https://tw.tradingview.com/",
+                wait_until="domcontentloaded",
+                timeout=15000,
+            )
+            await page.bring_to_front()
+            return True
+        except Exception:
+            return False
 
     async def _revive_windowless_browser(self) -> None:
         """視窗全關但行程常駐的 CDP 瀏覽器（macOS Dock 常駐）profile 已卸載：
