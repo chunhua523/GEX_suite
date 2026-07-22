@@ -20,10 +20,11 @@ from .routes import chain as chain_routes
 from .routes import paste as paste_routes
 from .routes import scraper as scraper_routes
 
-# Load DISCORD_NOTIFY_WEBHOOK from Jeff-Agent .env if not already in env.
+# Load SCRAPER_DISCORD_WEBHOOK_URL (GEX scraper status channel) from the
+# centralized Jeff-Agent .env if not already in env.
 # Both Macs keep this in ~/Jeff-Agent/.env or ~/Documents/Jeff-Agent/.env.
 def _load_env_fallback() -> None:
-    if os.environ.get("DISCORD_NOTIFY_WEBHOOK"):
+    if os.environ.get("SCRAPER_DISCORD_WEBHOOK_URL"):
         return
     try:
         from dotenv import load_dotenv
