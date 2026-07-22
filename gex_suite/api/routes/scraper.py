@@ -134,13 +134,16 @@ def _load_last_result_from_disk() -> None:
 # ---------------------------------------------------------------------------
 
 def _webhook_url() -> str:
-    return (os.environ.get("DISCORD_NOTIFY_WEBHOOK") or "").strip()
+    # GEX scraper status → scraper channel (SCRAPER_DISCORD_WEBHOOK_URL), NOT the
+    # claude channel. Was wrongly using DISCORD_NOTIFY_WEBHOOK, which pushed all
+    # scraper start/complete/fail/retry notices into the claude/article channel.
+    return (os.environ.get("SCRAPER_DISCORD_WEBHOOK_URL") or "").strip()
 
 
 def _send_webhook(message: str) -> Dict[str, Any]:
     url = _webhook_url()
     if not url:
-        logger.info("[Webhook] DISCORD_NOTIFY_WEBHOOK not set; skipping notify")
+        logger.info("[Webhook] SCRAPER_DISCORD_WEBHOOK_URL not set; skipping notify")
         return {"ok": False, "error": "webhook_not_configured"}
     try:
         # curl is more reliable than urllib for some Discord SSL quirks.
@@ -412,7 +415,11 @@ def _scraper_thread(mode: str, retry_failed_tasks: Optional[List[Dict[str, Any]]
             ))
 
         elapsed = (datetime.now() - started).total_seconds()
-        final_failed = result.get("retry_failed_tasks") or result.get("initial_failed_tasks", [])
+        # retry_failed_tasks = retry 後「仍失敗」的清單，全過時為 []。不可用 `or`：
+        # 空 list falsy 會退回 initial_failed_tasks，把「這輪的原始輸入」誤報成失敗
+        # （成功清零卻印 Failed=28 的成因）。只有非 retry 的整輪 scrape 才沒這個 key。
+        _retry_failed = result.get("retry_failed_tasks")
+        final_failed = _retry_failed if _retry_failed is not None else result.get("initial_failed_tasks", [])
         summary = {
             "success": len(final_failed) == 0,
             "elapsed_seconds": round(elapsed, 2),
