@@ -520,6 +520,10 @@ class PlaywrightCDPAutomator(TVAutomator):
             await page.wait_for_timeout(450)
             if await self.detect_blocking_overlay() is None:
                 self._log("[preflight] modal dismissed via control/Escape")
+                # The dismiss (esp. 'Restore connection') kicks off a reconnect
+                # and the page stays sluggish for a moment — settle before the
+                # caller opens the Layouts dialog (2026-07-23 no-op paste).
+                await page.wait_for_timeout(2200)
                 return result
 
         # Strategy 2: hard reload — a fresh chart load drops transient overlays.
@@ -565,6 +569,14 @@ class PlaywrightCDPAutomator(TVAutomator):
         page = self._require_page()
         await page.bring_to_front()
         opened = await self._open_layout_dialog()
+        if not opened:
+            # One retry after a settle: on a page still recovering (e.g. right
+            # after preflight cleared an overlay) the dialog can finish
+            # rendering after the first attempt already gave up — the retry's
+            # opening _is_layout_dialog_open() check picks it up.
+            self._log("[list_layouts] dialog not opened → settle + retry once")
+            await page.wait_for_timeout(1500)
+            opened = await self._open_layout_dialog()
         if not opened:
             self._log("[list_layouts] fallback=Current reason=dialog_not_opened")
             return [LayoutInfo(id="current", name="Current")]
@@ -5609,8 +5621,7 @@ class PlaywrightCDPAutomator(TVAutomator):
         # Menu already open (e.g. user left manage-layout dropdown): try Open layout…
         if await self._is_any_popup_menu_open():
             if await self._try_click_open_layout_menuitem():
-                await page.wait_for_timeout(340)
-                if await self._is_layout_dialog_open():
+                if await self._wait_layout_dialog_open():
                     await self._clear_layout_dialog_search(self._layout_dialog_locator())
                     self._log("[open_layout_dialog] opened via Open layout... (pre-existing menu)")
                     return True
@@ -5791,11 +5802,14 @@ class PlaywrightCDPAutomator(TVAutomator):
             return True
 
         # Only click the explicit "Open layout..." row to avoid mis-clicking "Layout setup".
-        if await self._try_click_open_layout_menuitem():
-            await page.wait_for_timeout(300)
-            if await self._is_layout_dialog_open():
-                self._log("[open_layout_dialog] via-save-load-menu → Open layout...")
-                return True
+        clicked = await self._try_click_open_layout_menuitem()
+        if not clicked:
+            # On a sluggish page the dropdown itself can render late.
+            await page.wait_for_timeout(700)
+            clicked = await self._try_click_open_layout_menuitem()
+        if clicked and await self._wait_layout_dialog_open():
+            self._log("[open_layout_dialog] via-save-load-menu → Open layout...")
+            return True
         return False
 
     async def _log_layout_open_candidates(self) -> None:
@@ -5861,6 +5875,24 @@ class PlaywrightCDPAutomator(TVAutomator):
     async def _is_layout_dialog_open(self) -> bool:
         dialog = self._layout_dialog_locator()
         return await dialog.count() > 0
+
+    async def _wait_layout_dialog_open(self, timeout_ms: int = 3000) -> bool:
+        """Poll for the Layouts dialog instead of a one-shot check.
+
+        Right after preflight dismisses a blocking overlay the page is still
+        re-establishing its connection, so the dialog can render well past a
+        fixed 240–300ms wait (2026-07-23: the one-shot check said closed while
+        the failure screenshot showed the dialog fully open).
+        """
+        page = self._require_page()
+        waited = 0
+        while True:
+            if await self._is_layout_dialog_open():
+                return True
+            if waited >= timeout_ms:
+                return False
+            await page.wait_for_timeout(250)
+            waited += 250
 
     async def _read_current_layout_name(self) -> str | None:
         """Best-effort read current layout name from header toolbar control.

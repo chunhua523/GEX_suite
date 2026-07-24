@@ -460,9 +460,18 @@ def main() -> int:
         payload = _serialize_report(report, elapsed, captured)
         if log_path:
             payload["run_log"] = str(log_path)
+        # A scope=all run that fell back to Current-only covered almost nothing
+        # — surface it in the result JSON (chain marks the step FAIL) and the
+        # exit code, instead of masquerading as a tiny successful run.
+        payload["layout_list_degraded"] = bool(
+            opts.layout_scope == "all"
+            and getattr(page, "_last_phase_b_layout_list_degraded", False)
+        )
         _record_last_scan_failed(payload, opts)
         print(f"✅ TV batch done in {elapsed:.1f}s — total={payload['total']} "
               f"done={payload['done']} skipped={payload['skipped']} failed={payload['failed']}")
+        if payload["layout_list_degraded"]:
+            print("⚠️ 版面清單降級為僅 Current — 本輪幾乎沒有覆蓋，以失敗計（exit=1）")
 
         page._end_run_log({
             "total": payload["total"],
@@ -478,7 +487,9 @@ def main() -> int:
                 encoding="utf-8",
             )
 
-        return 1 if payload.get("failed", 0) > 0 else 0
+        if payload.get("failed", 0) > 0 or payload.get("layout_list_degraded"):
+            return 1
+        return 0
     finally:
         # Belt-and-suspenders: ensure the writer is closed even if something
         # unexpected slipped past the inner handlers.
