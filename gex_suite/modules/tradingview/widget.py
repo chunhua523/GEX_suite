@@ -122,10 +122,10 @@ _FUTURES_ALIAS_MAP: dict[str, dict[str, str | None]] = {
     # Lieta CME platform import (NK225 + "1!" suffix), so the names coincide.
     "NK2251!": {"futures": "NK2251!", "equity": None, "index": None},
 
-    # KOSPI 200 futures — TradingView renamed the KRX continuous symbol to
-    # K2I1! (2026-07); DB rows are still the Lieta CME import "KOSPI200"
-    # (index-product exception, no "1!" suffix). Start anchor comes from the
-    # start_time_tz_rules "KOSPI200" entry, same as before the rename.
+    # KOSPI 200 — the subchart watches the KRX futures continuous K2I1!
+    # (switched from the KOSPI200 spot symbol 2026-07); DB rows are still the
+    # Lieta CME import "KOSPI200" (index-product exception, no "1!" suffix).
+    # Start anchor comes from the start_time_tz_rules "KOSPI200" entry.
     "K2I1!": {"futures": "KOSPI200", "equity": "EWY", "index": None},
 
     # 台指選擇權（TXO，TAIFEX）— 貼在 TWSE 加權指數現貨圖（IX0001）或台指期連續
