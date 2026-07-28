@@ -47,6 +47,7 @@ _TRADINGVIEW_DEFAULT: dict[str, Any] = {
     "start_time_tz_rules": {
         "NK2251!":  {"timezone": "Asia/Seoul", "day_offset": -1, "time": "17:00"},
         "KOSPI200": {"timezone": "Asia/Seoul", "day_offset": 0,  "time": "09:00"},
+        "TXO1!":    {"timezone": "Asia/Taipei", "day_offset": 0, "time": "09:00"},
     },
 }
 

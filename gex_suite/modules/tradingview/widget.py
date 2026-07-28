@@ -127,6 +127,12 @@ _FUTURES_ALIAS_MAP: dict[str, dict[str, str | None]] = {
     # (index-product exception, no "1!" suffix). Start anchor comes from the
     # start_time_tz_rules "KOSPI200" entry, same as before the rename.
     "K2I1!": {"futures": "KOSPI200", "equity": "EWY", "index": None},
+
+    # 台指選擇權（TXO，TAIFEX）— 貼在 TWSE 加權指數現貨圖（IX0001）或台指期連續
+    # （TXF1!）上；DB rows 是 Lieta CME 平台匯入的 TXO＋"1!" 後綴。只有一份 TXO
+    # 資料 → 三模式同指 TXO1!。start anchor 走 start_time_tz_rules 的 "TXO1!"。
+    "IX0001": {"futures": "TXO1!", "equity": "TXO1!", "index": "TXO1!"},
+    "TXF1!":  {"futures": "TXO1!", "equity": "TXO1!", "index": "TXO1!"},
 }
 
 _FUTURES_START_TIME = "18:00"
