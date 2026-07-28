@@ -121,6 +121,12 @@ _FUTURES_ALIAS_MAP: dict[str, dict[str, str | None]] = {
     # Nikkei 225 — TV chart is OSE continuous (NK2251!); DB rows come from the
     # Lieta CME platform import (NK225 + "1!" suffix), so the names coincide.
     "NK2251!": {"futures": "NK2251!", "equity": None, "index": None},
+
+    # KOSPI 200 futures — TradingView renamed the KRX continuous symbol to
+    # K2I1! (2026-07); DB rows are still the Lieta CME import "KOSPI200"
+    # (index-product exception, no "1!" suffix). Start anchor comes from the
+    # start_time_tz_rules "KOSPI200" entry, same as before the rename.
+    "K2I1!": {"futures": "KOSPI200", "equity": "EWY", "index": None},
 }
 
 _FUTURES_START_TIME = "18:00"
