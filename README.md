@@ -162,8 +162,9 @@ CME 連續期貨（如 `ES1!`、`NQ1!`、`GC1!`、`BTC1!`…）的 GEX 可以用
 | ZB1!  | ZB1!  | TLT  | — |
 | BTC1! | BTC1! | IBIT | — |
 | NK2251! | NK2251! | — | — |
+| K2I1! | KOSPI200 | EWY | — |
 
-完整清單見 [`_FUTURES_ALIAS_MAP`](gex_suite/modules/tradingview/widget.py)。`—` 表示該 root 沒有適合的對應（GEX Suite 採嚴格略過：對到 `None` 即略過該子圖並 log 原因）。`NK2251!` 是 OSE 連續合約（非 CME），資料同樣來自 Lieta CME 平台匯入。
+完整清單見 [`_FUTURES_ALIAS_MAP`](gex_suite/modules/tradingview/widget.py)。`—` 表示該 root 沒有適合的對應（GEX Suite 採嚴格略過：對到 `None` 即略過該子圖並 log 原因）。`NK2251!` 是 OSE 連續合約（非 CME），資料同樣來自 Lieta CME 平台匯入。`K2I1!` 是 KRX KOSPI 200 期貨連續合約 —— TradingView 於 2026-07 把原 symbol `KOSPI200` 改碼為 `K2I1!`，DB ticker 仍為 Lieta CME 平台匯入的 `KOSPI200`（index 商品例外、無 `1!` 後綴），靠此 alias 對回去；日後交易所/TV 再改碼，症狀是該 ticker 天天【略過｜資料庫】（不會 FAIL），同樣在 alias map 補一行即修。
 
 ### Layout 名稱 marker 規則
 
@@ -198,7 +199,7 @@ CME 連續期貨（如 `ES1!`、`NQ1!`、`GC1!`、`BTC1!`…）的 GEX 可以用
 | ticker | 當地定義 | 夏令寫入（NY） | 冬令寫入（NY） |
 |---|---|---|---|
 | NK2251! | 週日 17:00 Asia/Seoul | 週日 04:00 | 週日 03:00 |
-| KOSPI200 | 週一 09:00 Asia/Seoul | 週日 20:00 | 週日 19:00 |
+| KOSPI200（圖上=K2I1!） | 週一 09:00 Asia/Seoul | 週日 20:00 | 週日 19:00 |
 
 格式：`"TICKER": {"timezone": "Asia/Seoul", "day_offset": -1, "time": "17:00"}`（`day_offset` 為相對該週週一的天數，`-1`＝週日）。
 
