@@ -114,20 +114,21 @@ def _is_cme_source_path(fp: str) -> bool:
     return "CME" in parts
 
 
-# CME 平台上的 index 商品（非期貨）— 匯入時保留原名，不補 ``1!``。
-_CME_INDEX_TICKERS = {"KOSPI200"}
+# CME 平台上的非期貨商品（index 現貨、選擇權 root）— 匯入時保留原名，不補
+# ``1!``（``1!`` 是 TV 期貨連續合約記號，這些商品沒有此寫法）。
+_CME_NO_SUFFIX_TICKERS = {"KOSPI200", "TXO"}
 
 
 def _suffix_futures_ticker(ticker: str) -> str:
     """Append ``1!`` to a CME-sourced root ticker (idempotent if already suffixed).
 
-    Tickers in ``_CME_INDEX_TICKERS`` are index products scraped from the CME
-    platform, not futures — they keep their bare name.
+    Tickers in ``_CME_NO_SUFFIX_TICKERS`` are non-futures products scraped from
+    the CME platform (index spot, options roots) — they keep their bare name.
     """
     t = (ticker or "").strip()
     if not t:
         return t
-    if t.upper() in _CME_INDEX_TICKERS:
+    if t.upper() in _CME_NO_SUFFIX_TICKERS:
         return t
     return t if t.endswith("1!") else f"{t}1!"
 

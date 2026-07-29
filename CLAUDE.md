@@ -59,7 +59,7 @@ When `is_futures_alias=True` is returned (any of the three modes that hit the al
 
 DB lookup still uses `item.monday` (the trading week's Monday). Only the TV-side write-and-verify uses the shifted `indicator_date`.
 
-**Start (date, time) resolution is centralized in `_resolve_indicator_start`** (widget.py) — both computation sites (`_apply_work_item_with_automator` and the cache/verify path in `_phase_b_scan_flow`) go through it; don't reintroduce inline date math. Priority: (1) `start_time_tz_rules` in `auto_paste_config.json` (`shared/config.get_tradingview_tz_start`) — start defined in the instrument's **local timezone** and converted to America/New_York, e.g. NK2251! = Sunday 17:00 Asia/Seoul, KOSPI200 = Monday 09:00 Asia/Seoul, TXO1! = Monday 09:00 Asia/Taipei (dates can roll back to Sunday; DST-aware); (2) futures alias → Sunday 18:00; (3) `start_time_rules` per-ticker HH:MM on Monday.
+**Start (date, time) resolution is centralized in `_resolve_indicator_start`** (widget.py) — both computation sites (`_apply_work_item_with_automator` and the cache/verify path in `_phase_b_scan_flow`) go through it; don't reintroduce inline date math. Priority: (1) `start_time_tz_rules` in `auto_paste_config.json` (`shared/config.get_tradingview_tz_start`) — start defined in the instrument's **local timezone** and converted to America/New_York, e.g. NK2251! = Sunday 17:00 Asia/Seoul, KOSPI200 = Monday 09:00 Asia/Seoul, TXO = Monday 09:00 Asia/Taipei (dates can roll back to Sunday; DST-aware); (2) futures alias → Sunday 18:00; (3) `start_time_rules` per-ticker HH:MM on Monday.
 
 ### Per-layout dedup uses `(symbol, mode)` tuple
 
@@ -75,7 +75,7 @@ There is no cross-layout dedup. A previous version had `seen_runtime_keys` that 
 
 The parser (`gex_parser.parse_gex_code`) extracts ticker from the TV Code body via `[A-Za-z][A-Za-z0-9\.]*:` regex (開頭須字母、其後可含數字), so it produces `ES` from `ES:...` and `KOSPI200` from `KOSPI200:...`. The suffix transformation happens after parsing.
 
-**Per-ticker index exception**: tickers in `_CME_INDEX_TICKERS` (importers.py, e.g. `KOSPI200`) are index products scraped from the CME platform — they are exempt from the `1!` suffix even when the file path is CME-detected. Add new CME-platform index products to that set.
+**Per-ticker no-suffix exception**: tickers in `_CME_NO_SUFFIX_TICKERS` (importers.py, e.g. `KOSPI200`, `TXO`) are non-futures products scraped from the CME platform (index spot, options roots) — they are exempt from the `1!` suffix even when the file path is CME-detected. Add new such products to that set.
 
 ## TO FUTURE 自動填入 (TradingView)
 
@@ -224,7 +224,7 @@ CLI 探測（不開 GUI）：`python -m gex_suite.modules.tradingview.app_launch
 - Don't add silent fall-through paths in the resolver. If a symbol is identified as a futures alias and the mode has no mapping, it must surface as a log entry.
 - Don't re-introduce cross-layout dedup. Each layout's subchart needs independent processing.
 - Don't add Chinese layout markers (the design is English-only now).
-- Don't migrate existing DB rows when changing the importer suffix logic — only new imports get the `1!` suffix; legacy rows stay as-is.
+- Don't migrate existing DB rows when changing the importer suffix logic — only new imports get the `1!` suffix; legacy rows stay as-is. (唯一例外：2026-07-29 Jeff 指名把 `TXO1!` 裸名化為 `TXO`，450 rows 已同步 UPDATE。)
 - Don't add a `merge equity into futures` fallback — the user wants strict separation between modes so they can compare side-by-side.
 
 ## Testing

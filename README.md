@@ -163,9 +163,9 @@ CME 連續期貨（如 `ES1!`、`NQ1!`、`GC1!`、`BTC1!`…）的 GEX 可以用
 | BTC1! | BTC1! | IBIT | — |
 | NK2251! | NK2251! | — | — |
 | K2I1! | KOSPI200 | EWY | — |
-| IX0001 / TXF1! | TXO1! | TXO1! | TXO1! |
+| IX0001 / TXF1! | TXO | TXO | TXO |
 
-完整清單見 [`_FUTURES_ALIAS_MAP`](gex_suite/modules/tradingview/widget.py)。`—` 表示該 root 沒有適合的對應（GEX Suite 採嚴格略過：對到 `None` 即略過該子圖並 log 原因）。`NK2251!` 是 OSE 連續合約（非 CME），資料同樣來自 Lieta CME 平台匯入。`K2I1!` 是 KRX KOSPI 200 期貨連續合約 —— 子圖 2026-07 起從現貨 symbol `KOSPI200` 改看 `K2I1!`，DB ticker 仍為 Lieta CME 平台匯入的 `KOSPI200`（index 商品例外、無 `1!` 後綴），靠此 alias 對回去（若子圖換回現貨 `KOSPI200` 也照樣能對——名稱直接吻合 DB ticker）。日後子圖改看新 symbol（或交易所改碼）而對不到 DB ticker 時，症狀是該 ticker 天天【略過｜資料庫】（不會 FAIL），同樣在 alias map 補一行即修。`IX0001`＝TWSE 加權指數現貨、`TXF1!`＝TAIFEX 台指期連續 —— 兩者都對到台指選擇權資料 `TXO1!`（Lieta CME 平台匯入、加 `1!` 後綴），只有一份資料所以三模式同值。
+完整清單見 [`_FUTURES_ALIAS_MAP`](gex_suite/modules/tradingview/widget.py)。`—` 表示該 root 沒有適合的對應（GEX Suite 採嚴格略過：對到 `None` 即略過該子圖並 log 原因）。`NK2251!` 是 OSE 連續合約（非 CME），資料同樣來自 Lieta CME 平台匯入。`K2I1!` 是 KRX KOSPI 200 期貨連續合約 —— 子圖 2026-07 起從現貨 symbol `KOSPI200` 改看 `K2I1!`，DB ticker 仍為 Lieta CME 平台匯入的 `KOSPI200`（index 商品例外、無 `1!` 後綴），靠此 alias 對回去（若子圖換回現貨 `KOSPI200` 也照樣能對——名稱直接吻合 DB ticker）。日後子圖改看新 symbol（或交易所改碼）而對不到 DB ticker 時，症狀是該 ticker 天天【略過｜資料庫】（不會 FAIL），同樣在 alias map 補一行即修。`IX0001`＝TWSE 加權指數現貨、`TXF1!`＝TAIFEX 台指期連續 —— 兩者都對到台指選擇權資料 `TXO`（Lieta CME 平台匯入；選擇權 root 非期貨、免 `1!` 後綴，2026-07-29 起由 `TXO1!` 改為裸名），只有一份資料所以三模式同值。
 
 ### Layout 名稱 marker 規則
 
@@ -201,7 +201,7 @@ CME 連續期貨（如 `ES1!`、`NQ1!`、`GC1!`、`BTC1!`…）的 GEX 可以用
 |---|---|---|---|
 | NK2251! | 週日 17:00 Asia/Seoul | 週日 04:00 | 週日 03:00 |
 | KOSPI200（圖上=K2I1!） | 週一 09:00 Asia/Seoul | 週日 20:00 | 週日 19:00 |
-| TXO1!（圖上=IX0001/TXF1!） | 週一 09:00 Asia/Taipei | 週日 21:00 | 週日 20:00 |
+| TXO（圖上=IX0001/TXF1!） | 週一 09:00 Asia/Taipei | 週日 21:00 | 週日 20:00 |
 
 格式：`"TICKER": {"timezone": "Asia/Seoul", "day_offset": -1, "time": "17:00"}`（`day_offset` 為相對該週週一的天數，`-1`＝週日）。
 
@@ -209,7 +209,7 @@ CME 連續期貨（如 `ES1!`、`NQ1!`、`GC1!`、`BTC1!`…）的 GEX 可以用
 
 Scraper 跑 CME 平台時會把 TV Code 寫入 `download_folder/CME/TV Code/TV_Codes_*.txt`。匯入 GEX DB 時，**TXT importer 會偵測路徑中的 `CME` segment，自動把 ticker 加上 `1!` 後綴**（`ES` → `ES1!`、`NK225` → `NK2251!` …），讓期貨 GEX 與 equity GEX 在 DB 各佔一個 key、互不覆蓋。ticker 開頭須為字母、其後可含數字（`KOSPI200`、`NK225`）。
 
-例外：CME 平台上的 **index 商品不補 `1!`**、保留原名 — 清單在 [`_CME_INDEX_TICKERS`](gex_suite/modules/chart/importers.py)（目前有 `KOSPI200`），之後 CME 平台再出現 index 商品往該 set 加名字即可。
+例外：CME 平台上的**非期貨商品**（index 現貨、選擇權 root）**不補 `1!`**、保留原名 — 清單在 [`_CME_NO_SUFFIX_TICKERS`](gex_suite/modules/chart/importers.py)（目前有 `KOSPI200`、`TXO`），之後 CME 平台再出現這類商品往該 set 加名字即可。
 
 如果你是用 Excel / Google Sheet 走 CME 匯入，可呼叫 `import_txt_files(..., force_source="cme")` 顯式強制（目前只 TXT 路徑有 force flag；其他路徑可後續視需要擴充）。
 
