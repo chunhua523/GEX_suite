@@ -417,9 +417,13 @@ def _scraper_thread(mode: str, retry_failed_tasks: Optional[List[Dict[str, Any]]
         elapsed = (datetime.now() - started).total_seconds()
         # retry_failed_tasks = retry 後「仍失敗」的清單，全過時為 []。不可用 `or`：
         # 空 list falsy 會退回 initial_failed_tasks，把「這輪的原始輸入」誤報成失敗
-        # （成功清零卻印 Failed=28 的成因）。只有非 retry 的整輪 scrape 才沒這個 key。
-        _retry_failed = result.get("retry_failed_tasks")
-        final_failed = _retry_failed if _retry_failed is not None else result.get("initial_failed_tasks", [])
+        # （成功清零卻印 Failed=28 的成因）。也不可用「key 是否存在」判斷：run_scraper()
+        # 初始 dict 就帶 retry_failed_tasks=[]，整輪 scrape 會被誤判成 retry 全過而
+        # 吞掉真失敗。以 retried 旗標分流。
+        if result.get("retried"):
+            final_failed = result.get("retry_failed_tasks") or []
+        else:
+            final_failed = result.get("initial_failed_tasks", [])
         summary = {
             "success": len(final_failed) == 0,
             "elapsed_seconds": round(elapsed, 2),

@@ -250,9 +250,12 @@ def main() -> int:
         )
     elapsed = (datetime.now() - started).total_seconds()
     # retry_failed_tasks 全過時為 []，不可用 `or`（空 list falsy 會退回 initial_failed_tasks，
-    # 把原始輸入誤報成失敗）。只有非 retry 的整輪 scrape 才沒這個 key。
-    _retry_failed = result.get("retry_failed_tasks")
-    final_failed = _retry_failed if _retry_failed is not None else result.get("initial_failed_tasks", [])
+    # 把原始輸入誤報成失敗）。也不可用「key 是否存在」判斷：run_scraper() 初始 dict 就帶
+    # retry_failed_tasks=[]，整輪 scrape 會被誤判成 retry 全過而吞掉真失敗。以 retried 旗標分流。
+    if result.get("retried"):
+        final_failed = result.get("retry_failed_tasks") or []
+    else:
+        final_failed = result.get("initial_failed_tasks", [])
     summary = {
         "success": len(final_failed) == 0,
         "elapsed_seconds": round(elapsed, 2),
