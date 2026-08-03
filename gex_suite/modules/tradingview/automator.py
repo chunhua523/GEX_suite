@@ -5327,10 +5327,19 @@ class PlaywrightCDPAutomator(TVAutomator):
         dialog = page.locator("[role='dialog'][data-name='indicator-properties-dialog']").last
         day_xpath = self._xpath_literal(day)
         for _ in range(8):
+            # TV's CSS-module hash (cell-XXXX/inner-XXXX) changes every frontend
+            # build — match the stable prefix only, never pin the hash.
             candidate = levels_section.locator(
-                "xpath=.//following::div[contains(@class,'cell-RLntasnw')][.//div[contains(@class,'inner-RLntasnw') and normalize-space()="
+                "xpath=.//following::div[contains(@class,'cell-')][.//div[contains(@class,'inner-') and normalize-space()="
                 f"{day_xpath}]]"
                 "[1]/following::input[@data-qa-id='ui-lib-Input-input'][1]"
+            ).first
+            if await candidate.count():
+                return candidate
+            # Generic fallback: any element whose text equals the label, then next input.
+            candidate = levels_section.locator(
+                "xpath=.//following::*[normalize-space()="
+                f"{day_xpath}][1]/following::input[@data-qa-id='ui-lib-Input-input'][1]"
             ).first
             if await candidate.count():
                 return candidate
@@ -5379,8 +5388,8 @@ class PlaywrightCDPAutomator(TVAutomator):
         label_xpath = self._xpath_literal(label)
         for _ in range(8):
             candidate = section.locator(
-                "xpath=.//following::div[contains(@class,'cell-RLntasnw')]"
-                "[.//div[contains(@class,'inner-RLntasnw') and normalize-space()="
+                "xpath=.//following::div[contains(@class,'cell-')]"
+                "[.//div[contains(@class,'inner-') and normalize-space()="
                 f"{label_xpath}]]"
                 "[1]/following::input[@data-qa-id='ui-lib-Input-input'][1]"
             ).first
