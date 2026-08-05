@@ -46,6 +46,9 @@ TRADINGVIEW_LAST_FAILED_PATH = TRADINGVIEW_DATA_DIR / "last_scan_failed.json"
 # Layout groups（版面分組）: user-defined groups of TradingView layouts plus the
 # cached layout scan; opened one-group-per-window via desktop app or browser.
 TRADINGVIEW_LAYOUT_GROUPS_PATH = TRADINGVIEW_DATA_DIR / "layout_groups.json"
+# Auth cookie backup for the CDP paste profile (sessionid / device_t / …).
+# Local-only — gitignored; recovers from profile wipe, not server-side logout.
+TRADINGVIEW_SESSION_COOKIES_PATH = TRADINGVIEW_DATA_DIR / "session_cookies.json"
 
 SERVICE_ACCOUNT_PATH = DATA_DIR / "service_account.json"
 

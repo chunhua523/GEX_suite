@@ -22,6 +22,7 @@ from gex_suite.shared import db
 from gex_suite.shared.paths import DATA_DIR
 
 from .browser_paths import cdp_page_count, revive_windowless_cdp
+from . import session_backup
 
 
 def _q(s: str) -> str:
@@ -257,14 +258,29 @@ class PlaywrightCDPAutomator(TVAutomator):
 
     async def _assert_logged_in(self) -> None:
         """未登入就 fail fast，讓 chain/GUI 的失敗訊息直接寫明原因，而不是
-        之後版面清單打不開、降級 Current-only、total=0 的難解讀失敗。"""
+        之後版面清單打不開、降級 Current-only、total=0 的難解讀失敗。
+
+        登入成功時覆寫本機 session cookie 備份；缺 sessionid 時先嘗試還原
+        （救本機 profile 被清）。伺服器端已撤銷的 session 還原後驗證會失敗，
+        仍需人工重登。
+        """
         if await self.is_logged_in():
+            await self._backup_tv_session(reason="登入有效")
+            return
+        restored = await self._try_restore_tv_session()
+        if restored:
             return
         # 多開瀏覽器時使用者常登入到錯的 instance（例如第二個 Chrome 綁不到
         # 127.0.0.1:9222、默默改綁 [::1] 的假 9222，2026-07-16 踩坑）— 中止前
         # 先在「這個」instance 開一個 TradingView 分頁把正確視窗帶到前面，
         # 登入位置不用猜。
         tab_opened = await self._open_login_tab()
+        backup_note = ""
+        if session_backup.has_backup():
+            backup_note = (
+                "；本機有 cookie 備份但還原後仍無效（多半是 TradingView 伺服器"
+                "端已撤銷 session，需手動重登）"
+            )
         if tab_opened:
             hint = (
                 "已在正確視窗開好 TradingView 分頁 — 請在該視窗登入後重跑"
@@ -278,10 +294,50 @@ class PlaywrightCDPAutomator(TVAutomator):
             )
         msg = (
             f"【中止｜未登入】TradingView 未登入（{self.cdp_url} 的 profile 無 "
-            f"sessionid cookie）— {hint}"
+            f"sessionid cookie）— {hint}{backup_note}"
         )
         self._log_or_print(msg)
         raise RuntimeError(msg)
+
+    async def _backup_tv_session(self, *, reason: str) -> None:
+        """Best-effort：把目前 context 的 TV auth cookie 寫到本機備份檔。"""
+        if self._context is None:
+            return
+        try:
+            n = await session_backup.backup_from_context(self._context)
+        except Exception as exc:
+            self._log_or_print(f"【警告｜cookie 備份】失敗（{reason}）：{exc}")
+            return
+        if n > 0:
+            self._log_or_print(
+                f"【登入｜cookie 備份】已寫入 {session_backup.backup_path().name}"
+                f"（{n} 個，{reason}）"
+            )
+
+    async def _try_restore_tv_session(self) -> bool:
+        """缺 sessionid 時注入備份並用 chart 頁軟驗證。成功則 True。"""
+        if self._context is None or not session_backup.has_backup():
+            return False
+        try:
+            n = await session_backup.restore_into_context(self._context)
+        except Exception as exc:
+            self._log_or_print(f"【警告｜cookie 還原】注入失敗：{exc}")
+            return False
+        if n <= 0:
+            return False
+        self._log_or_print(f"【登入｜cookie 還原】已注入備份（{n} 個），驗證中…")
+        ok = await session_backup.validate_session_after_restore(
+            self._context, page=self._page
+        )
+        if not ok:
+            self._log_or_print(
+                "【登入｜cookie 還原】驗證失敗 — 備份 session 已失效"
+                "（伺服器端撤銷或過期），改走手動登入"
+            )
+            return False
+        await self._backup_tv_session(reason="還原成功")
+        self._log_or_print("【登入｜cookie 還原】驗證通過，繼續 paste")
+        return True
 
     async def _open_login_tab(self) -> bool:
         """在目前連上的 CDP instance 開一個 TradingView 分頁並帶到最前，
