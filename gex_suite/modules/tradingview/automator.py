@@ -24,6 +24,24 @@ from gex_suite.shared.paths import DATA_DIR
 from .browser_paths import cdp_page_count, revive_windowless_cdp
 from . import session_backup
 
+# Chrome Aw Snap / renderer kill (error code 5 = RESULT_CODE_KILLED_BAD_MESSAGE).
+_CRASH_URL_NEEDLES = ("chrome-error://", "chromewebdata")
+_CRASH_TEXT_NEEDLES = (
+    "糟糕",
+    "aw, snap",
+    "aw snap",
+    "錯誤代碼",
+    "error code",
+    "顯示這個網頁時發生錯誤",
+    "something went wrong while displaying",
+)
+_CRASH_EXC_NEEDLES = (
+    "targetclosed",
+    "page crashed",
+    "has been closed",
+    "most likely because of a crash",
+)
+
 
 def _q(s: str) -> str:
     """Escape a string for embedding inside a Playwright text selector
@@ -176,6 +194,10 @@ class PlaywrightCDPAutomator(TVAutomator):
         self._chart_settings_misopen_count = 0
         self._chart_settings_misopen_limit = 3
         self._primary_modifier_cache: str | None = None
+        # Aw Snap / renderer crash (Chrome error code 5): page target usually
+        # survives; recover by goto of the last known chart URL.
+        self._page_crashed = False
+        self._last_chart_url: str | None = None
 
     def set_logger(self, logger) -> None:
         """Inject an optional callable(str) used for verbose runtime logs."""
@@ -246,7 +268,110 @@ class PlaywrightCDPAutomator(TVAutomator):
         self._browser = await self._pw.chromium.connect_over_cdp(self.cdp_url)
         self._context = self._pick_context(self._browser)
         self._page = await self._pick_or_open_page(self._context)
+        self._attach_crash_listener(self._page)
+        self._remember_chart_url(self._page.url)
         await self._assert_logged_in()
+
+    def _attach_crash_listener(self, page: Page) -> None:
+        """Best-effort: Playwright fires ``crash`` when the renderer dies."""
+        try:
+            page.on("crash", lambda: self._mark_page_crashed())
+        except Exception:
+            pass
+
+    def _mark_page_crashed(self) -> None:
+        self._page_crashed = True
+        self._log_or_print("【CDP｜renderer 崩潰】收到 page crash 事件")
+
+    def _remember_chart_url(self, url: str | None) -> None:
+        u = (url or "").strip()
+        if "tradingview.com/chart" in u and not any(n in u for n in _CRASH_URL_NEEDLES):
+            self._last_chart_url = u
+
+    @staticmethod
+    def _is_crash_exc(exc: BaseException) -> bool:
+        name = type(exc).__name__.lower()
+        msg = str(exc).lower()
+        blob = f"{name} {msg}"
+        return any(n in blob for n in _CRASH_EXC_NEEDLES)
+
+    async def page_looks_crashed(self) -> bool:
+        """True if the active tab is an Aw Snap / dead renderer (or crash flag)."""
+        if self._page_crashed:
+            return True
+        page = self._page
+        if page is None:
+            return False
+        try:
+            url = (page.url or "").lower()
+        except Exception as exc:
+            return self._is_crash_exc(exc) or True
+        if any(n in url for n in _CRASH_URL_NEEDLES):
+            return True
+        try:
+            probe = await page.evaluate(
+                """() => {
+                  const t = (document.title || '') + ' ' + ((document.body && document.body.innerText) || '');
+                  return t.slice(0, 800);
+                }"""
+            )
+        except Exception as exc:
+            return self._is_crash_exc(exc) or True
+        low = str(probe or "").lower()
+        return any(n in low for n in _CRASH_TEXT_NEEDLES)
+
+    async def recover_crashed_page(self, fallback_url: str | None = None) -> bool:
+        """Reload a chart URL after Aw Snap. Returns True if page looks healthy."""
+        page = self._page
+        if page is None:
+            return False
+        target = (
+            (fallback_url or "").strip()
+            or (self._last_chart_url or "").strip()
+            or (self.chart_url or "").strip()
+        )
+        if not target:
+            return False
+        self._log_or_print(f"【CDP｜renderer 崩潰】已自動重新載入 URL={target}")
+        try:
+            await page.goto(target, wait_until="domcontentloaded", timeout=25000)
+        except Exception as exc:
+            self._log_or_print(f"【CDP｜renderer 崩潰】恢復失敗，goto err={exc!r}")
+            return False
+        self._page_crashed = False
+        self._attach_crash_listener(page)
+        self._remember_chart_url(page.url)
+        try:
+            await page.wait_for_selector(
+                "[data-name='chart-widget'], [class*='chart-widget']",
+                state="visible",
+                timeout=12000,
+            )
+        except Exception:
+            pass
+        if await self.page_looks_crashed():
+            self._log_or_print("【CDP｜renderer 崩潰】恢復失敗，重新載入後仍是 sad tab")
+            return False
+        return True
+
+    async def run_with_crash_recovery(
+        self,
+        factory: Callable[[], Awaitable],
+        *,
+        fallback_url: str | None = None,
+    ):
+        """Run ``factory`` once; on crash / sad tab, recover and retry once."""
+        if await self.page_looks_crashed():
+            if not await self.recover_crashed_page(fallback_url):
+                raise RuntimeError("TradingView page crashed and recovery failed")
+        try:
+            return await factory()
+        except Exception as exc:
+            if not (self._is_crash_exc(exc) or await self.page_looks_crashed()):
+                raise
+            if not await self.recover_crashed_page(fallback_url):
+                raise
+            return await factory()
 
     async def is_logged_in(self) -> bool:
         """TradingView 登入檢查：登入後才會有 .tradingview.com 的 sessionid
@@ -1150,17 +1275,56 @@ class PlaywrightCDPAutomator(TVAutomator):
             return
 
     async def _load_layout_via_goto(self, layout: LayoutInfo, before_url: str) -> bool:
-        page = self._require_page()
+        self._require_page()
         target_url = layout.url or ""
         if not target_url:
             return False
-        if target_url.rstrip("/") == before_url.rstrip("/"):
+
+        async def _once(*, force_goto: bool = False) -> bool:
+            return await self._load_layout_via_goto_once(
+                layout, target_url, before_url, force_goto=force_goto
+            )
+
+        # Already on URL but tab may be Aw Snap — fall through to _once/recover.
+        if target_url.rstrip("/") == before_url.rstrip("/") and not await self.page_looks_crashed():
             self._log(f"[load_layout] same URL, no switch needed: {target_url}")
+            self._remember_chart_url(target_url)
+            return True
+
+        ok = await _once()
+        if ok and not await self.page_looks_crashed():
+            return True
+        if not await self.page_looks_crashed():
+            return False
+        if not await self.recover_crashed_page(target_url):
+            return False
+        await self._wait_after_layout_goto()
+        self._remember_chart_url(self._page.url if self._page else target_url)
+        return True
+
+    async def _load_layout_via_goto_once(
+        self,
+        layout: LayoutInfo,
+        target_url: str,
+        before_url: str,
+        *,
+        force_goto: bool = False,
+    ) -> bool:
+        page = self._require_page()
+        if (
+            not force_goto
+            and target_url.rstrip("/") == before_url.rstrip("/")
+            and not await self.page_looks_crashed()
+        ):
+            self._log(f"[load_layout] same URL, no switch needed: {target_url}")
+            self._remember_chart_url(target_url)
             return True
         try:
             await page.goto(target_url, wait_until="domcontentloaded", timeout=20000)
         except Exception as exc:
             self._log(f"[load_layout] goto FAIL target='{layout.name}' err={exc!r}")
+            if self._is_crash_exc(exc):
+                self._page_crashed = True
             return False
         # Give TradingView time to hydrate widgets/legend after navigation.
         try:
@@ -1181,7 +1345,14 @@ class PlaywrightCDPAutomator(TVAutomator):
             pass
         # Extra settle loop for TV hydration lag after navigation.
         await self._wait_after_layout_goto()
-        switched = page.url.rstrip("/") != before_url.rstrip("/")
+        if await self.page_looks_crashed():
+            self._log(f"[load_layout] sad tab after goto target='{layout.name}'")
+            return False
+        switched = page.url.rstrip("/") != before_url.rstrip("/") or force_goto
+        # Same-URL recover path: URL may not "switch" but page is healthy again.
+        if force_goto and "tradingview.com/chart" in (page.url or ""):
+            switched = True
+        self._remember_chart_url(page.url)
         self._log(
             f"[load_layout] post-goto target='{layout.name}' final_url={page.url} switched={switched}"
         )

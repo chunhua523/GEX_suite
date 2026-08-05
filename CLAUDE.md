@@ -130,6 +130,7 @@ Every silent `continue` in `_phase_b_scan_flow` should produce a log line. Curre
 | `【登入｜cookie 備份】` | 登入有效時把 TV auth cookie 寫入本機 `data/tradingview/session_cookies.json`（gitignored） |
 | `【登入｜cookie 還原】` | profile 缺 `sessionid` 時注入備份並用 chart 頁軟驗證；伺服器已撤銷的 session 會驗證失敗仍需手動重登 |
 | `【CDP 自癒】` | connect 前偵測到殭屍 CDP 瀏覽器（0 個 page target、profile 已卸載）→ `PUT /json/new` 開頁復原＋等 5s hydration |
+| `【CDP｜renderer 崩潰】` | Chrome Aw Snap（錯誤碼 5／renderer kill）：自動 `goto` 同一 chart URL 重試一次；仍失敗則略過該版面繼續（不重啟整顆瀏覽器） |
 | `【略過｜週末】` | Today is Sat/Sun — TO FUTURE auto-fill skipped |
 | `【略過｜TO FUTURE 已有值】` | Daily or today's Ratio/Offset already non-default |
 | `【略過｜TO FUTURE 報價失敗】` | yfinance returned None for futures or compare leg |

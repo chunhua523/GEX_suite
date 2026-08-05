@@ -1818,19 +1818,68 @@ class TradingViewPage(QWidget):
                 return result
         return result
 
+    async def _recover_page_if_crashed(
+        self,
+        automator: PlaywrightCDPAutomator,
+        *,
+        layout_name: str,
+        fallback_url: str | None,
+    ) -> bool:
+        """If the CDP tab is Aw Snap, reload chart URL once.
+
+        Returns False when recovery fails — caller should skip this layout.
+        """
+        if not await automator.page_looks_crashed():
+            return True
+        ok = await automator.recover_crashed_page(fallback_url)
+        if ok:
+            return True
+        self._exec_log(
+            f"【CDP｜renderer 崩潰】恢復失敗，略過版面={layout_name}"
+        )
+        return False
+
     async def _enumerate_subcharts_with_retry(
         self,
         automator: PlaywrightCDPAutomator,
         *,
         label: str,
         retries: int = 1,
+        fallback_url: str | None = None,
     ) -> list:
         last_exc: Exception | None = None
+        recovered_once = False
         for attempt in range(retries + 1):
             try:
+                if await automator.page_looks_crashed():
+                    if recovered_once:
+                        self._exec_log(
+                            f"【CDP｜renderer 崩潰】恢復失敗，略過版面={label}"
+                        )
+                        return []
+                    ok = await automator.recover_crashed_page(fallback_url)
+                    recovered_once = True
+                    if not ok:
+                        self._exec_log(
+                            f"【CDP｜renderer 崩潰】恢復失敗，略過版面={label}"
+                        )
+                        return []
                 return await automator.enumerate_subcharts()
             except Exception as exc:  # noqa: BLE001 - keep batch resilient
                 last_exc = exc
+                crashed = (
+                    PlaywrightCDPAutomator._is_crash_exc(exc)
+                    or await automator.page_looks_crashed()
+                )
+                if crashed and not recovered_once:
+                    ok = await automator.recover_crashed_page(fallback_url)
+                    recovered_once = True
+                    if ok:
+                        continue
+                    self._exec_log(
+                        f"【CDP｜renderer 崩潰】恢復失敗，略過版面={label}"
+                    )
+                    return []
                 if attempt >= retries:
                     break
                 await asyncio.sleep(1.2)
@@ -2428,6 +2477,13 @@ class TradingViewPage(QWidget):
             self._warn_if_layout_list_degraded(opts)
             seen_subchart_keys: set[tuple[str, int, str]] = set()
             for layout_idx, layout in enumerate(layouts):
+                layout_url = (layout.url or "").strip() or None
+                if not await self._recover_page_if_crashed(
+                    automator,
+                    layout_name=layout.name,
+                    fallback_url=layout_url,
+                ):
+                    continue
                 if opts.layout_scope == "active":
                     switched = True
                 else:
@@ -2448,8 +2504,9 @@ class TradingViewPage(QWidget):
                     )
                 subcharts = await self._enumerate_subcharts_with_retry(
                     automator,
-                    label="整理流程",
+                    label=layout.name,
                     retries=1,
+                    fallback_url=layout_url,
                 )
                 self._begin_layout_in_log(
                     layout.name, mode="cleanup", subchart_count=len(subcharts)
@@ -2536,6 +2593,19 @@ class TradingViewPage(QWidget):
                     self._exec_log("【已停止】使用者中止批次。")
                     stop_all = True
                     break
+                layout_url = (layout.url or "").strip() or None
+                if not await self._recover_page_if_crashed(
+                    automator,
+                    layout_name=layout.name,
+                    fallback_url=layout_url,
+                ):
+                    self._cache_layout_entry(
+                        cache_entries,
+                        layout,
+                        runtime_url="",
+                        name=(layout.name if opts.layout_scope == "all" else ""),
+                    )
+                    continue
                 if not opts.dry_run and layout_idx > 0 and prev_layout_modified:
                     self._exec_log(
                         f"【已儲存版面】{prev_layout_label or '—'}（切換至下一個版面之前）"
@@ -2599,8 +2669,9 @@ class TradingViewPage(QWidget):
                 matched_keys_in_layout: set[tuple[str, str]] = set()
                 subcharts = await self._enumerate_subcharts_with_retry(
                     automator,
-                    label="批次掃描",
+                    label=layout.name,
                     retries=1,
+                    fallback_url=layout_url,
                 )
                 # Header emitted AFTER enumeration so the summary can carry the
                 # subchart count. Skipped on the degraded (load-failed) path,
@@ -3331,6 +3402,13 @@ class TradingViewPage(QWidget):
         seen_symbols: set[str] = set()
         matched_subcharts = 0
         for layout_idx, layout in enumerate(layouts):
+            layout_url = (layout.url or "").strip() or None
+            if not await self._recover_page_if_crashed(
+                automator,
+                layout_name=layout.name,
+                fallback_url=layout_url,
+            ):
+                continue
             if opts.layout_scope == "active":
                 switched = True
             else:
@@ -3349,8 +3427,9 @@ class TradingViewPage(QWidget):
             matched_keys_in_layout: set[tuple[str, str]] = set()
             subcharts = await self._enumerate_subcharts_with_retry(
                 automator,
-                label="預覽掃描",
+                label=layout.name,
                 retries=1,
+                fallback_url=layout_url,
             )
             if not subcharts:
                 continue
