@@ -2588,6 +2588,27 @@ class TradingViewPage(QWidget):
             # 連續「renderer 崩潰且救不回來」的版面數；連續 3 個即視為瀏覽器
             # 已死，中止整輪（避免對死瀏覽器逐版面空轉）。任一版面恢復成功歸零。
             consecutive_crash_skips = 0
+            # crash 略過的版面：首次排到本輪尾端重試一次（enumerate 會迭代到
+            # append 的項目；隔一段時間再試比原地 reload 勝率高——實測 crash
+            # 當下連 goto 都會再 crash，數十分鐘後即正常）。二度 crash 記入
+            # crash_failed_layouts，由 CLI 寫進 last_scan_failed.json 供
+            # /paste retry-failed 補掃，並讓整輪以失敗計。
+            crash_requeued: set[str] = set()
+            crash_failed_layouts: list[dict] = []
+
+            def _note_crash_skip(layout: LayoutInfo) -> None:
+                key = (layout.id or "").strip() or (layout.url or "").strip() or layout.name
+                if key not in crash_requeued:
+                    crash_requeued.add(key)
+                    layouts.append(layout)
+                    self._exec_log(
+                        f"【CDP｜renderer 崩潰】版面「{layout.name}」已排入本輪尾端重試一次"
+                    )
+                else:
+                    crash_failed_layouts.append(
+                        {"url": layout.url or "", "layout_name": layout.name}
+                    )
+
             # 版面分組快取：url -> {name, subcharts, complete}，流程結尾 flush。
             cache_entries: dict[str, dict] = {}
 
@@ -2609,6 +2630,7 @@ class TradingViewPage(QWidget):
                             runtime_url="",
                             name=(layout.name if opts.layout_scope == "all" else ""),
                         )
+                        _note_crash_skip(layout)
                         consecutive_crash_skips += 1
                         if consecutive_crash_skips >= 3:
                             self._exec_log(
@@ -3297,6 +3319,7 @@ class TradingViewPage(QWidget):
                     )
                     prev_layout_label = layout.name
                     prev_layout_modified = False
+                    _note_crash_skip(layout)
                     consecutive_crash_skips += 1
                     if consecutive_crash_skips >= 3:
                         self._exec_log(
@@ -3314,6 +3337,7 @@ class TradingViewPage(QWidget):
 
             self._last_phase_b_symbols = sorted(seen_symbols)
             self._last_phase_b_matched_subcharts = matched_subcharts
+            self._last_phase_b_crash_layouts = crash_failed_layouts
             done = sum(1 for r in results if r.status == "done")
             skipped = sum(1 for r in results if r.status == "skipped")
             failed = sum(1 for r in results if r.status == "failed")

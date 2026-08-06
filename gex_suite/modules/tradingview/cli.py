@@ -432,6 +432,8 @@ def _record_last_scan_failed(payload: dict, opts: Any) -> None:
     """
     if getattr(opts, "ticker_scope", "all") == "ticker":
         return
+    if getattr(opts, "dry_run", False):
+        return  # 預覽不是真實覆蓋，不可覆寫 retry-failed 清單
     seen: set[str] = set()
     failed: list[dict] = []
     for it in payload.get("items", []):
@@ -447,6 +449,18 @@ def _record_last_scan_failed(payload: dict, opts: Any) -> None:
             "ticker": it.get("ticker"),
             "monday": it.get("monday"),
             "message": it.get("message"),
+        })
+    for cl in payload.get("crash_layouts", []):
+        url = (cl.get("url") or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        failed.append({
+            "url": url,
+            "layout_name": cl.get("layout_name"),
+            "ticker": None,
+            "monday": None,
+            "message": "renderer 崩潰，本輪尾端重試仍失敗（版面未掃）",
         })
     record = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -553,11 +567,22 @@ def main() -> int:
             opts.layout_scope == "all"
             and getattr(page, "_last_phase_b_layout_list_degraded", False)
         )
+        # renderer 崩潰、本輪尾端重試仍失敗的版面（該版面未掃）：記進
+        # last_scan_failed 供 /paste retry-failed 補掃，且整輪以失敗計。
+        payload["crash_layouts"] = list(
+            getattr(page, "_last_phase_b_crash_layouts", []) or []
+        )
         _record_last_scan_failed(payload, opts)
         print(f"✅ TV batch done in {elapsed:.1f}s — total={payload['total']} "
               f"done={payload['done']} skipped={payload['skipped']} failed={payload['failed']}")
         if payload["layout_list_degraded"]:
             print("⚠️ 版面清單降級為僅 Current — 本輪幾乎沒有覆蓋，以失敗計（exit=1）")
+        if payload["crash_layouts"]:
+            names = ", ".join(
+                str(c.get("layout_name") or c.get("url") or "?")
+                for c in payload["crash_layouts"]
+            )
+            print(f"⚠️ renderer 崩潰未掃完的版面：{names} — 以失敗計（exit=1）")
 
         page._end_run_log({
             "total": payload["total"],
@@ -573,7 +598,8 @@ def main() -> int:
                 encoding="utf-8",
             )
 
-        if payload.get("failed", 0) > 0 or payload.get("layout_list_degraded"):
+        if (payload.get("failed", 0) > 0 or payload.get("layout_list_degraded")
+                or payload.get("crash_layouts")):
             return 1
         return 0
     finally:
