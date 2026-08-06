@@ -121,6 +121,60 @@ def _probe_cdp(url: str, timeout: float = 2.0) -> bool:
         return False
 
 
+def _cdp_ws_responsive(cdp_url: str, timeout_ms: int = 15000) -> bool:
+    """HTTP /json/version 活著 ≠ CDP 可用：瀏覽器主行程卡死時 devtools 的 HTTP
+    thread 照常回應、ws 也能握手，但指令永遠沒人處理，Playwright connect 會吃滿
+    timeout（2026-08-06：隔夜 GUI 殘留 Chrome 就是這樣讓 asia＋main 兩場 paste
+    全滅）。唯一可靠的判別是真的走一次 connect_over_cdp。"""
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            p.chromium.connect_over_cdp(cdp_url, timeout=timeout_ms).close()
+        return True
+    except Exception:
+        return False
+
+
+def _kill_cdp_port_owner(port: int, wait_seconds: float = 10.0) -> bool:
+    """強制結束佔住 tcp:port 的瀏覽器行程，釋放 port 供冷啟。
+
+    只殺 argv 帶 --remote-debugging-port=<port> 的行程——自動化啟的瀏覽器才有
+    這個旗標，使用者日常瀏覽器沒有，絕不誤殺。回傳 port 是否已釋放。"""
+    import signal as _signal
+
+    flag = f"--remote-debugging-port={port}"
+
+    def _listeners() -> list[int]:
+        out = subprocess.run(
+            ["lsof", "-nP", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
+            capture_output=True, text=True,
+        ).stdout
+        return [int(x) for x in out.split()]
+
+    pids = _listeners()
+    if not pids:
+        return True
+    for pid in pids:
+        argv = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                              capture_output=True, text=True).stdout
+        if flag not in argv:
+            print(f"⚠️ port {port} 由非自動化行程 pid={pid} 佔用，拒絕強制結束")
+            return False
+    for sig in (_signal.SIGTERM, _signal.SIGKILL):
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + wait_seconds / 2
+        while time.monotonic() < deadline:
+            if not _listeners():
+                return True
+            time.sleep(0.5)
+        pids = _listeners()
+    return not _listeners()
+
+
 # Chrome zoom_level for exactly 50% page zoom == log(0.5)/log(1.2). Page zoom is
 # stored per exact host, so we seed both the partition default (catch-all) and
 # the specific TradingView hosts the automation loads, so dialogs (layout list /
@@ -186,16 +240,20 @@ def _launch_browser_cdp(browser: str, port: int) -> None:
 def _ensure_cdp(cdp_url: str, *, browser: str, auto_launch: bool,
                 timeout_seconds: int) -> bool:
     """Probe CDP; optionally launch the configured browser and wait.
-    Return True if reachable."""
-    if _probe_cdp(cdp_url):
-        return True
-    if not auto_launch:
-        return False
-    # Extract port from URL for launch
+    Return True if reachable AND responsive."""
     try:
         port = int(cdp_url.rsplit(":", 1)[1].split("/")[0])
     except Exception:
         port = 9222
+    if _probe_cdp(cdp_url):
+        if _cdp_ws_responsive(cdp_url):
+            return True
+        # 半死瀏覽器（HTTP 活著、CDP 指令無回應）：reuse 沒救，唯一解是砍掉重啟。
+        print("⚠️ CDP HTTP 有回應但指令無回應（瀏覽器行程卡死）→ 強制結束並重啟")
+        if not auto_launch or not _kill_cdp_port_owner(port):
+            return False
+    elif not auto_launch:
+        return False
     _launch_browser_cdp(browser, port)
     deadline = time.monotonic() + max(5, timeout_seconds)
     while time.monotonic() < deadline:
