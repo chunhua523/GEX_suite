@@ -135,6 +135,33 @@ def _cdp_ws_responsive(cdp_url: str, timeout_ms: int = 15000) -> bool:
         return False
 
 
+def _start_display_keepawake():
+    """整段 paste 期間持續宣告使用者活動，鎖住螢幕常亮。
+
+    macOS 26 上 `caffeinate -dimsu <cmd>` 的 -u 只在啟動瞬間宣告一次使用者活動，
+    跑到一半螢幕照樣熄滅；而 Chrome 151 螢幕熄滅後主行程事件幫浦會永久卡死
+    （2026-08-06 兩度 wedge：19:30 熄屏 → 19:37 CDP 指令無人回應，醒屏也不會
+    恢復）。用 back-to-back 的 `caffeinate -u -t 60` 短 pulse 連續重置熄屏倒數。
+    回傳 stop Event；daemon thread 隨行程結束自動消滅。"""
+    import threading
+
+    stop = threading.Event()
+
+    def _pulse() -> None:
+        while not stop.is_set():
+            try:
+                subprocess.run(
+                    ["/usr/bin/caffeinate", "-u", "-t", "60"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=70,
+                )
+            except Exception:
+                stop.wait(30)
+
+    threading.Thread(target=_pulse, daemon=True, name="display-keepawake").start()
+    return stop
+
+
 def _kill_cdp_port_owner(port: int, wait_seconds: float = 10.0) -> bool:
     """強制結束佔住 tcp:port 的瀏覽器行程，釋放 port 供冷啟。
 
@@ -495,6 +522,7 @@ def main() -> int:
         print(f"📄 run log: {log_path}")
 
     start = time.monotonic()
+    keepawake = _start_display_keepawake()
     try:
         try:
             report = asyncio.run(page._phase_b_scan_flow(opts))
@@ -549,6 +577,7 @@ def main() -> int:
             return 1
         return 0
     finally:
+        keepawake.set()
         # Belt-and-suspenders: ensure the writer is closed even if something
         # unexpected slipped past the inner handlers.
         if getattr(page, "_run_log_writer", None) is not None:
