@@ -38,6 +38,7 @@ _CRASH_TEXT_NEEDLES = (
 _CRASH_EXC_NEEDLES = (
     "targetclosed",
     "page crashed",
+    "target crashed",
     "has been closed",
     "most likely because of a crash",
 )
