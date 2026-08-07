@@ -296,6 +296,14 @@ class PlaywrightCDPAutomator(TVAutomator):
         blob = f"{name} {msg}"
         return any(n in blob for n in _CRASH_EXC_NEEDLES)
 
+    def browser_connected(self) -> bool:
+        """CDP 連線層是否還活著。瀏覽器行程被 watchdog 砍掉（或自己死掉）後為
+        False——此時逐版面 reload 沒有意義，唯一出路是整顆重啟＋重連。"""
+        try:
+            return bool(self._browser and self._browser.is_connected())
+        except Exception:
+            return False
+
     async def page_looks_crashed(self) -> bool:
         """True if the active tab is an Aw Snap / dead renderer (or crash flag)."""
         if self._page_crashed:

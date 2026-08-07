@@ -458,6 +458,15 @@ class TradingViewPage(QWidget):
         self._load_tv_prefs()
         self._on_ticker_scope_changed()
 
+        # 無人值守（CLI）專用的瀏覽器 watchdog hooks。GUI 不設定 → 行為不變。
+        # _browser_kill：砍掉 CDP port 上的瀏覽器行程（半死時讓阻塞中的
+        # playwright 呼叫立刻拋錯解除阻塞）；_browser_respawn：砍掉＋冷啟＋等
+        # ws 可用（回 bool）。兩者都是同步函式，流程內用 asyncio.to_thread 呼叫。
+        self._browser_kill = None
+        self._browser_respawn = None
+        self._watchdog_stall_seconds = 300
+        self._phase_b_respawn_count = 0
+
         self._cancel_batch_scan = False
         self._scan_thread: _PhaseBScanThread | None = None
         self._preview_thread: _AsyncCoroThread | None = None
@@ -1818,6 +1827,65 @@ class TradingViewPage(QWidget):
                 return result
         return result
 
+    async def _stall_watchdog(self, progress: dict, kill_hook) -> None:
+        """半死瀏覽器偵測（CLI 無人值守專用；GUI 沒有 kill hook 不會啟動）。
+
+        Chrome 151 的 wedge：HTTP /json 活著、ws 握手成功、指令永遠沒人回，
+        流程就阻塞在某個 playwright await 上（2026-08-07 實測凍 2 小時零 CPU）。
+        任何 await 都醒不來，所以只能由旁路把瀏覽器行程砍掉——連線斷掉會讓
+        阻塞中的呼叫立刻拋 TargetClosed（crash 類例外），交回版面迴圈既有的
+        crash guard → 重啟瀏覽器 → 續跑。"""
+        limit = max(60, int(self._watchdog_stall_seconds or 300))
+        while True:
+            await asyncio.sleep(15)
+            stalled = time.monotonic() - progress["t"]
+            if stalled < limit:
+                continue
+            self._exec_log(
+                f"【CDP｜watchdog】流程 {int(stalled)}s 無進展——瀏覽器疑似半死"
+                "（指令無人回應），強制結束瀏覽器行程以解除阻塞"
+            )
+            progress["t"] = time.monotonic()  # 避免 kill 後未解除阻塞前連環觸發
+            try:
+                await asyncio.to_thread(kill_hook)
+            except Exception as exc:
+                self._exec_log(f"【CDP｜watchdog】強制結束瀏覽器失敗：{exc}")
+
+    async def _try_respawn_browser(self, automator: PlaywrightCDPAutomator) -> bool:
+        """砍掉＋重啟瀏覽器並重連 automator。成功回 True，呼叫端歸零 crash 計數
+        後續跑；沒有 respawn hook（GUI）或超過重啟上限一律回 False，走既有的
+        中止路徑。上限防的是「重啟後立刻又 wedge」的無限輪迴。"""
+        hook = self._browser_respawn
+        if hook is None:
+            return False
+        if self._phase_b_respawn_count >= 3:
+            self._exec_log("【CDP｜watchdog】本輪已重啟瀏覽器 3 次仍不穩，放棄續跑")
+            return False
+        self._phase_b_respawn_count += 1
+        self._exec_log(
+            f"【CDP｜watchdog】重啟瀏覽器並重連（第 {self._phase_b_respawn_count} 次）…"
+        )
+        try:
+            await automator.close()
+        except Exception:
+            pass
+        try:
+            ok = await asyncio.to_thread(hook)
+        except Exception as exc:
+            self._exec_log(f"【CDP｜watchdog】瀏覽器重啟失敗：{exc}")
+            return False
+        if not ok:
+            self._exec_log("【CDP｜watchdog】瀏覽器重啟後 CDP 仍不可用")
+            return False
+        try:
+            await automator.connect()
+            await self._preflight_clear_overlay(automator)
+        except Exception as exc:
+            self._exec_log(f"【CDP｜watchdog】重連 automator 失敗：{exc}")
+            return False
+        self._exec_log("【CDP｜watchdog】瀏覽器已重啟並重連，續跑剩餘版面")
+        return True
+
     async def _recover_page_if_crashed(
         self,
         automator: PlaywrightCDPAutomator,
@@ -2565,11 +2633,25 @@ class TradingViewPage(QWidget):
     ):
         automator = PlaywrightCDPAutomator()
         automator.set_apply_visibility_preset(opts.apply_visibility_preset)
+        # 半死 watchdog 心跳：流程每前進一步就打一次；watchdog 發現太久沒進展
+        # 就砍瀏覽器解除阻塞（只在 CLI 設了 _browser_kill 時啟動）。
+        self._phase_b_respawn_count = 0
+        progress = {"t": time.monotonic()}
+
+        def _beat() -> None:
+            progress["t"] = time.monotonic()
+
+        watchdog_task: asyncio.Task | None = None
         try:
             await automator.connect()
+            if self._browser_kill is not None:
+                watchdog_task = asyncio.create_task(
+                    self._stall_watchdog(progress, self._browser_kill)
+                )
             await self._preflight_clear_overlay(automator)
             mondays = sorted(compute_target_mondays(opts.weeks))
             layouts = await self._resolve_target_layouts(automator, opts)
+            _beat()
             self._sync_last_phase_b_layout_snap(layouts)
             self._set_layout_total_in_log(len(layouts))
             self._warn_if_layout_list_degraded(opts)
@@ -2595,6 +2677,10 @@ class TradingViewPage(QWidget):
             # /paste retry-failed 補掃，並讓整輪以失敗計。
             crash_requeued: set[str] = set()
             crash_failed_layouts: list[dict] = []
+            # 因瀏覽器死亡（連 respawn 都救不回）而中止＝True；收尾把沒掃到的
+            # 版面全部記入 crash_failed_layouts（使用者手動停止不算）。
+            aborted_by_crash = False
+            layout_idx = -1
 
             def _note_crash_skip(layout: LayoutInfo) -> None:
                 key = (layout.id or "").strip() or (layout.url or "").strip() or layout.name
@@ -2606,7 +2692,11 @@ class TradingViewPage(QWidget):
                     )
                 else:
                     crash_failed_layouts.append(
-                        {"url": layout.url or "", "layout_name": layout.name}
+                        {
+                            "url": layout.url or "",
+                            "layout_name": layout.name,
+                            "message": "renderer 崩潰，本輪尾端重試仍失敗（版面未掃）",
+                        }
                     )
 
             # 版面分組快取：url -> {name, subcharts, complete}，流程結尾 flush。
@@ -2614,6 +2704,7 @@ class TradingViewPage(QWidget):
 
             for layout_idx, layout in enumerate(layouts):
                 try:
+                    _beat()
                     if self._batch_should_stop():
                         self._exec_log("【已停止】使用者中止批次。")
                         stop_all = True
@@ -2632,11 +2723,18 @@ class TradingViewPage(QWidget):
                         )
                         _note_crash_skip(layout)
                         consecutive_crash_skips += 1
+                        if (
+                            consecutive_crash_skips >= 3
+                            or not automator.browser_connected()
+                        ) and await self._try_respawn_browser(automator):
+                            consecutive_crash_skips = 0
+                            continue
                         if consecutive_crash_skips >= 3:
                             self._exec_log(
                                 f"【CDP｜renderer 崩潰】連續 {consecutive_crash_skips} 個版面"
                                 "救不回來——瀏覽器可能已死，中止整輪（其餘版面未掃）。"
                             )
+                            aborted_by_crash = True
                             stop_all = True
                             break
                         continue
@@ -2729,6 +2827,7 @@ class TradingViewPage(QWidget):
                         continue
                     layout_modified = False
                     for sub in subcharts:
+                        _beat()
                         if self._batch_should_stop():
                             self._exec_log("【已停止】使用者中止批次。")
                             stop_all = True
@@ -3283,6 +3382,7 @@ class TradingViewPage(QWidget):
                                     dry_run=opts.dry_run,
                                 )
                                 results.append(result)
+                                _beat()  # 每寫完一週打一次心跳，長版面不誤觸 watchdog
                                 if not opts.dry_run and result.status == "done":
                                     layout_modified = True
                         finally:
@@ -3321,17 +3421,49 @@ class TradingViewPage(QWidget):
                     prev_layout_modified = False
                     _note_crash_skip(layout)
                     consecutive_crash_skips += 1
+                    if (
+                        consecutive_crash_skips >= 3
+                        or not automator.browser_connected()
+                    ) and await self._try_respawn_browser(automator):
+                        consecutive_crash_skips = 0
+                        continue
                     if consecutive_crash_skips >= 3:
                         self._exec_log(
                             f"【CDP｜renderer 崩潰】連續 {consecutive_crash_skips} 個版面"
                             "救不回來——瀏覽器可能已死，中止整輪（其餘版面未掃）。"
                         )
+                        aborted_by_crash = True
                         stop_all = True
                         break
                     continue
-            if not opts.dry_run and prev_layout_modified:
+            if (
+                not opts.dry_run
+                and prev_layout_modified
+                and automator.browser_connected()
+            ):
                 self._exec_log(f"【已儲存版面】{prev_layout_label or '—'}（批次結束）")
                 await automator.save_current_layout()
+
+            if aborted_by_crash:
+                # 中止＝尾端重試沒機會跑、後面的版面沒掃——全部記入失敗清單，
+                # 讓 last_scan_failed.json／`/paste retry-failed` 看得到（2026-08-07
+                # 踩坑：中止後帳面 failed=1 只剩指標失敗，20+ 個未掃版面隱形）。
+                seen_keys = {
+                    (c.get("url") or "").strip() or c.get("layout_name")
+                    for c in crash_failed_layouts
+                }
+                for lay in layouts[layout_idx + 1:]:
+                    key = (lay.url or "").strip() or lay.name
+                    if not key or key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    crash_failed_layouts.append(
+                        {
+                            "url": lay.url or "",
+                            "layout_name": lay.name,
+                            "message": "瀏覽器死亡中止整輪，此版面未掃",
+                        }
+                    )
 
             self._flush_layout_groups_cache(opts, layouts, cache_entries, stop_all)
 
@@ -3349,7 +3481,13 @@ class TradingViewPage(QWidget):
                 items=results,
             )
         finally:
-            await automator.close()
+            if watchdog_task is not None:
+                watchdog_task.cancel()
+            try:
+                await automator.close()
+            except Exception:
+                # 瀏覽器被 watchdog 砍掉後 close 可能拋錯——不能讓它蓋掉 report。
+                pass
 
     # ---------- 版面分組快取同步（掃圖流程附帶更新；GUI 與每日 CLI 共用此 flow） ----------
 

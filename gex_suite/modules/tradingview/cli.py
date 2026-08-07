@@ -95,6 +95,12 @@ def parse_args() -> argparse.Namespace:
                         "seconds before connecting.")
     p.add_argument("--launch-timeout", type=int, default=30,
                    help="Seconds to wait for the browser/CDP to become reachable.")
+    p.add_argument("--keep-browser", action="store_true",
+                   help="Do NOT shut down the auto-launched CDP browser when the "
+                        "run finishes. Default is to close it: Chrome 151 wedges "
+                        "(half-dead CDP) when an idle instance sits across screen-"
+                        "off periods, so leaving one resident between runs is the "
+                        "main exposure (2026-08-07).")
     p.add_argument("--dry-run", action="store_true",
                    help="Preview only — no writes to TradingView or DB.")
     p.add_argument("--result-json", default="", help="Write BatchReport summary as JSON.")
@@ -460,7 +466,8 @@ def _record_last_scan_failed(payload: dict, opts: Any) -> None:
             "layout_name": cl.get("layout_name"),
             "ticker": None,
             "monday": None,
-            "message": "renderer 崩潰，本輪尾端重試仍失敗（版面未掃）",
+            "message": cl.get("message")
+            or "renderer 崩潰，本輪尾端重試仍失敗（版面未掃）",
         })
     record = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -484,6 +491,26 @@ def main() -> int:
     cdp_url = (args.cdp_url or config.get("cdp_url") or DEFAULT_CDP_URL).rstrip("/")
     browser = _normalize_browser(args.browser or config.get("browser"))
     print(f"🌐 browser={browser} (CDP profile {_BROWSER_CDP_PROFILES[browser].name})")
+    try:
+        port = int(cdp_url.rsplit(":", 1)[1].split("/")[0])
+    except Exception:
+        port = 9222
+
+    def _kill_browser() -> bool:
+        """watchdog 用：只砍行程，讓阻塞中的 playwright 呼叫拋錯解除阻塞。"""
+        return _kill_cdp_port_owner(port)
+
+    def _respawn_browser() -> bool:
+        """砍掉＋冷啟＋等到 ws 真的可回應（不是只看 HTTP probe）。"""
+        if not _kill_cdp_port_owner(port):
+            return False
+        _launch_browser_cdp(browser, port)
+        deadline = time.monotonic() + max(5, args.launch_timeout)
+        while time.monotonic() < deadline:
+            if _probe_cdp(cdp_url):
+                return _cdp_ws_responsive(cdp_url)
+            time.sleep(1)
+        return False
 
     if not _ensure_cdp(cdp_url, browser=browser, auto_launch=args.auto_launch_brave,
                        timeout_seconds=args.launch_timeout):
@@ -499,6 +526,19 @@ def main() -> int:
 
     app = _make_offscreen_app()  # noqa: F841 — must outlive widget
     page, captured = _create_widget_headless()
+
+    if args.auto_launch_brave:
+        # 無人值守 watchdog：流程凍住（半死瀏覽器，指令無人回應）→ 砍行程解除
+        # 阻塞 → 版面迴圈的 crash guard 走 respawn 重連續跑。GUI 路徑不設定
+        # 這些 hook，行為不變。
+        page._browser_kill = _kill_browser
+        page._browser_respawn = _respawn_browser
+        try:
+            page._watchdog_stall_seconds = int(
+                config.get("watchdog_stall_seconds") or 300
+            )
+        except Exception:
+            pass
 
     try:
         opts = _build_options(config, args)
@@ -524,37 +564,61 @@ def main() -> int:
         f"urls({len(opts.layout_urls)})" if opts.layout_urls else opts.layout_scope
     )
     log_kind = "scan_cli_dry" if opts.dry_run else "scan_cli"
-    page._begin_run_log(
-        log_kind,
-        title_suffix=(
-            f"ticker={ticker_for_title} weeks={opts.weeks} "
-            f"layout={layout_for_title} dry_run={opts.dry_run}"
-        ),
+    title_suffix = (
+        f"ticker={ticker_for_title} weeks={opts.weeks} "
+        f"layout={layout_for_title} dry_run={opts.dry_run}"
     )
-    log_path = getattr(page, "_latest_log_path", None)
-    if log_path:
-        print(f"📄 run log: {log_path}")
 
     start = time.monotonic()
     keepawake = _start_display_keepawake()
     try:
-        try:
-            report = asyncio.run(page._phase_b_scan_flow(opts))
-        except Exception as exc:
-            elapsed = time.monotonic() - start
-            msg = f"_phase_b_scan_flow raised: {type(exc).__name__}: {exc}"
-            print(f"❌ {msg}")
-            page._end_run_log({"note": msg})
-            if args.result_json:
-                Path(args.result_json).write_text(
-                    json.dumps({
-                        "ok": False, "error": msg, "elapsed_seconds": round(elapsed, 2),
-                        "log_tail": captured[-50:],
-                        "run_log": str(log_path) if log_path else None,
-                    }, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
+        # 整輪最多跑 2 次：第 1 次因 crash 類例外炸掉、或版面清單降級成
+        # Current-only（開場就接到半死瀏覽器的典型症狀）時，重啟瀏覽器後
+        # 重試一次。已完成的版面靠快取 skip，重試成本低且冪等。
+        report = None
+        log_path = None
+        for attempt in (1, 2):
+            page._begin_run_log(log_kind, title_suffix=title_suffix)
+            log_path = getattr(page, "_latest_log_path", None)
+            if log_path:
+                print(f"📄 run log: {log_path}")
+            try:
+                report = asyncio.run(page._phase_b_scan_flow(opts))
+            except Exception as exc:
+                elapsed = time.monotonic() - start
+                msg = f"_phase_b_scan_flow raised: {type(exc).__name__}: {exc}"
+                print(f"❌ {msg}")
+                page._end_run_log({"note": msg})
+                from .automator import PlaywrightCDPAutomator
+                if (attempt == 1 and args.auto_launch_brave
+                        and PlaywrightCDPAutomator._is_crash_exc(exc)):
+                    print("♻️ crash 類失敗——重啟瀏覽器後整輪重試一次")
+                    if _respawn_browser():
+                        continue
+                if args.result_json:
+                    Path(args.result_json).write_text(
+                        json.dumps({
+                            "ok": False, "error": msg,
+                            "elapsed_seconds": round(elapsed, 2),
+                            "log_tail": captured[-50:],
+                            "run_log": str(log_path) if log_path else None,
+                        }, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                return 1
+            degraded_now = bool(
+                opts.layout_scope == "all"
+                and getattr(page, "_last_phase_b_layout_list_degraded", False)
+            )
+            if attempt == 1 and args.auto_launch_brave and degraded_now:
+                page._end_run_log(
+                    {"note": "版面清單降級（Current-only）——重啟瀏覽器後整輪重試"}
                 )
-            return 1
+                print("♻️ 版面清單降級——重啟瀏覽器後整輪重試一次")
+                if _respawn_browser():
+                    report = None
+                    continue
+            break
 
         elapsed = time.monotonic() - start
         payload = _serialize_report(report, elapsed, captured)
@@ -611,6 +675,15 @@ def main() -> int:
                 page._end_run_log()
             except Exception:
                 pass
+        if args.auto_launch_brave and not args.keep_browser:
+            # 兩輪 paste 之間不留常駐 CDP 瀏覽器：Chrome 151 熄屏／久駐 wedge
+            # 的暴露面直接歸零。_kill_cdp_port_owner 只殺帶 debug 旗標的行程，
+            # 使用者日常瀏覽器不受影響。
+            print("🧹 收掉 CDP 瀏覽器（--keep-browser 可保留）")
+            try:
+                _kill_cdp_port_owner(port)
+            except Exception as exc:
+                print(f"⚠️ 收掉 CDP 瀏覽器失敗：{exc}")
 
 
 if __name__ == "__main__":
