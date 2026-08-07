@@ -82,7 +82,11 @@ def paste_retry_failed() -> Any:
         ) as tmp:
             result_json = Path(tmp.name)
 
-        cmd = [sys.executable, "-m", "gex_suite.modules.tradingview.cli", "--weeks", weeks]
+        # --auto-launch-brave 不可省：cli 收尾會收掉 CDP 瀏覽器（2026-08-07
+        # 起不留常駐），retry 時多半沒有現成瀏覽器可連，須自行冷啟；同時
+        # 這旗標也是半死 watchdog／respawn hooks 的開關。
+        cmd = [sys.executable, "-m", "gex_suite.modules.tradingview.cli",
+               "--auto-launch-brave", "--weeks", weeks]
         for u in urls:
             cmd.extend(["--layout-url", u])
         cmd.extend(["--result-json", str(result_json)])
