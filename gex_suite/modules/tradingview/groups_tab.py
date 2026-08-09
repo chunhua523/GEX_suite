@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 import sys
 from datetime import datetime
@@ -308,6 +309,22 @@ class LayoutGroupsTab(QWidget):
         self._refresh_groups_list()
 
     # ---------- 設定檔位置 ----------
+    @staticmethod
+    def _sniff_json_kind(path: str) -> str:
+        """回傳檔案外觀："groups"｜"list"｜"other"（讀不懂／無明確特徵）."""
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return "other"
+        if not isinstance(data, dict):
+            return "other"
+        if isinstance(data.get("layouts"), list):
+            return "list"
+        if "groups" in data or "scanned_layouts" in data:
+            return "groups"
+        return "other"
+
     def _refresh_path_label(self) -> None:
         gpath = layout_groups_path()
         g_custom = get_configured_path() is not None
@@ -337,6 +354,14 @@ class LayoutGroupsTab(QWidget):
         )
         if not picked:
             return
+        if self._sniff_json_kind(picked) == "list":
+            QMessageBox.warning(
+                self,
+                "檔案格式不符",
+                "選擇的檔案看起來是清單檔（頂層為 layouts，掃描快取）。\n"
+                "群組檔頂層應為 groups（檔名通常是 layout_groups.json）。",
+            )
+            return
         set_configured_path(picked)
         self._reload_state()
         self._refresh_path_label()
@@ -361,6 +386,15 @@ class LayoutGroupsTab(QWidget):
             "JSON (*.json)",
         )
         if not picked:
+            return
+        if self._sniff_json_kind(picked) == "groups":
+            QMessageBox.warning(
+                self,
+                "檔案格式不符",
+                "選擇的檔案看起來是群組檔（頂層為 groups），不是清單檔。\n"
+                "清單檔由掃描產生、頂層為 layouts（檔名通常是 layout_list.json）；\n"
+                "指錯會讓群組內所有版面顯示〔已過期〕。",
+            )
             return
         set_configured_list_path(picked)
         self._reload_state()
