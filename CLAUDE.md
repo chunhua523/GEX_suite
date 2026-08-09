@@ -143,37 +143,58 @@ If you add a new silent skip, add a corresponding log line — historical patter
 
 Files: `layout_groups.py`（model/persistence，無 Qt）、`app_launcher.py`（桌面 app
 CDP 驅動，無 Qt）、`groups_tab.py`（UI）、`qt_async.py`/`browser_paths.py`（自
-widget.py 搬出的共用件）。資料檔 `data/tradingview/layout_groups.json`。
-一組＝一視窗、組內版面＝分頁；App 與瀏覽器兩種開啟模式。
+widget.py 搬出的共用件）。一組＝一視窗、組內版面＝分頁；App 與瀏覽器兩種開啟模式。
 
-**版面清單 = 掃描快取（`scanned_layouts`），三處會更新同一份檔案**：
+**資料拆兩檔（2026-08-10 起；為雲端同步把衝突面降到最小）**：
+
+- **群組檔** `layout_groups.json`（位置可自訂）：`settings` ＋ `groups`，群組
+  只存版面 id（`layout_ids`）。**只有使用者在分組頁的編輯會寫入**（`save_groups`）
+  ——掃描／貼上／每日排程永遠不碰，機器寫入不會和手動編輯在同步時互蓋。
+- **清單檔** `layout_list.json`（位置可獨立自訂；預設＝群組檔同目錄）：掃描快取
+  `scanned_layouts`（名稱、URL、子圖標題）。**只有掃描／貼上流程寫入**
+  （`save_list`／`apply_scan_results_to_disk`）；同步衝突無所謂，下次掃描自癒。
+  典型配置：群組檔放同步資料夾跨機共用、清單檔各機自掃（留本機）。
+- 顯示時群組 id 由 `state.resolve()` 從清單解析；解析不到＝**已過期**（版面已
+  刪或未掃描）→ UI 灰字標〔已過期〕、開啟群組時略過並 log，**由使用者手動移除
+  ——程式不再自動 prune 群組**。手動新增 URL 會同時 upsert 一筆 `source="manual"`
+  清單項目（full 掃描永遠保留 manual 項目）。
+- 舊版單檔格式（groups 內嵌 layouts＋scanned_layouts 同檔）在 `load_layout_groups`
+  偵測到時自動一次性遷移拆檔；過渡期兩檔並存以清單檔內容優先。
+
+**清單檔更新來源（兩處）**：
 
 - 分組頁「掃描版面」：`groups_tab._scan_layouts_coro` 逐版面 `load_layout` →
   `enumerate_subcharts` 讀每張子圖 header symbol 當標題（`subchart_title` 取冒號
   尾碼、公式圖原樣）。9222 沒開會自動 `launch_cdp_browser`；可中途停止。
 - 批次貼上（GUI）＋每日排程（`cli.py` 重用同一個 `_phase_b_scan_flow`）：流程
   收尾呼叫 `widget._flush_layout_groups_cache`，把掃圖時看到的版面（含子圖標題）
-  同步進快取。
+  同步進清單檔。
 - 同步語意在 `layout_groups.apply_scan_results`：`full=True`（scope=all 且完整
-  跑完）整批替換快取、且**群組內 `source=="scan"` 而版面已消失者一併移除**
-  （`source=="manual"` 永遠保留）；`full=False`（scope=urls/active/中止/降級）
-  只 upsert 不刪。子圖迴圈沒跑完的版面 `complete=False` → 不覆蓋舊子圖清單。
+  跑完）整批替換清單（manual 項目保留）；`full=False`（scope=urls/active/中止/
+  降級）只 upsert 不刪。子圖迴圈沒跑完的版面 `complete=False` → 不覆蓋舊子圖
+  清單。回傳 `{"cache", "expired"}`，expired＝群組內解析不到的 id 數（只提示，
+  不動群組）。
 - UI 顯示與 picker filter 都用 `GroupLayout.display_label()`／`matches_filter()`
   （名稱＋子圖標題，不顯示 chart id；filter 可用子圖標題篩）。`groups_tab`
-  的 `showEvent` 會 reload，撿起外部行程（每日 CLI、批次貼上）寫的最新快取。
+  的 `showEvent` 會 reload，撿起外部行程（每日 CLI、批次貼上）寫的最新清單。
 
-**資料檔位置可自訂**（分組頁底部「設定檔：… / 變更… / 還原預設」）：
+**資料檔位置可自訂**（分組頁底部「群組檔：…／清單檔：…」兩列，各自
+「變更… / 還原預設」）：
 
-- 生效路徑由 `layout_groups.layout_groups_path()` 解析：行程覆寫
+- 群組檔路徑由 `layout_groups.layout_groups_path()` 解析：行程覆寫
   （`set_path_override`，只給測試）> `suite_config.json` 的 `layout_groups_path`
   鍵（`get/set_configured_path`）> 內建 `TRADINGVIEW_LAYOUT_GROUPS_PATH`。
-  `load/save_layout_groups`、`apply_scan_results_to_disk` 全走解析器，所以 GUI
-  與每日排程 CLI 讀寫同一份檔（把兩機的 GUI 都指到同一個雲端/同步資料夾即可
-  跨機共用群組）。
-- 變更＝選一個既有的 json 檔（`QFileDialog.getOpenFileName`），只改指向、不搬移
-  現有檔；典型用法是指到雲端/同步資料夾裡那份 `layout_groups.json`。
+  清單檔路徑 `layout_list_path()` 同樣三層：`set_list_path_override` >
+  `layout_list_path` 鍵（`get/set_configured_list_path`）> 群組檔同目錄的
+  `layout_list.json`。所有讀寫全走解析器，所以 GUI 與每日排程 CLI 讀寫同一組
+  檔（把兩機的 GUI 都指到同一個雲端/同步資料夾即可跨機共用群組）。
+- 變更＝選一個既有的 json 檔（`QFileDialog.getOpenFileName`，兩檔皆同），只改
+  指向、不搬移現有檔；典型用法是指到雲端/同步資料夾裡那份檔案。
 - `suite_config.json` 是 per-machine（gitignored），自訂路徑不會自動同步到另一台，
-  需在該機 GUI 各自設定一次（或指向同一個已同步的資料夾）。
+  需在該機 GUI 各自設定一次（或指向同一個已同步的資料夾）。**注意**：指向的
+  資料夾必須是「雙向同步」空間（Google Drive 我的雲端硬碟串流資料夾、iCloud
+  Drive）；Google Drive「電腦備份」是單機各自鏡像、機器之間不互通，放那裡
+  群組永遠不會跨機同步。
 
 **TradingView 桌面 app 自動化 — 實測結論（3.3.0，勿走回頭路）**：
 

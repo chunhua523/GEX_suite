@@ -18,6 +18,7 @@ from datetime import datetime
 from typing import Callable
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -47,12 +48,16 @@ from .layout_groups import (
     LayoutGroupsState,
     apply_scan_results_to_disk,
     chart_id_from_url,
+    get_configured_list_path,
     get_configured_path,
     layout_groups_path,
+    layout_list_path,
     load_layout_groups,
     new_group_id,
     normalize_chart_url,
-    save_layout_groups,
+    save_groups,
+    save_list,
+    set_configured_list_path,
     set_configured_path,
     subchart_title,
 )
@@ -80,7 +85,7 @@ class _LayoutPickerDialog(QDialog):
             item = QListWidgetItem(layout.display_label())
             item.setData(Qt.UserRole, layout)
             item.setToolTip(layout.url)
-            if group.contains(layout):
+            if group.contains_id(layout.dedup_key()):
                 item.setFlags(item.flags() & ~Qt.ItemIsEnabled & ~Qt.ItemIsSelectable)
                 item.setText(item.text() + "（已在群組）")
             self.list_widget.addItem(item)
@@ -211,9 +216,9 @@ class LayoutGroupsTab(QWidget):
         hint.setStyleSheet("color:#888; font-size:11px;")
         root.addWidget(hint)
 
-        # ----- 設定檔位置 -----
+        # ----- 設定檔位置（群組檔＝手動編輯；清單檔＝掃描快取，路徑各自可自訂） -----
         row_path = QHBoxLayout()
-        row_path.addWidget(QLabel("設定檔："))
+        row_path.addWidget(QLabel("群組檔："))
         self.lbl_path = QLabel()
         self.lbl_path.setStyleSheet("color:#888; font-size:11px;")
         self.lbl_path.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -226,6 +231,20 @@ class LayoutGroupsTab(QWidget):
         row_path.addWidget(self.b_path_reset)
         root.addLayout(row_path)
 
+        row_list_path = QHBoxLayout()
+        row_list_path.addWidget(QLabel("清單檔："))
+        self.lbl_list_path = QLabel()
+        self.lbl_list_path.setStyleSheet("color:#888; font-size:11px;")
+        self.lbl_list_path.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        row_list_path.addWidget(self.lbl_list_path, 1)
+        b_list_path_change = QPushButton("變更…")
+        b_list_path_change.clicked.connect(self._on_change_list_path)
+        row_list_path.addWidget(b_list_path_change)
+        self.b_list_path_reset = QPushButton("還原預設")
+        self.b_list_path_reset.clicked.connect(self._on_reset_list_path)
+        row_list_path.addWidget(self.b_list_path_reset)
+        root.addLayout(row_list_path)
+
         if sys.platform != "darwin":
             for b in (self.b_open_app, self.b_open_all_app):
                 b.setEnabled(False)
@@ -237,7 +256,8 @@ class LayoutGroupsTab(QWidget):
 
     # ---------- 共用 ----------
     def _save(self) -> None:
-        save_layout_groups(self._state)
+        """使用者的群組編輯只寫群組檔——清單檔由掃描／貼上流程維護."""
+        save_groups(self._state)
 
     def _busy(self) -> bool:
         thread = self._busy_thread
@@ -289,11 +309,21 @@ class LayoutGroupsTab(QWidget):
 
     # ---------- 設定檔位置 ----------
     def _refresh_path_label(self) -> None:
-        path = layout_groups_path()
-        custom = get_configured_path() is not None
-        self.lbl_path.setText(f"{path}" + ("（自訂）" if custom else "（預設）"))
-        self.lbl_path.setToolTip(str(path))
-        self.b_path_reset.setEnabled(custom)
+        gpath = layout_groups_path()
+        g_custom = get_configured_path() is not None
+        self.lbl_path.setText(f"{gpath}" + ("（自訂）" if g_custom else "（預設）"))
+        self.lbl_path.setToolTip("群組檔：只有此分頁的手動編輯會寫入。")
+        self.b_path_reset.setEnabled(g_custom)
+
+        lpath = layout_list_path()
+        l_custom = get_configured_list_path() is not None
+        self.lbl_list_path.setText(
+            f"{lpath}" + ("（自訂）" if l_custom else "（預設：群組檔同目錄）")
+        )
+        self.lbl_list_path.setToolTip(
+            "清單檔（掃描快取）：由掃描／批次貼上／每日排程寫入。"
+        )
+        self.b_list_path_reset.setEnabled(l_custom)
 
     def _on_change_path(self) -> None:
         if self._busy():
@@ -310,7 +340,7 @@ class LayoutGroupsTab(QWidget):
         set_configured_path(picked)
         self._reload_state()
         self._refresh_path_label()
-        self._log(f"【版面分組｜設定檔】已指向：{picked}")
+        self._log(f"【版面分組｜群組檔】已指向：{picked}")
 
     def _on_reset_path(self) -> None:
         if self._busy():
@@ -318,7 +348,32 @@ class LayoutGroupsTab(QWidget):
         set_configured_path(None)
         self._reload_state()
         self._refresh_path_label()
-        self._log(f"【版面分組｜設定檔】已還原預設位置：{layout_groups_path()}")
+        self._log(f"【版面分組｜群組檔】已還原預設位置：{layout_groups_path()}")
+
+    def _on_change_list_path(self) -> None:
+        if self._busy():
+            return
+        start_dir = str(layout_list_path().parent)
+        picked, _ = QFileDialog.getOpenFileName(
+            self,
+            "選擇既有的 layout_list.json 檔案（只改指向，不搬移現有資料）",
+            start_dir,
+            "JSON (*.json)",
+        )
+        if not picked:
+            return
+        set_configured_list_path(picked)
+        self._reload_state()
+        self._refresh_path_label()
+        self._log(f"【版面分組｜清單檔】已指向：{picked}")
+
+    def _on_reset_list_path(self) -> None:
+        if self._busy():
+            return
+        set_configured_list_path(None)
+        self._reload_state()
+        self._refresh_path_label()
+        self._log(f"【版面分組｜清單檔】已還原預設位置：{layout_list_path()}")
 
     def showEvent(self, event) -> None:  # noqa: N802 - Qt override
         super().showEvent(event)
@@ -342,7 +397,7 @@ class LayoutGroupsTab(QWidget):
         self.list_groups.blockSignals(True)
         self.list_groups.clear()
         for group in self._state.groups:
-            item = QListWidgetItem(f"{group.name}（{len(group.layouts)}）")
+            item = QListWidgetItem(f"{group.name}（{len(group.layout_ids)}）")
             item.setData(Qt.UserRole, group.group_id)
             self.list_groups.addItem(item)
             if group.group_id == prev:
@@ -357,11 +412,21 @@ class LayoutGroupsTab(QWidget):
         self.list_layouts.clear()
         group = self._current_group()
         if group is not None:
-            for layout in group.layouts:
-                suffix = "〔手動〕" if layout.source == "manual" else ""
-                item = QListWidgetItem(f"{layout.display_label()}{suffix}")
-                item.setData(Qt.UserRole, layout.dedup_key())
-                item.setToolTip(layout.url)
+            for lid in group.layout_ids:
+                resolved = self._state.resolve(lid)
+                if resolved is None:
+                    # 清單檔查不到＝版面已刪除（或尚未掃描）→ 標過期，讓使用者手動移除。
+                    item = QListWidgetItem(f"〔已過期〕{lid}")
+                    item.setForeground(QColor(150, 150, 150))
+                    item.setToolTip(
+                        "此版面 id 已不在掃描清單（可能已於 TradingView 刪除）。\n"
+                        "開啟群組時會略過；請選取後按「移除」。"
+                    )
+                else:
+                    suffix = "〔手動〕" if resolved.source == "manual" else ""
+                    item = QListWidgetItem(f"{resolved.display_label()}{suffix}")
+                    item.setToolTip(resolved.url)
+                item.setData(Qt.UserRole, lid)
                 self.list_layouts.addItem(item)
         self.list_layouts.blockSignals(False)
 
@@ -453,15 +518,9 @@ class LayoutGroupsTab(QWidget):
             return
         added = 0
         for layout in dlg.selected_layouts():
-            if not group.contains(layout):
-                group.layouts.append(
-                    GroupLayout(
-                        name=layout.name,
-                        url=layout.url,
-                        layout_id=layout.layout_id,
-                        source=layout.source,
-                    )
-                )
+            lid = layout.dedup_key()
+            if not group.contains_id(lid):
+                group.layout_ids.append(lid)
                 added += 1
         if added:
             self._save()
@@ -486,37 +545,38 @@ class LayoutGroupsTab(QWidget):
                 "格式：https://www.tradingview.com/chart/<id>/ 或直接貼 chart id。",
             )
             return
-        layout = GroupLayout(
-            name=f"URL:{chart_id_from_url(url)}",
-            url=url,
-            layout_id=chart_id_from_url(url),
-            source="manual",
-        )
-        if group.contains(layout):
+        lid = chart_id_from_url(url) or ""
+        if group.contains_id(lid):
             QMessageBox.information(self, "重複", "這個版面已在群組內。")
             return
-        group.layouts.append(layout)
+        if self._state.resolve(lid) is None:
+            # 清單檔沒有這個 id → 補一筆 manual 項目，群組顯示才解析得到。
+            self._state.scanned_layouts.append(
+                GroupLayout(name=f"URL:{lid}", url=url, layout_id=lid, source="manual")
+            )
+            save_list(self._state)
+        group.layout_ids.append(lid)
         self._save()
         self._refresh_groups_list(select_group_id=group.group_id)
 
     def _on_remove_layout(self) -> None:
         group = self._current_group()
         row = self.list_layouts.currentRow()
-        if group is None or not 0 <= row < len(group.layouts):
+        if group is None or not 0 <= row < len(group.layout_ids):
             return
-        group.layouts.pop(row)
+        group.layout_ids.pop(row)
         self._save()
         self._refresh_groups_list(select_group_id=group.group_id)
 
     def _move_layout(self, delta: int) -> None:
         group = self._current_group()
         row = self.list_layouts.currentRow()
-        if group is None or not 0 <= row < len(group.layouts):
+        if group is None or not 0 <= row < len(group.layout_ids):
             return
         new_row = row + delta
-        if not 0 <= new_row < len(group.layouts):
+        if not 0 <= new_row < len(group.layout_ids):
             return
-        group.layouts.insert(new_row, group.layouts.pop(row))
+        group.layout_ids.insert(new_row, group.layout_ids.pop(row))
         self._save()
         self._refresh_layouts_list()
         self.list_layouts.setCurrentRow(new_row)
@@ -529,8 +589,8 @@ class LayoutGroupsTab(QWidget):
             str(self.list_layouts.item(i).data(Qt.UserRole))
             for i in range(self.list_layouts.count())
         ]
-        by_key = {l.dedup_key(): l for l in group.layouts}
-        group.layouts = [by_key[key] for key in order if key in by_key]
+        known = set(group.layout_ids)
+        group.layout_ids = [lid for lid in order if lid in known]
         self._save()
 
     # ---------- 掃描（走訪每個版面，讀子圖標題） ----------
@@ -651,8 +711,11 @@ class LayoutGroupsTab(QWidget):
             f"【版面分組｜掃描】{'完成' if full else '中止（已保留部分結果）'}："
             f"{len(results)} 個版面已更新"
         )
-        if summary["pruned"]:
-            msg += f"\n  已自群組移除 {summary['pruned']} 個已刪除的版面"
+        if summary["expired"]:
+            msg += (
+                f"\n  {summary['expired']} 個群組項目已過期（版面已不存在），"
+                "請至群組清單手動移除"
+            )
         if skipped:
             msg += f"\n  {skipped} 個無 URL 已略過"
         self._log(msg)
@@ -679,7 +742,23 @@ class LayoutGroupsTab(QWidget):
                 QMessageBox.information(self, "未選群組", "請先選取一個群組。")
                 return []
             selected = [group]
-        result = [(g.name, [l.url for l in g.layouts]) for g in selected if g.layouts]
+        result: list[tuple[str, list[str]]] = []
+        for g in selected:
+            urls: list[str] = []
+            expired = 0
+            for lid in g.layout_ids:
+                resolved = self._state.resolve(lid)
+                if resolved is None:
+                    expired += 1
+                else:
+                    urls.append(resolved.url)
+            if expired:
+                self._log(
+                    f"【版面分組｜開啟】群組「{g.name}」略過 {expired} 個已過期版面"
+                    "（請至群組清單手動移除）"
+                )
+            if urls:
+                result.append((g.name, urls))
         if not result:
             QMessageBox.information(self, "沒有版面", "群組內沒有版面可開啟。")
         return result

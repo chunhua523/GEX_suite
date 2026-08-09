@@ -15,8 +15,10 @@ from .paths import SUITE_CONFIG_PATH, TRADINGVIEW_AUTO_PASTE_CONFIG_PATH, ensure
 _DEFAULT: dict[str, Any] = {
     "theme": "dark",
     "default_download_folder": None,
-    # 版面分組資料檔（layout_groups.json）自訂位置；None＝用預設 data 目錄。
+    # 版面分組群組檔（layout_groups.json）自訂位置；None＝用預設 data 目錄。
     "layout_groups_path": None,
+    # 版面清單檔（layout_list.json，掃描快取）自訂位置；None＝群組檔同目錄。
+    "layout_list_path": None,
     # Optional: 主視窗「說明 → 檢查更新」會讀取 Raw 上的 pyproject.toml 與本機 gex_suite.__version__ 比對
     "update_github_user": "",
     "update_github_repo": "",

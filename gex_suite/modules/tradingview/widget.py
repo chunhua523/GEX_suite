@@ -3519,10 +3519,11 @@ class TradingViewPage(QWidget):
         cache_entries: dict[str, dict],
         stop_all: bool,
     ) -> None:
-        """掃圖流程收尾：把看到的版面（含子圖標題）同步進版面分組快取.
+        """掃圖流程收尾：把看到的版面（含子圖標題）同步進版面清單檔.
 
-        scope=all 且完整跑完 → full 同步（快取整批替換；群組內 scan 來源的
-        已刪版面一併移除）。中止／局部 scope／版面清單降級 → 只 upsert 不刪。
+        scope=all 且完整跑完 → full 同步（清單整批替換，手動新增項目保留）。
+        中止／局部 scope／版面清單降級 → 只 upsert 不刪。只寫清單檔，
+        不動使用者的群組檔——群組內解析不到的 id 由 UI 顯示「已過期」。
         """
         try:
             results = [
@@ -3549,8 +3550,11 @@ class TradingViewPage(QWidget):
                 f"【版面分組｜同步】版面快取已更新（{'全量' if full else '局部'}）："
                 f"{summary['cache']} 個版面"
             )
-            if summary["pruned"]:
-                msg += f"\n  已自群組移除 {summary['pruned']} 個已刪除的版面"
+            if summary["expired"]:
+                msg += (
+                    f"\n  {summary['expired']} 個群組項目已過期（版面已不存在），"
+                    "請至版面分組手動移除"
+                )
             self._exec_log(msg)
         except Exception as exc:
             self._exec_log(f"【版面分組｜同步】快取更新失敗：{exc}")

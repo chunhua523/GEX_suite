@@ -1,12 +1,19 @@
 """版面分組 model + persistence（無 Qt，可 headless 單元測試）.
 
-Data lives in ``gex_suite/data/tradingview/layout_groups.json``:
+資料拆成兩個檔案（同一目錄；放同步資料夾時把衝突面降到最小）：
 
-- ``groups``: user-defined ordered groups; each group's ``layouts`` order is the
-  tab order when the group is opened. Entries are copies, so one layout may
-  belong to multiple groups and a re-scan never breaks group membership.
-- ``scanned_layouts``: cache of the last CDP ``list_layouts()`` scan.
-- ``settings``: app-launch delivery method + delays (merged over defaults).
+- 群組檔 ``layout_groups.json``（位置可自訂）：``settings`` ＋ ``groups``。
+  群組只存版面 id（``layout_ids``）；**只有使用者在分組頁的編輯會寫入**，
+  掃描／貼上／每日排程永遠不碰，避免機器寫入和手動編輯在雲端同步時互蓋。
+- 清單檔 ``layout_list.json``（固定在群組檔同目錄）：掃描快取
+  ``scanned_layouts``（名稱、URL、子圖標題）。**只有掃描／貼上流程寫入**；
+  同步衝突無所謂——下次掃描就會覆蓋。
+
+顯示時群組內的 id 從清單檔解析；解析不到＝版面已不存在（或尚未掃描），
+UI 標示「已過期」、開啟群組時略過，由使用者手動移除——不再自動 prune 群組。
+
+舊版單檔格式（groups 內嵌 layouts ＋ scanned_layouts 同檔）在 load 時自動
+一次性遷移拆檔。
 """
 from __future__ import annotations
 
@@ -20,49 +27,89 @@ from typing import Any
 from gex_suite.shared.paths import TRADINGVIEW_LAYOUT_GROUPS_PATH, ensure_dirs
 
 _CHART_ID_RE = re.compile(r"/chart/([A-Za-z0-9_-]{4,})")
+_ID_ONLY_RE = re.compile(r"[A-Za-z0-9_-]{4,}")
 
-# suite_config.json 內存放自訂路徑的鍵；空/None → 用預設 TRADINGVIEW_LAYOUT_GROUPS_PATH。
+# 清單檔預設檔名（未自訂路徑時放群組檔同目錄）。
+_LIST_FILENAME = "layout_list.json"
+
+# suite_config.json 內存放自訂路徑的鍵；空/None → 用預設。
 _CONFIG_PATH_KEY = "layout_groups_path"
+_LIST_CONFIG_PATH_KEY = "layout_list_path"
 # 測試/驗證用的行程內覆寫（優先於 config）；正式流程不設。
 _PATH_OVERRIDE: Path | None = None
+_LIST_PATH_OVERRIDE: Path | None = None
 
 
 def set_path_override(path: str | Path | None) -> None:
-    """行程內強制指定資料檔位置（主要給測試用；設 None 還原為 config/預設）."""
+    """行程內強制指定群組檔位置（主要給測試用；設 None 還原為 config/預設）."""
     global _PATH_OVERRIDE
     _PATH_OVERRIDE = Path(path).expanduser() if path else None
 
 
-def get_configured_path() -> str | None:
-    """讀 suite_config.json 內的自訂路徑（未設回 None）."""
+def set_list_path_override(path: str | Path | None) -> None:
+    """行程內強制指定清單檔位置（主要給測試用；設 None 還原為 config/預設）."""
+    global _LIST_PATH_OVERRIDE
+    _LIST_PATH_OVERRIDE = Path(path).expanduser() if path else None
+
+
+def _get_configured(key: str) -> str | None:
     try:
         from gex_suite.shared import config as _shared_config
 
-        raw = _shared_config.load_config().get(_CONFIG_PATH_KEY)
+        raw = _shared_config.load_config().get(key)
     except Exception:
         return None
     raw = str(raw or "").strip()
     return raw or None
 
 
-def set_configured_path(path: str | Path | None) -> None:
-    """把自訂路徑寫進 suite_config.json（GUI 與每日排程共讀；None/空＝還原預設）."""
+def _set_configured(key: str, path: str | Path | None) -> None:
     from gex_suite.shared import config as _shared_config
 
     cfg = _shared_config.load_config()
     resolved = str(Path(path).expanduser()) if str(path or "").strip() else None
-    cfg[_CONFIG_PATH_KEY] = resolved
+    cfg[key] = resolved
     _shared_config.save_config(cfg)
 
 
+def get_configured_path() -> str | None:
+    """讀 suite_config.json 內的群組檔自訂路徑（未設回 None）."""
+    return _get_configured(_CONFIG_PATH_KEY)
+
+
+def set_configured_path(path: str | Path | None) -> None:
+    """把群組檔自訂路徑寫進 suite_config.json（GUI 與每日排程共讀；None/空＝還原預設）."""
+    _set_configured(_CONFIG_PATH_KEY, path)
+
+
+def get_configured_list_path() -> str | None:
+    """讀 suite_config.json 內的清單檔自訂路徑（未設回 None）."""
+    return _get_configured(_LIST_CONFIG_PATH_KEY)
+
+
+def set_configured_list_path(path: str | Path | None) -> None:
+    """把清單檔自訂路徑寫進 suite_config.json（None/空＝還原「群組檔同目錄」預設）."""
+    _set_configured(_LIST_CONFIG_PATH_KEY, path)
+
+
 def layout_groups_path() -> Path:
-    """目前生效的資料檔位置：行程覆寫 > config 自訂 > 內建預設."""
+    """群組檔位置：行程覆寫 > config 自訂 > 內建預設."""
     if _PATH_OVERRIDE is not None:
         return _PATH_OVERRIDE
     configured = get_configured_path()
     if configured:
         return Path(configured).expanduser()
     return TRADINGVIEW_LAYOUT_GROUPS_PATH
+
+
+def layout_list_path() -> Path:
+    """清單檔位置：行程覆寫 > config 自訂 > 預設（群組檔同目錄 ``layout_list.json``）."""
+    if _LIST_PATH_OVERRIDE is not None:
+        return _LIST_PATH_OVERRIDE
+    configured = get_configured_list_path()
+    if configured:
+        return Path(configured).expanduser()
+    return layout_groups_path().with_name(_LIST_FILENAME)
 
 _DEFAULT_SETTINGS: dict[str, Any] = {
     # App 模式走 CDP：TradingView 以 --remote-debugging-port=<app_cdp_port> 啟動，
@@ -77,6 +124,8 @@ _DEFAULT_SETTINGS: dict[str, Any] = {
 
 @dataclass
 class GroupLayout:
+    """清單檔內的一個版面（掃描快取或手動新增）."""
+
     name: str
     url: str  # canonical https://www.tradingview.com/chart/<id>/
     layout_id: str | None = None
@@ -131,33 +180,21 @@ class GroupLayout:
 
 @dataclass
 class LayoutGroup:
+    """使用者定義的群組——只存版面 id，其餘資訊顯示時從清單檔解析."""
+
     group_id: str
     name: str
-    layouts: list[GroupLayout] = field(default_factory=list)
+    layout_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.group_id,
             "name": self.name,
-            "layouts": [l.to_dict() for l in self.layouts],
+            "layout_ids": list(self.layout_ids),
         }
 
-    @staticmethod
-    def from_dict(data: dict[str, Any]) -> "LayoutGroup":
-        layouts = [
-            gl
-            for raw in (data.get("layouts") or [])
-            if isinstance(raw, dict) and (gl := GroupLayout.from_dict(raw)) is not None
-        ]
-        return LayoutGroup(
-            group_id=str(data.get("id") or new_group_id()),
-            name=str(data.get("name") or "").strip() or "未命名群組",
-            layouts=layouts,
-        )
-
-    def contains(self, layout: GroupLayout) -> bool:
-        key = layout.dedup_key()
-        return any(l.dedup_key() == key for l in self.layouts)
+    def contains_id(self, layout_id: str | None) -> bool:
+        return bool(layout_id) and layout_id in self.layout_ids
 
 
 @dataclass
@@ -167,19 +204,21 @@ class LayoutGroupsState:
     scanned_at: str | None = None
     settings: dict[str, Any] = field(default_factory=lambda: dict(_DEFAULT_SETTINGS))
 
-    def to_dict(self) -> dict[str, Any]:
-        merged = dict(_DEFAULT_SETTINGS)
-        merged.update(self.settings or {})
-        return {
-            "version": 1,
-            "settings": merged,
-            "scanned_at": self.scanned_at,
-            "scanned_layouts": [l.to_dict() for l in self.scanned_layouts],
-            "groups": [g.to_dict() for g in self.groups],
-        }
-
     def group_by_id(self, group_id: str) -> LayoutGroup | None:
         return next((g for g in self.groups if g.group_id == group_id), None)
+
+    def list_by_id(self) -> dict[str, GroupLayout]:
+        return {l.dedup_key(): l for l in self.scanned_layouts}
+
+    def resolve(self, layout_id: str) -> GroupLayout | None:
+        """由版面 id 解析清單檔項目；None＝已過期（版面不存在或尚未掃描）."""
+        return next(
+            (l for l in self.scanned_layouts if l.dedup_key() == layout_id), None
+        )
+
+    def count_expired(self) -> int:
+        known = set(self.list_by_id())
+        return sum(1 for g in self.groups for lid in g.layout_ids if lid not in known)
 
 
 def new_group_id() -> str:
@@ -204,6 +243,10 @@ def subchart_title(raw: str) -> str:
 def chart_id_from_url(url: str) -> str | None:
     m = _CHART_ID_RE.search(url or "")
     return m.group(1) if m else None
+
+
+def chart_url_for_id(layout_id: str) -> str:
+    return f"https://www.tradingview.com/chart/{layout_id}/"
 
 
 def normalize_chart_url(raw: str) -> str | None:
@@ -237,20 +280,22 @@ def apply_scan_results(
     full: bool,
     scanned_at: str | None = None,
 ) -> dict[str, int]:
-    """把一次掃描/貼上流程看到的版面同步進快取與群組.
+    """把一次掃描/貼上流程看到的版面同步進清單快取（**不動群組**）.
 
     ``results``：本次實際看到的版面（``source="scan"``；沒讀到子圖的項目
     ``subcharts`` 留空，會沿用快取裡的舊值）。
 
     ``full=True``（全版面掃描，例如分組頁掃描、scope=all 的 auto-paste）：
-    快取整批換成 ``results``，且群組內 ``source=="scan"`` 而版面已不存在的
-    項目會被移除（``source=="manual"`` 一律保留）。
+    快取整批換成 ``results``；``source=="manual"`` 且本次沒看到的項目保留
+    （手動新增的 URL 不因掃描而消失）。
 
     ``full=False``（scope=urls/ticker 等局部執行）：只 upsert 看到的版面，
     不刪任何東西。
 
-    Returns counts: ``{"cache": …, "group_updates": …, "pruned": …}``.
-    Caller 自行 ``save_layout_groups``.
+    群組一律不修改——id 解析不到的項目由 UI 顯示「已過期」讓使用者手動移除。
+
+    Returns counts: ``{"cache": …, "expired": …}``（expired＝群組內解析不到
+    的 id 總數）。Caller 自行 ``save_list``.
     """
     old_by_key = {l.dedup_key(): l for l in state.scanned_layouts}
     # 沒讀到子圖（load 失敗、局部掃描）→ 沿用舊快取的子圖清單。
@@ -261,7 +306,13 @@ def apply_scan_results(
                 item.subcharts = list(old.subcharts)
 
     if full:
-        state.scanned_layouts = list(results)
+        seen = {l.dedup_key() for l in results}
+        kept_manual = [
+            l
+            for l in state.scanned_layouts
+            if l.source == "manual" and l.dedup_key() not in seen
+        ]
+        state.scanned_layouts = list(results) + kept_manual
         state.scanned_at = scanned_at
     else:
         merged = {l.dedup_key(): l for l in state.scanned_layouts}
@@ -269,77 +320,134 @@ def apply_scan_results(
             merged[item.dedup_key()] = item
         state.scanned_layouts = list(merged.values())
 
-    new_by_key = {l.dedup_key(): l for l in results}
-    group_updates = 0
-    pruned = 0
-    for group in state.groups:
-        kept: list[GroupLayout] = []
-        for layout in group.layouts:
-            fresh = new_by_key.get(layout.dedup_key())
-            if fresh is not None:
-                if (fresh.name != layout.name and fresh.name) or (
-                    fresh.subcharts != layout.subcharts and fresh.subcharts
-                ):
-                    group_updates += 1
-                if fresh.name:
-                    layout.name = fresh.name
-                if fresh.subcharts:
-                    layout.subcharts = list(fresh.subcharts)
-                kept.append(layout)
-            elif full and layout.source == "scan":
-                pruned += 1  # 版面已從 TradingView 刪除 → 移出群組
-            else:
-                kept.append(layout)
-        group.layouts = kept
-    return {"cache": len(state.scanned_layouts), "group_updates": group_updates, "pruned": pruned}
+    return {"cache": len(state.scanned_layouts), "expired": state.count_expired()}
 
 
 def apply_scan_results_to_disk(
     results: list[GroupLayout], *, full: bool, scanned_at: str | None = None
 ) -> dict[str, int]:
-    """讀最新盤面 → 套用掃描結果 → 寫回（供 paste 流程／每日 CLI 收尾呼叫）."""
+    """讀最新盤面 → 套用掃描結果 → **只寫清單檔**（供 paste 流程／每日 CLI 收尾呼叫）."""
     state = load_layout_groups()
     summary = apply_scan_results(state, results, full=full, scanned_at=scanned_at)
-    save_layout_groups(state)
+    save_list(state)
     return summary
 
 
+def _parse_list_entries(raw_list: Any) -> list[GroupLayout]:
+    return [
+        gl
+        for raw in (raw_list or [])
+        if isinstance(raw, dict) and (gl := GroupLayout.from_dict(raw)) is not None
+    ]
+
+
 def load_layout_groups() -> LayoutGroupsState:
+    """讀群組檔＋清單檔合成 state；偵測到舊版單檔格式時自動遷移拆檔."""
     ensure_dirs()
-    path = layout_groups_path()
-    if not path.exists():
-        return LayoutGroupsState()
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        settings = dict(_DEFAULT_SETTINGS)
-        raw_settings = data.get("settings")
-        if isinstance(raw_settings, dict):
-            settings.update(raw_settings)
-        scanned = [
-            gl
-            for raw in (data.get("scanned_layouts") or [])
-            if isinstance(raw, dict) and (gl := GroupLayout.from_dict(raw)) is not None
-        ]
-        groups = [
-            LayoutGroup.from_dict(raw)
-            for raw in (data.get("groups") or [])
-            if isinstance(raw, dict)
-        ]
-        scanned_at = data.get("scanned_at")
-        return LayoutGroupsState(
-            groups=groups,
-            scanned_layouts=scanned,
-            scanned_at=str(scanned_at) if scanned_at else None,
-            settings=settings,
-        )
-    except Exception:
-        return LayoutGroupsState()
+    state = LayoutGroupsState()
+    legacy = False
+    legacy_entries: list[GroupLayout] = []  # 舊格式內嵌的版面資訊 → 併入清單檔
+    legacy_scanned_at: str | None = None
+
+    gpath = layout_groups_path()
+    if gpath.exists():
+        try:
+            with gpath.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = None
+        if isinstance(data, dict):
+            raw_settings = data.get("settings")
+            if isinstance(raw_settings, dict):
+                state.settings.update(raw_settings)
+            for raw in data.get("groups") or []:
+                if not isinstance(raw, dict):
+                    continue
+                if isinstance(raw.get("layout_ids"), list):
+                    ids = [
+                        str(x).strip()
+                        for x in raw["layout_ids"]
+                        if _ID_ONLY_RE.fullmatch(str(x).strip())
+                    ]
+                else:  # 舊格式：groups 內嵌完整 layouts
+                    legacy = True
+                    entries = _parse_list_entries(raw.get("layouts"))
+                    legacy_entries.extend(entries)
+                    ids = [e.dedup_key() for e in entries]
+                state.groups.append(
+                    LayoutGroup(
+                        group_id=str(raw.get("id") or new_group_id()),
+                        name=str(raw.get("name") or "").strip() or "未命名群組",
+                        layout_ids=ids,
+                    )
+                )
+            if "scanned_layouts" in data:  # 舊格式：快取與群組同檔
+                legacy = True
+                legacy_entries.extend(_parse_list_entries(data.get("scanned_layouts")))
+                if data.get("scanned_at"):
+                    legacy_scanned_at = str(data["scanned_at"])
+
+    lpath = layout_list_path()
+    if lpath.exists():
+        try:
+            with lpath.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = None
+        if isinstance(data, dict):
+            state.scanned_layouts = _parse_list_entries(data.get("layouts"))
+            if data.get("scanned_at"):
+                state.scanned_at = str(data["scanned_at"])
+
+    if legacy:
+        # 清單檔（較新、機器維護）優先；舊檔內容只補缺的 id。
+        by_key = {l.dedup_key(): l for l in state.scanned_layouts}
+        for entry in legacy_entries:
+            if entry.dedup_key() not in by_key:
+                by_key[entry.dedup_key()] = entry
+                state.scanned_layouts.append(entry)
+        if not state.scanned_at:
+            state.scanned_at = legacy_scanned_at
+        try:  # 一次性遷移：拆檔寫回（失敗不影響本次讀取）
+            save_groups(state)
+            save_list(state)
+        except Exception:
+            pass
+
+    return state
 
 
-def save_layout_groups(state: LayoutGroupsState) -> None:
+def save_groups(state: LayoutGroupsState) -> None:
+    """寫群組檔（settings ＋ groups）——只在使用者編輯群組時呼叫."""
     ensure_dirs()
     path = layout_groups_path()
     path.parent.mkdir(parents=True, exist_ok=True)  # 自訂路徑的父目錄可能還不存在
+    merged = dict(_DEFAULT_SETTINGS)
+    merged.update(state.settings or {})
+    payload = {
+        "version": 2,
+        "settings": merged,
+        "groups": [g.to_dict() for g in state.groups],
+    }
     with path.open("w", encoding="utf-8") as f:
-        json.dump(state.to_dict(), f, indent=2, ensure_ascii=False)
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+
+def save_list(state: LayoutGroupsState) -> None:
+    """寫清單檔（掃描快取）——掃描／貼上流程與手動新增 URL 時呼叫."""
+    ensure_dirs()
+    path = layout_list_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "scanned_at": state.scanned_at,
+        "layouts": [l.to_dict() for l in state.scanned_layouts],
+    }
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+
+def save_layout_groups(state: LayoutGroupsState) -> None:
+    """同時寫兩檔（遷移／測試用；一般流程請分別用 save_groups / save_list）."""
+    save_groups(state)
+    save_list(state)
