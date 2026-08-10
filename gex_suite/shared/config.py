@@ -50,6 +50,10 @@ _TRADINGVIEW_DEFAULT: dict[str, Any] = {
         "NK2251!":  {"timezone": "Asia/Seoul", "day_offset": -1, "time": "17:00"},
         "KOSPI200": {"timezone": "Asia/Seoul", "day_offset": 0,  "time": "09:00"},
         "TXO":      {"timezone": "Asia/Taipei", "day_offset": 0, "time": "09:00"},
+        # CBOT 穀物 globex 週日 19:00 CT 開盤＝週日 20:00 NY（非 18:00）。
+        "ZW1!":     {"timezone": "America/New_York", "day_offset": -1, "time": "20:00"},
+        "ZC1!":     {"timezone": "America/New_York", "day_offset": -1, "time": "20:00"},
+        "ZS1!":     {"timezone": "America/New_York", "day_offset": -1, "time": "20:00"},
     },
 }
 

@@ -67,6 +67,19 @@ class TradingViewTzStartRulesTests(unittest.TestCase):
             (dt.date(2026, 1, 11), "19:00"),
         )
 
+    def test_cbot_grains_sunday_2000_ny(self) -> None:
+        # 穀物（ZW/ZC/ZS）globex 週日 19:00 CT 開盤＝週日 20:00 NY；
+        # 規則以 NY 時間定義 → 換算恆等，冬夏令皆同。
+        for ticker in ("ZW1!", "ZC1!", "ZS1!"):
+            self.assertEqual(
+                config.get_tradingview_tz_start(ticker, dt.date(2026, 7, 13)),
+                (dt.date(2026, 7, 12), "20:00"),
+            )
+            self.assertEqual(
+                config.get_tradingview_tz_start(ticker, dt.date(2026, 1, 12)),
+                (dt.date(2026, 1, 11), "20:00"),
+            )
+
     def test_unlisted_ticker_returns_none(self) -> None:
         self.assertIsNone(config.get_tradingview_tz_start("ES1!", dt.date(2026, 7, 13)))
         self.assertIsNone(config.get_tradingview_tz_start("", dt.date(2026, 7, 13)))

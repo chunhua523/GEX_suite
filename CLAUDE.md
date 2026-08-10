@@ -59,7 +59,7 @@ When `is_futures_alias=True` is returned (any of the three modes that hit the al
 
 DB lookup still uses `item.monday` (the trading week's Monday). Only the TV-side write-and-verify uses the shifted `indicator_date`.
 
-**Start (date, time) resolution is centralized in `_resolve_indicator_start`** (widget.py) — both computation sites (`_apply_work_item_with_automator` and the cache/verify path in `_phase_b_scan_flow`) go through it; don't reintroduce inline date math. Priority: (1) `start_time_tz_rules` in `auto_paste_config.json` (`shared/config.get_tradingview_tz_start`) — start defined in the instrument's **local timezone** and converted to America/New_York, e.g. NK2251! = Sunday 17:00 Asia/Seoul, KOSPI200 = Monday 09:00 Asia/Seoul, TXO = Monday 09:00 Asia/Taipei (dates can roll back to Sunday; DST-aware); (2) futures alias → Sunday 18:00; (3) `start_time_rules` per-ticker HH:MM on Monday.
+**Start (date, time) resolution is centralized in `_resolve_indicator_start`** (widget.py) — both computation sites (`_apply_work_item_with_automator` and the cache/verify path in `_phase_b_scan_flow`) go through it; don't reintroduce inline date math. Priority: (1) `start_time_tz_rules` in `auto_paste_config.json` (`shared/config.get_tradingview_tz_start`) — start defined in the instrument's **local timezone** and converted to America/New_York, e.g. NK2251! = Sunday 17:00 Asia/Seoul, KOSPI200 = Monday 09:00 Asia/Seoul, TXO = Monday 09:00 Asia/Taipei, CBOT 穀物 ZW1!/ZC1!/ZS1! = Sunday 20:00 America/New_York (dates can roll back to Sunday; DST-aware); (2) futures alias → Sunday 18:00; (3) `start_time_rules` per-ticker HH:MM on Monday.
 
 ### Per-layout dedup uses `(symbol, mode)` tuple
 
