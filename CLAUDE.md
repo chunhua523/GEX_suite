@@ -251,6 +251,7 @@ CLI 探測（不開 GUI）：`python -m gex_suite.modules.tradingview.app_launch
 - Don't add Chinese layout markers (the design is English-only now).
 - Don't migrate existing DB rows when changing the importer suffix logic — only new imports get the `1!` suffix; legacy rows stay as-is. (唯一例外：2026-07-29 Jeff 指名把 `TXO1!` 裸名化為 `TXO`，450 rows 已同步 UPDATE。)
 - Don't add a `merge equity into futures` fallback — the user wants strict separation between modes so they can compare side-by-side.
+- Don't reintroduce substring rules into `_symbols_compatible` / `_symbol_matches_ticker` — `"SOX" in "SOXX"` made the subchart drift guard pass on the wrong pane and SOXX data was pasted onto the SOX chart daily (2026-08-12). Tail-equality (`NASDAQ:SOXX` ≡ `SOXX`) is the only allowed loosening.
 
 ## Testing
 

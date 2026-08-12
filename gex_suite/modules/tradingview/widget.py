@@ -1740,9 +1740,15 @@ class TradingViewPage(QWidget):
         *,
         subchart_index: int,
         expected_symbol: str,
-        retries: int = 3,
+        retries: int = 5,
     ) -> bool:
-        """Ensure active subchart remains the intended one before editing."""
+        """Ensure active subchart remains the intended one before editing.
+
+        Comparison is strict (``_symbols_compatible`` = tail equality), so a
+        late-landing activation click needs enough retries to register before
+        we declare drift — hence 5 (~4s worst case; healthy panes pass on the
+        first attempt).
+        """
         expected = (expected_symbol or "").strip()
         for attempt in range(retries + 1):
             await automator.activate_subchart(subchart_index)
@@ -1764,11 +1770,11 @@ class TradingViewPage(QWidget):
             return False
         if exp == act:
             return True
-        if exp in act or act in exp:
-            return True
-        exp_tail = exp.split(":")[-1]
-        act_tail = act.split(":")[-1]
-        return exp_tail == act_tail or exp_tail in act_tail or act_tail in exp_tail
+        # Exchange-prefix-insensitive equality ONLY ("NASDAQ:SOXX" ≡ "SOXX").
+        # Substring matching is forbidden here: "SOX" ⊂ "SOXX" made this drift
+        # guard pass while the active pane was a *different* instrument, and
+        # SOXX data was silently pasted onto the SOX chart (2026-08-12).
+        return exp.split(":")[-1].strip() == act.split(":")[-1].strip()
 
     async def _apply_work_item_with_retry(
         self,
@@ -3698,9 +3704,12 @@ class TradingViewPage(QWidget):
         if not token:
             return False
         text = symbol.upper()
-        if token in text:
+        if token == text.split(":")[-1].strip():
             return True
-        if re.search(rf"\b{re.escape(token)}\b", text):
+        # Standalone-token match only — a ticker must not match as a prefix of
+        # a longer one (SOX must not hit SOXX). ``\b`` breaks on tokens ending
+        # in "!" (ES1!), so bound with alphanumeric lookarounds instead.
+        if re.search(rf"(?<![A-Z0-9]){re.escape(token)}(?![A-Z0-9])", text):
             return True
 
         # Alias fallback for common index naming differences.

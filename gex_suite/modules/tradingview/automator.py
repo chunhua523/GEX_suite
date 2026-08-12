@@ -1615,39 +1615,69 @@ class PlaywrightCDPAutomator(TVAutomator):
         except Exception:
             pass
 
-    async def _reread_symbol_settled(
-        self, idx: int, *, fallback: str | None, tries: int = 4, delay_ms: int = 160
+    async def _read_symbol_change_aware(
+        self,
+        baseline: str | None,
+        *,
+        max_wait_ms: int = 2600,
+        interval_ms: int = 160,
     ) -> str | None:
-        """Re-activate pane ``idx`` and read its symbol once the header settles.
+        """Read the header symbol after a pane activation, tolerating the
+        activation click landing late.
 
-        Used only to disambiguate a *suspicious duplicate* — a pane that read the
-        same symbol as an earlier pane, which may be a stale header read (the
-        active-chart switch hadn't propagated yet). Re-activates to force the
-        switch, then waits for two consecutive equal reads. A genuine duplicate
-        (e.g. two panes really showing the same symbol) settles back to the same
-        value; a stale one corrects to the pane's true symbol.
+        The global header is the only clean per-pane symbol source, but it only
+        reflects the *active* chart — and the synthetic activation click can
+        take >1s to register right after a layout switch. Reading too early
+        returns ``baseline`` (the pre-activation symbol) and attributes the
+        previous pane's symbol to this one (2026-08-12: a SOX+SOXX layout
+        enumerated swapped every run, pasting SOXX data onto the SOX chart).
+        Poll until the header settles on a value *different from* ``baseline``
+        (two consecutive equal reads); once the wait budget runs out, accept
+        the current value — the pane genuinely shows ``baseline`` (duplicate
+        pane / activation had already landed before the first read).
         """
         page = self._require_page()
-        await self.activate_subchart(idx)
         last: str | None = None
-        for _ in range(max(2, tries)):
-            await page.wait_for_timeout(delay_ms)
+        waited = 0
+        while True:
             cur = await self.get_symbol_search_value()
-            if cur and cur == last:
+            if cur and cur != baseline and cur == last:
                 return cur
             last = cur
-        return last or fallback
+            if waited >= max_wait_ms:
+                return cur or baseline
+            await page.wait_for_timeout(interval_ms)
+            waited += interval_ms
+
+    async def _reread_symbol_settled(self, idx: int, *, fallback: str | None) -> str | None:
+        """Re-activate pane ``idx`` and re-read its symbol change-aware.
+
+        Used to disambiguate a *suspicious duplicate* — a pane that read the
+        same symbol as an earlier pane, which may be a stale header read (the
+        active-chart switch hadn't propagated yet). A genuine duplicate settles
+        back to ``fallback`` unchanged; a stale one corrects to the pane's true
+        symbol once the re-activation lands.
+        """
+        await self.activate_subchart(idx)
+        return await self._read_symbol_change_aware(fallback)
 
     async def _enumerate_subcharts_once(self, widget_count: int) -> list[SubChartInfo]:
         out: list[SubChartInfo] = []
         seen: set[str] = set()
         for idx in range(widget_count):
+            # Baseline = header value *before* this activation. On multi-pane
+            # layouts the post-activation read must move away from it (or time
+            # out) before we trust it — otherwise a late-landing click makes us
+            # record the previous pane's symbol for this pane.
+            baseline = await self.get_symbol_search_value() if widget_count > 1 else None
             await self.activate_subchart(idx)
-            sym = await self.get_symbol_search_value()
-            # A symbol already seen on an earlier pane is suspicious: it can be a
-            # stale header read from before the active-chart switch landed. Only
-            # then do we pay for a settle re-read; distinct reads stay on the
-            # fast path. Genuine duplicates survive the re-read unchanged.
+            if widget_count > 1:
+                sym = await self._read_symbol_change_aware(baseline)
+            else:
+                sym = await self.get_symbol_search_value()
+            # A symbol already seen on an earlier pane is still suspicious
+            # (e.g. the baseline itself was stale). Pay for a settle re-read;
+            # genuine duplicates survive it unchanged.
             if sym and sym in seen:
                 sym = await self._reread_symbol_settled(idx, fallback=sym)
             if sym:
