@@ -68,6 +68,12 @@ class RetryResponse(BaseModel):
     failed_count: int
 
 
+class ReloginResponse(BaseModel):
+    success: bool
+    message: str
+    login_status: LoginStatus
+
+
 class ChainStepStatus(BaseModel):
     name: str
     status: str  # OK | WARN | FAIL | SKIP | PENDING

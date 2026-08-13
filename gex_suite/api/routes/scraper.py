@@ -38,6 +38,7 @@ from gex_suite.shared.paths import (
 from ..models import (
     CancelResponse,
     LoginStatus,
+    ReloginResponse,
     RetryResponse,
     ScheduleModeRequest,
     ScheduleModeResponse,
@@ -227,7 +228,7 @@ def _format_result_text(result: Dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 _LOGIN_CHECK_SCRIPT = r"""
-import asyncio, json, os, sys
+import asyncio, fcntl, json, os, shutil, sys
 from playwright.async_api import async_playwright
 
 BASE_URL = "https://www.lietaresearch.com/platform"
@@ -236,6 +237,16 @@ BRAVE_PATH = "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
 async def main():
     state_path = sys.argv[1]
     browser_pref = (sys.argv[2] if len(sys.argv) > 2 else "brave").lower()
+    # Serialize against scrape runs / SSO relogin. Lieta auth is Supabase with
+    # rotating refresh tokens: a probe running concurrently with a scrape can
+    # consume the refresh token the run is about to use, and reuse outside the
+    # grace window revokes the whole session family.
+    lock = open(state_path + ".lock", "w")
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print(json.dumps({"status": "unknown", "reason": "state_in_use_by_run"}))
+        return
     out = {"status": "unknown", "reason": "unclassified"}
     pw = await async_playwright().start()
     browser = None
@@ -263,6 +274,14 @@ async def main():
             await asyncio.sleep(0.5)
         else:
             out = {"status": "unknown", "reason": "platform_not_ready_within_10s"}
+        if out.get("status") == "valid":
+            # Persist tokens the server rotated during this probe — otherwise
+            # state.json keeps an already-consumed refresh token.
+            try:
+                shutil.copy2(state_path, state_path + ".bak")
+            except Exception:
+                pass
+            await context.storage_state(path=state_path)
         await context.close()
     except Exception as e:
         msg = str(e).strip().replace("\n", " ")[:160]
@@ -622,6 +641,60 @@ def status_scraper() -> ScraperStatus:
         last_result_text=last_result_text,
         failed_tasks=failed_tasks,
         can_retry_failed=(len(failed_tasks) > 0 and not running),
+    )
+
+
+_GEX_SUITE_ROOT = Path(__file__).resolve().parents[3]
+
+# gex_suite is imported via cwd (not pip-installed in the venv) — the
+# subprocess must run with cwd at the gex-suite root for the import to work.
+_RELOGIN_SNIPPET = (
+    "import asyncio, sys\n"
+    "from gex_suite.modules.scraper.runner import LietaScraper\n"
+    "ok = asyncio.run(LietaScraper(browser_type=sys.argv[1]).perform_google_sso_relogin())\n"
+    "raise SystemExit(0 if ok else 1)\n"
+)
+
+
+@router.post("/relogin", response_model=ReloginResponse)
+def relogin_scraper() -> Any:
+    """Google SSO 自動重登：用 state.json 裡仍存活的 Google session 重新換發
+    Lieta session。Google 要求互動驗證時會乾淨失敗，屆時仍需手動重登。"""
+    with _lock:
+        if _running:
+            return JSONResponse(status_code=409, content={
+                "success": False,
+                "message": "Scraper 正在執行中，無法重登",
+                "login_status": {"status": "unknown", "reason": "scraper_running"},
+            })
+    settings = _load_settings()
+    browser_pref = str(settings.get("browser", "brave") or "brave").strip().lower()
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _RELOGIN_SNIPPET, browser_pref],
+            capture_output=True, text=True, timeout=240, cwd=str(_GEX_SUITE_ROOT),
+        )
+        success = proc.returncode == 0
+        detail = "" if success else (
+            (proc.stdout or "").strip()[-300:] or (proc.stderr or "").strip()[-300:]
+        )
+    except subprocess.TimeoutExpired:
+        success, detail = False, "relogin_timeout"
+    except Exception as exc:
+        success, detail = False, f"{type(exc).__name__}: {exc}"
+
+    login = _check_login_status(force=True)
+    if success:
+        msg = "SSO 重登成功"
+        _send_webhook("🔐 Lieta SSO 自動重登成功")
+    else:
+        msg = f"SSO 重登失敗（需手動重登）：{detail}"
+        _send_webhook(f"⚠️ Lieta SSO 重登失敗，需手動登入：{detail[:180]}")
+    return ReloginResponse(
+        success=success,
+        message=msg,
+        login_status=LoginStatus(**login) if {"status", "reason"} <= set(login.keys())
+        else LoginStatus(status="unknown", reason=str(login)),
     )
 
 

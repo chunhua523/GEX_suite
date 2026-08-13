@@ -1,5 +1,6 @@
 import asyncio
 import os
+import shutil
 import time
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 from datetime import datetime
@@ -9,8 +10,10 @@ from gex_suite.shared.paths import SCRAPER_DATA_DIR, SCRAPER_STATE_PATH, ensure_
 
 # URL
 BASE_URL = "https://www.lietaresearch.com"
+AUTH_URL = f"{BASE_URL}/auth"
 ensure_dirs()
 STOP_FLAG_PATH = str(SCRAPER_DATA_DIR / ".stop_requested")
+STATE_LOCK_PATH = str(SCRAPER_DATA_DIR / "state.json.lock")
 
 
 class LoginRequiredError(Exception):
@@ -19,6 +22,48 @@ class LoginRequiredError(Exception):
 
 
 LOGIN_REQUIRED_REASON = "Login required (session expired)"
+
+
+def acquire_state_lock(timeout_seconds: float = 120.0, log=print):
+    """Serialize state.json consumers (scrape run / API login probe / SSO relogin).
+
+    Lieta auth is Supabase with rotating refresh tokens: two concurrent contexts
+    loaded from the same state.json can each consume the stored refresh token,
+    and reuse outside the grace window revokes the whole session family. flock
+    is released by the OS on process death, so a crashed holder cannot wedge us.
+    Returns the open lock file handle, or None on timeout (fail-open: caller
+    proceeds unlocked rather than skipping the run).
+    """
+    import fcntl
+    fh = open(STATE_LOCK_PATH, "w")
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fh
+        except OSError:
+            if time.monotonic() >= deadline:
+                log("state.json lock still busy after timeout; proceeding without lock.")
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+                return None
+            time.sleep(1.0)
+
+
+def release_state_lock(fh) -> None:
+    if fh is None:
+        return
+    try:
+        import fcntl
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        fh.close()
+    except Exception:
+        pass
 
 class LietaScraper:
     def __init__(self, logger_func=print, browser_type="chrome"):
@@ -57,9 +102,7 @@ class LietaScraper:
         
         return None
 
-    async def start_browser(self, headless=False):
-        self.playwright = await async_playwright().start()
-        
+    def _build_launch_args(self, headless):
         launch_args = {
             "headless": headless,
             "args": ["--disable-blink-features=AutomationControlled"]
@@ -76,9 +119,23 @@ class LietaScraper:
         else:
             # Default to Chrome
             launch_args["channel"] = "chrome"
+        return launch_args
 
-        self.browser = await self.playwright.chromium.launch(**launch_args)
+    async def start_browser(self, headless=False):
+        self.playwright = await async_playwright().start()
+        self.browser = await self.playwright.chromium.launch(**self._build_launch_args(headless))
         self.log(f"Browser launched ({self.browser_type}).")
+
+    async def _save_state_with_backup(self, context):
+        """Persist context storage state to state.json, rotating the previous
+        file to state.json.bak so a bad write never destroys the last
+        known-good session."""
+        if os.path.exists(self.storage_state_path):
+            try:
+                shutil.copy2(self.storage_state_path, self.storage_state_path + ".bak")
+            except Exception as e:
+                self.log(f"state.json backup rotate failed (continuing): {e}")
+        await context.storage_state(path=self.storage_state_path)
 
     async def close(self):
         if self.browser:
@@ -144,7 +201,7 @@ class LietaScraper:
         finally:
             # Try to save one last time if context is still valid
             try:
-                await context.storage_state(path=self.storage_state_path)
+                await self._save_state_with_backup(context)
                 self.log("Session saved to disk.")
             except:
                 pass
@@ -154,9 +211,180 @@ class LietaScraper:
         """
         Runs the full login lifecycle in a single event loop.
         """
-        await self.start_browser(headless=False)
-        await self.ensure_login()
-        await self.close()
+        lock = acquire_state_lock(log=self.log)
+        try:
+            await self.start_browser(headless=False)
+            await self.ensure_login()
+            await self.close()
+        finally:
+            release_state_lock(lock)
+
+    async def perform_google_sso_relogin(self, headless: bool = False, use_state_lock: bool = True) -> bool:
+        """Mint a fresh Lieta session by riding the Google account session
+        already stored in state.json (one-click "Google" SSO on /auth).
+
+        Returns True only after the platform page verifies as logged-in AND the
+        refreshed storage state is saved. Never raises. A Google interactive
+        wall (re-auth / 2FA / "browser not secure") fails cleanly — the manual
+        perform_login_flow() stays the fallback for that case.
+
+        use_state_lock=False is for callers that already hold the state lock
+        (flock is not re-entrant across file handles; re-acquiring would stall
+        until the fail-open timeout).
+        """
+        if not os.path.exists(self.storage_state_path):
+            self.log("SSO relogin: no state.json (no Google cookies to reuse); manual login required.")
+            return False
+
+        lock = acquire_state_lock(log=self.log) if use_state_lock else None
+        own_playwright = self.playwright is None
+        browser = None
+        try:
+            if own_playwright:
+                self.playwright = await async_playwright().start()
+            browser = await self.playwright.chromium.launch(**self._build_launch_args(headless))
+            context = await browser.new_context(storage_state=self.storage_state_path)
+            popup_pages = []
+            context.on("page", lambda p: popup_pages.append(p))
+            page = await context.new_page()
+
+            # Already valid? Refresh the saved state and skip the OAuth trip.
+            try:
+                await self._goto_and_settle(page, f"{BASE_URL}/platform")
+                await self._assert_logged_in_for_platform(page, f"{BASE_URL}/platform")
+                self.log("SSO relogin: session already valid; refreshing saved state only.")
+                await self._save_state_with_backup(context)
+                return True
+            except LoginRequiredError:
+                pass
+            except Exception as e:
+                self.log(f"SSO relogin: platform precheck inconclusive ({e}); attempting SSO anyway.")
+
+            sb_before = await self._read_auth_cookie_values(context)
+
+            self.log("SSO relogin: opening /auth and clicking the Google button...")
+            await self._goto_and_settle(page, AUTH_URL)
+            google_btn = page.get_by_role("button", name="Google", exact=True)
+            if await google_btn.count() == 0:
+                google_btn = page.get_by_text("Google", exact=True)
+            if await google_btn.count() == 0:
+                self.log("SSO relogin: Google button not found on /auth; aborting.")
+                return False
+            await google_btn.first.click()
+
+            if not await self._drive_google_oauth(page, popup_pages):
+                return False
+
+            # Wait for the new Supabase session cookies to actually land —
+            # returning to the site precedes the client finishing the exchange.
+            for _ in range(40):  # up to 20s
+                sb_after = await self._read_auth_cookie_values(context)
+                if sb_after and sb_after != sb_before:
+                    break
+                await asyncio.sleep(0.5)
+
+            verify = await context.new_page()
+            try:
+                await self._goto_and_settle(verify, f"{BASE_URL}/platform")
+                await self._assert_logged_in_for_platform(verify, f"{BASE_URL}/platform")
+            finally:
+                await verify.close()
+
+            await self._save_state_with_backup(context)
+            self.log("SSO relogin: success — refreshed session saved to state.json.")
+            return True
+        except Exception as e:
+            self.log(f"SSO relogin failed: {e}")
+            return False
+        finally:
+            if browser:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+            if own_playwright and self.playwright:
+                try:
+                    await self.playwright.stop()
+                except Exception:
+                    pass
+                self.playwright = None
+            release_state_lock(lock)
+
+    async def _goto_and_settle(self, page, url):
+        await page.goto(url, timeout=45000)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
+
+    async def _read_auth_cookie_values(self, context):
+        cookies = await context.cookies(BASE_URL)
+        return sorted(
+            (c["name"], c["value"]) for c in cookies
+            if c["name"].startswith("sb-") and "auth-token" in c["name"]
+        )
+
+    async def _drive_google_oauth(self, page, popup_pages) -> bool:
+        """Walk the OAuth hop (same-tab or popup) after clicking the Google
+        button: pick the stored account if a chooser shows, click through a
+        consent screen, bail out on interactive security walls. Success means
+        some page bounced back to lietaresearch.com — the caller still hard-
+        verifies the platform page before trusting it."""
+        hard_walls = (
+            "verify it's you",
+            "驗證您的身分",
+            "this browser or app may not be secure",
+            "瀏覽器或應用程式可能不安全",
+            "couldn't sign you in",
+            "無法登入",
+        )
+        clicked_account = False
+        clicked_continue = False
+        saw_google = False
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            for p in [page, *popup_pages]:
+                if p.is_closed():
+                    continue
+                url = p.url or ""
+                if "accounts.google.com" in url:
+                    saw_google = True
+                    try:
+                        body = (await p.evaluate("() => document.body.innerText")).lower()
+                    except Exception:
+                        continue
+                    for wall in hard_walls:
+                        if wall in body:
+                            self.log(f"SSO relogin: Google interactive wall detected ({wall!r}); manual login required.")
+                            return False
+                    if not clicked_account:
+                        try:
+                            acct = p.locator("[data-identifier]")
+                            if await acct.count() > 0:
+                                await acct.first.click(timeout=3000)
+                                clicked_account = True
+                                self.log("SSO relogin: account chooser — picked the stored account.")
+                                continue
+                        except Exception:
+                            pass
+                    if not clicked_continue:
+                        for label in ("繼續", "Continue"):
+                            try:
+                                btn = p.get_by_role("button", name=label)
+                                if await btn.count() > 0:
+                                    await btn.first.click(timeout=3000)
+                                    clicked_continue = True
+                                    self.log("SSO relogin: consent screen — clicked continue.")
+                                    break
+                            except Exception:
+                                pass
+                elif "lietaresearch.com" in url:
+                    off_auth = not url.split("?")[0].rstrip("/").endswith("/auth")
+                    if saw_google or off_auth:
+                        return True
+            await asyncio.sleep(0.5)
+        self.log("SSO relogin: OAuth did not complete within 90s.")
+        return False
 
     async def perform_full_job(self, tickers, models, cme_tickers, cme_models, download_folder, parallel):
         """
@@ -228,6 +456,58 @@ class LietaScraper:
         finally:
             await page.close()
 
+    async def _run_preflights(self, context, need_std, need_cme):
+        if need_std:
+            await self._preflight_platform_access(context, f"{BASE_URL}/platform", "STD")
+        if need_cme:
+            await self._preflight_platform_access(context, f"{BASE_URL}/platform/cme", "CME")
+
+    async def _preflight_with_sso_recovery(self, context, need_std, need_cme, accept_downloads=True):
+        """Run preflights; on a login wall, attempt one Google SSO auto
+        re-login and retry once on a context rebuilt from the refreshed
+        state.json.
+
+        Returns (context, error): context is always the live one the caller
+        must keep using; error is None on success, otherwise the exception to
+        record failures with.
+        """
+        try:
+            await self._run_preflights(context, need_std, need_cme)
+            return context, None
+        except LoginRequiredError as e:
+            self.log("Preflight hit login wall — attempting Google SSO auto re-login...")
+            if not await self.perform_google_sso_relogin(use_state_lock=False):
+                return context, e
+            try:
+                await context.close()
+            except Exception:
+                pass
+            context = await self.browser.new_context(
+                storage_state=self.storage_state_path, accept_downloads=accept_downloads)
+            try:
+                await self._run_preflights(context, need_std, need_cme)
+                self.log("Preflight recovered after SSO re-login.")
+                return context, None
+            except Exception as e2:
+                self.log(f"Preflight still failing after SSO re-login: {e2}")
+                return context, e2
+        except Exception as e:
+            return context, e
+
+    async def _refresh_state_after_run(self, context):
+        """Persist the run context's storage state so server-rotated Supabase
+        tokens survive into the next run. Skipped when the session died
+        mid-run (no point persisting known-dead cookies over the last good
+        file)."""
+        if any(t.get("reason") == LOGIN_REQUIRED_REASON for t in self.failed_tasks_structured):
+            self.log("Session state NOT refreshed (login-required failures present).")
+            return
+        try:
+            await self._save_state_with_backup(context)
+            self.log("Session state refreshed to state.json (rotated tokens persisted).")
+        except Exception as e:
+            self.log(f"Session state refresh failed (non-fatal): {e}")
+
     def record_failure(self, platform, model, ticker, reason=""):
         """Records a failure in both log string format and structured format."""
         # String format for log
@@ -253,6 +533,14 @@ class LietaScraper:
         """
         Main scrapping logic. Returns structured failed tasks.
         """
+        lock = acquire_state_lock(log=self.log)
+        try:
+            return await self._run_scraping_job_impl(
+                tickers, models, cme_tickers, cme_models, download_folder, parallel_mode)
+        finally:
+            release_state_lock(lock)
+
+    async def _run_scraping_job_impl(self, tickers, models, cme_tickers, cme_models, download_folder, parallel_mode):
         self.stop_requested = False
         if os.path.exists(STOP_FLAG_PATH):
             try:
@@ -279,12 +567,9 @@ class LietaScraper:
 
         need_std = bool(tickers and models)
         need_cme = bool(cme_tickers and cme_models)
-        try:
-            if need_std:
-                await self._preflight_platform_access(context, f"{BASE_URL}/platform", "STD")
-            if need_cme:
-                await self._preflight_platform_access(context, f"{BASE_URL}/platform/cme", "CME")
-        except Exception as e:
+        context, preflight_error = await self._preflight_with_sso_recovery(context, need_std, need_cme)
+        if preflight_error is not None:
+            e = preflight_error
             self.log(f"Preflight failed: {e}")
             reason = LOGIN_REQUIRED_REASON if isinstance(e, LoginRequiredError) else "Platform precheck failed"
             if need_std:
@@ -297,7 +582,7 @@ class LietaScraper:
                         self.record_failure("cme", m, t, reason)
             self.log_summary()
             return self.failed_tasks_structured
-        
+
         tasks = []
         
         # 1. Standard Platform Tasks
@@ -345,7 +630,8 @@ class LietaScraper:
             self.save_tv_codes(tv_codes_std, download_folder, subfolder="")
         if tv_codes_cme:
             self.save_tv_codes(tv_codes_cme, download_folder, subfolder="CME")
-            
+
+        await self._refresh_state_after_run(context)
         self.log_summary()
         return self.failed_tasks_structured
 
@@ -354,6 +640,13 @@ class LietaScraper:
         Retries specifically the failed tasks.
         failed_tasks: list of dicts {'platform': 'std'|'cme', 'model': ..., 'ticker': ...}
         """
+        lock = acquire_state_lock(log=self.log)
+        try:
+            return await self._retry_scraping_job_impl(failed_tasks, download_folder, parallel_mode)
+        finally:
+            release_state_lock(lock)
+
+    async def _retry_scraping_job_impl(self, failed_tasks, download_folder, parallel_mode):
         self.stop_requested = False
         if os.path.exists(STOP_FLAG_PATH):
             try:
@@ -404,12 +697,10 @@ class LietaScraper:
         context = await self.browser.new_context(storage_state=self.storage_state_path, accept_downloads=True)
 
         platforms = {task_info["platform"] for task_info in grouped.values()}
-        try:
-            if "std" in platforms:
-                await self._preflight_platform_access(context, f"{BASE_URL}/platform", "STD")
-            if "cme" in platforms:
-                await self._preflight_platform_access(context, f"{BASE_URL}/platform/cme", "CME")
-        except Exception as e:
+        context, preflight_error = await self._preflight_with_sso_recovery(
+            context, "std" in platforms, "cme" in platforms)
+        if preflight_error is not None:
+            e = preflight_error
             self.log(f"Preflight failed: {e}")
             reason = LOGIN_REQUIRED_REASON if isinstance(e, LoginRequiredError) else "Platform precheck failed"
             for task_info in grouped.values():
@@ -417,7 +708,7 @@ class LietaScraper:
                     self.record_failure(task_info["platform"], task_info["model"], t, reason)
             self.log_summary()
             return self.failed_tasks_structured
-        
+
         tasks = []
         
         for k, task_info in grouped.items():
@@ -458,7 +749,8 @@ class LietaScraper:
             self.save_tv_codes(tv_codes_std, download_folder, subfolder="")
         if tv_codes_cme:
             self.save_tv_codes(tv_codes_cme, download_folder, subfolder="CME")
-            
+
+        await self._refresh_state_after_run(context)
         self.log_summary()
         return self.failed_tasks_structured
 

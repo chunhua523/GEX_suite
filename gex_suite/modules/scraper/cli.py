@@ -85,6 +85,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--result-json", default="")
     p.add_argument("--retry-failed-file", default="")
+    p.add_argument("--google-relogin", action="store_true",
+                   help="Attempt Google SSO re-login using saved state.json, then exit")
     return p.parse_args()
 
 
@@ -179,6 +181,13 @@ def main() -> int:
     logger.info("=" * 50)
     logger.info(f"🚀 GEX Scraper CLI starting {datetime.now():%Y-%m-%d %H:%M:%S}")
     logger.info("=" * 50)
+
+    if args.google_relogin:
+        browser_pref = str(settings.get("browser", "brave") or "brave").strip().lower()
+        scraper = LietaScraper(logger_func=logger.info, browser_type=browser_pref)
+        ok = asyncio.run(scraper.perform_google_sso_relogin(headless=args.headless))
+        logger.info("✅ SSO relogin 成功" if ok else "❌ SSO relogin 失敗（需手動重登）")
+        return 0 if ok else 1
 
     if args.tv_code_only:
         models = ["TV Code"]
