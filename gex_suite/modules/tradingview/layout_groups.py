@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import re
 import secrets
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -341,6 +342,64 @@ def _parse_list_entries(raw_list: Any) -> list[GroupLayout]:
     ]
 
 
+def _load_json_with_timeout(path: Path, timeout_s: float = 10.0) -> Any:
+    """exists()+open()+json.load() 包進 daemon thread，逾時硬切。
+
+    群組檔常被指到 CloudStorage（Google Drive）同步資料夾；FileProvider
+    wedge 時連 stat/open 都會無限期卡死（2026-08-19：paste CLI 凍在
+    TradingViewPage 建構、batch 根本沒開始）。逾時視同檔案不存在——流程
+    以空狀態繼續；被放生的 daemon thread 不擋行程收尾。
+    """
+    box: list[Any] = []
+
+    def _worker() -> None:
+        try:
+            if not path.exists():
+                box.append(None)
+                return
+            with path.open("r", encoding="utf-8") as f:
+                box.append(json.load(f))
+        except Exception:
+            box.append(None)
+
+    t = threading.Thread(target=_worker, daemon=True, name="layout-groups-read")
+    t.start()
+    t.join(timeout_s)
+    if t.is_alive():
+        print(f"⚠️ 讀取逾時（{timeout_s:.0f}s）：{path} — 雲端掛載可能卡死，先以空狀態繼續")
+        return None
+    return box[0] if box else None
+
+
+def _write_json_with_timeout(path: Path, payload: Any, timeout_s: float = 10.0) -> bool:
+    """mkdir+open("w")+write 包 daemon thread，逾時硬切（同 _load_json_with_timeout）。
+
+    2026-08-19 實錄：讀取有 guard 之後，流程收尾 `_flush_layout_groups_cache`
+    的 save_list() 寫入 open() 仍在 wedge 掛載上永久卡死＝貼完資料行程不退。
+    序列化在呼叫端先做完（不碰 FS），thread 裡只剩純 I/O；逾時放生 daemon
+    thread——清單檔只是快取（下次掃描自癒）、群組檔僅使用者編輯時寫。
+    """
+    text = json.dumps(payload, indent=2, ensure_ascii=False)
+    done: list[bool] = []
+
+    def _worker() -> None:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+            done.append(True)
+        except Exception as exc:
+            print(f"⚠️ 寫入失敗：{path} — {exc!r}")
+            done.append(False)
+
+    t = threading.Thread(target=_worker, daemon=True, name="layout-groups-write")
+    t.start()
+    t.join(timeout_s)
+    if t.is_alive():
+        print(f"⚠️ 寫入逾時（{timeout_s:.0f}s）：{path} — 雲端掛載可能卡死，放棄本次寫入")
+        return False
+    return bool(done and done[0])
+
+
 def load_layout_groups() -> LayoutGroupsState:
     """讀群組檔＋清單檔合成 state；偵測到舊版單檔格式時自動遷移拆檔."""
     ensure_dirs()
@@ -350,54 +409,44 @@ def load_layout_groups() -> LayoutGroupsState:
     legacy_scanned_at: str | None = None
 
     gpath = layout_groups_path()
-    if gpath.exists():
-        try:
-            with gpath.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            data = None
-        if isinstance(data, dict):
-            raw_settings = data.get("settings")
-            if isinstance(raw_settings, dict):
-                state.settings.update(raw_settings)
-            for raw in data.get("groups") or []:
-                if not isinstance(raw, dict):
-                    continue
-                if isinstance(raw.get("layout_ids"), list):
-                    ids = [
-                        str(x).strip()
-                        for x in raw["layout_ids"]
-                        if _ID_ONLY_RE.fullmatch(str(x).strip())
-                    ]
-                else:  # 舊格式：groups 內嵌完整 layouts
-                    legacy = True
-                    entries = _parse_list_entries(raw.get("layouts"))
-                    legacy_entries.extend(entries)
-                    ids = [e.dedup_key() for e in entries]
-                state.groups.append(
-                    LayoutGroup(
-                        group_id=str(raw.get("id") or new_group_id()),
-                        name=str(raw.get("name") or "").strip() or "未命名群組",
-                        layout_ids=ids,
-                    )
-                )
-            if "scanned_layouts" in data:  # 舊格式：快取與群組同檔
+    data = _load_json_with_timeout(gpath)
+    if isinstance(data, dict):
+        raw_settings = data.get("settings")
+        if isinstance(raw_settings, dict):
+            state.settings.update(raw_settings)
+        for raw in data.get("groups") or []:
+            if not isinstance(raw, dict):
+                continue
+            if isinstance(raw.get("layout_ids"), list):
+                ids = [
+                    str(x).strip()
+                    for x in raw["layout_ids"]
+                    if _ID_ONLY_RE.fullmatch(str(x).strip())
+                ]
+            else:  # 舊格式：groups 內嵌完整 layouts
                 legacy = True
-                legacy_entries.extend(_parse_list_entries(data.get("scanned_layouts")))
-                if data.get("scanned_at"):
-                    legacy_scanned_at = str(data["scanned_at"])
+                entries = _parse_list_entries(raw.get("layouts"))
+                legacy_entries.extend(entries)
+                ids = [e.dedup_key() for e in entries]
+            state.groups.append(
+                LayoutGroup(
+                    group_id=str(raw.get("id") or new_group_id()),
+                    name=str(raw.get("name") or "").strip() or "未命名群組",
+                    layout_ids=ids,
+                )
+            )
+        if "scanned_layouts" in data:  # 舊格式：快取與群組同檔
+            legacy = True
+            legacy_entries.extend(_parse_list_entries(data.get("scanned_layouts")))
+            if data.get("scanned_at"):
+                legacy_scanned_at = str(data["scanned_at"])
 
     lpath = layout_list_path()
-    if lpath.exists():
-        try:
-            with lpath.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            data = None
-        if isinstance(data, dict):
-            state.scanned_layouts = _parse_list_entries(data.get("layouts"))
-            if data.get("scanned_at"):
-                state.scanned_at = str(data["scanned_at"])
+    data = _load_json_with_timeout(lpath)
+    if isinstance(data, dict):
+        state.scanned_layouts = _parse_list_entries(data.get("layouts"))
+        if data.get("scanned_at"):
+            state.scanned_at = str(data["scanned_at"])
 
     if legacy:
         # 清單檔（較新、機器維護）優先；舊檔內容只補缺的 id。
@@ -420,8 +469,6 @@ def load_layout_groups() -> LayoutGroupsState:
 def save_groups(state: LayoutGroupsState) -> None:
     """寫群組檔（settings ＋ groups）——只在使用者編輯群組時呼叫."""
     ensure_dirs()
-    path = layout_groups_path()
-    path.parent.mkdir(parents=True, exist_ok=True)  # 自訂路徑的父目錄可能還不存在
     merged = dict(_DEFAULT_SETTINGS)
     merged.update(state.settings or {})
     payload = {
@@ -429,22 +476,18 @@ def save_groups(state: LayoutGroupsState) -> None:
         "settings": merged,
         "groups": [g.to_dict() for g in state.groups],
     }
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
+    _write_json_with_timeout(layout_groups_path(), payload)
 
 
 def save_list(state: LayoutGroupsState) -> None:
     """寫清單檔（掃描快取）——掃描／貼上流程與手動新增 URL 時呼叫."""
     ensure_dirs()
-    path = layout_list_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "version": 1,
         "scanned_at": state.scanned_at,
         "layouts": [l.to_dict() for l in state.scanned_layouts],
     }
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
+    _write_json_with_timeout(layout_list_path(), payload)
 
 
 def save_layout_groups(state: LayoutGroupsState) -> None:

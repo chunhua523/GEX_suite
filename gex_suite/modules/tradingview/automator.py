@@ -743,6 +743,48 @@ class PlaywrightCDPAutomator(TVAutomator):
     # ---------- Phase B helpers (layouts / sub-charts) ----------
     _LAYOUT_SCROLL_ATTR = "data-gex-layout-scroll"
 
+    async def wait_chart_hydrated(self, max_ms: int = 60_000) -> bool:
+        """Wait until the chart UI is usable: a chart widget is visible AND a
+        Layouts-dialog trigger exists in the DOM.
+
+        A page still on its loading spinner has neither — every dialog-open
+        strategy then "fails" and the batch degrades to Current-only
+        (2026-08-19: chart 頁整晚轉圈，paste 兩輪 10s 內判死 → 全滅)。
+        Returns False on timeout; caller keeps its existing fallback path.
+        """
+        page = self._require_page()
+        trigger = page.locator(
+            "[data-name='save-load-menu'], "
+            "[data-name='header-toolbar-save-load'], "
+            "#header-toolbar-save-load, "
+            "button#header-toolbar-symbol-search"
+        ).first
+        waited = 0
+        step = 500
+        while waited < max_ms:
+            try:
+                widgets = await self._count_visible_chart_widgets()
+            except Exception:
+                widgets = 0
+            if widgets > 0:
+                try:
+                    if await trigger.is_visible():
+                        if waited:
+                            self._log(f"[hydration] chart ready after {waited}ms")
+                        return True
+                except Exception:
+                    pass
+            if waited and waited % 10_000 < step:
+                self._log(f"[hydration] chart not ready yet ({waited}ms, widgets={widgets})")
+                if await self.page_looks_crashed():
+                    self._log("[hydration] page looks crashed — abort wait")
+                    return False
+            await page.wait_for_timeout(step)
+            waited += step
+        self._log(f"[hydration] TIMEOUT after {max_ms}ms — page stuck on loading screen?")
+        await self._dump_dom("chart_hydration_timeout")
+        return False
+
     async def list_layouts(self) -> list[LayoutInfo]:
         """List available layouts from '.' Layouts dialog.
 
@@ -758,6 +800,12 @@ class PlaywrightCDPAutomator(TVAutomator):
         """
         page = self._require_page()
         await page.bring_to_front()
+        # Batch entry point: the page may still be on its loading spinner
+        # (e.g. paste starting right as phase2's parallel scrape spikes the
+        # machine) — no trigger exists yet, so opening would degrade to
+        # Current-only. Wait for hydration first; on timeout fall through to
+        # the existing attempt/fallback so behaviour stays fail-safe.
+        await self.wait_chart_hydrated()
         opened = await self._open_layout_dialog()
         if not opened:
             # One retry after a settle: on a page still recovering (e.g. right
