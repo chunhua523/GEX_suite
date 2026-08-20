@@ -375,14 +375,13 @@ class ScrapedFilesDialog(QDialog):
         ungrouped: list[tuple[str, str, datetime]] = []
         for ticker in tickers.keys():
             fp, dt_obj = tickers[ticker]
-            found_group = None
+            # A ticker may belong to several groups — show it under each one.
+            found = False
             for group_name, ticker_list in ticker_groups.items():
                 if ticker in ticker_list:
-                    found_group = group_name
-                    break
-            if found_group:
-                grouped_tickers.setdefault(found_group, []).append((ticker, fp, dt_obj))
-            else:
+                    grouped_tickers.setdefault(group_name, []).append((ticker, fp, dt_obj))
+                    found = True
+            if not found:
                 ungrouped.append((ticker, fp, dt_obj))
 
         for group_name in sorted(grouped_tickers.keys()):
@@ -463,14 +462,13 @@ class ScrapedFilesDialog(QDialog):
             ungrouped_tv: list[tuple[str, str]] = []
             for ticker in sorted(merged_tv_items.keys()):
                 content = merged_tv_items[ticker]
-                found_group = None
+                # A ticker may belong to several groups — show it under each one.
+                found = False
                 for group_name, ticker_list in ticker_groups.items():
                     if ticker in ticker_list:
-                        found_group = group_name
-                        break
-                if found_group:
-                    grouped_tv.setdefault(found_group, []).append((ticker, content))
-                else:
+                        grouped_tv.setdefault(group_name, []).append((ticker, content))
+                        found = True
+                if not found:
                     ungrouped_tv.append((ticker, content))
 
             for group_name in sorted(grouped_tv.keys()):
@@ -601,13 +599,17 @@ class ScrapedFilesDialog(QDialog):
 
     def _date_open_selected(self) -> None:
         tv_data_to_show: list[tuple[Any, ...]] = []
+        opened: set = set()  # same item can be checked under several groups
         for cb, data in self._date_file_vars:
             if not cb.isChecked():
                 continue
             try:
                 if isinstance(data, tuple) and data[0] == "TV_DATA":
-                    tv_data_to_show.append(data)
-                else:
+                    if data[1] not in opened:
+                        opened.add(data[1])
+                        tv_data_to_show.append(data)
+                elif str(data) not in opened:
+                    opened.add(str(data))
                     open_file_cross_platform(str(data))
             except Exception as exc:
                 print(f"Error opening item: {exc}")
