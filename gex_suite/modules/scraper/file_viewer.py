@@ -406,17 +406,21 @@ class ScrapedFilesDialog(QDialog):
             self._date_scroll_layout.insertWidget(self._date_scroll_layout.count() - 1, gb)
 
         if ungrouped:
-            if grouped_tickers:
-                oh = QLabel(f"其他 / Other ({len(ungrouped)} tickers)")
-                oh.setStyleSheet("font-weight:bold;padding:4px;")
-                self._date_scroll_layout.insertWidget(self._date_scroll_layout.count() - 1, oh)
             ungrouped.sort(key=lambda x: x[0])
+            chk_list = []
+            cont = QWidget()
+            cl = QVBoxLayout(cont)
             for ticker, fp, dt_obj in ungrouped:
                 time_str = dt_obj.strftime("%H:%M:%S")
                 cb = QCheckBox(f"[{time_str}]  {ticker}")
                 cb.setFont(QFont("Consolas", 11))
-                self._date_scroll_layout.insertWidget(self._date_scroll_layout.count() - 1, cb)
+                cl.addWidget(cb)
                 self._date_file_vars.append((cb, fp))
+                chk_list.append((cb, fp))
+            gb = self._make_collapsible_group(
+                f"未分組 ({len(ungrouped)} tickers)", chk_list, cont
+            )
+            self._date_scroll_layout.insertWidget(self._date_scroll_layout.count() - 1, gb)
 
     def _rebuild_tv_code_by_date(
         self,
@@ -487,15 +491,19 @@ class ScrapedFilesDialog(QDialog):
                 self._date_scroll_layout.insertWidget(self._date_scroll_layout.count() - 1, gb)
 
             if ungrouped_tv:
-                if grouped_tv:
-                    oh = QLabel(f"其他 / Other ({len(ungrouped_tv)} tickers)")
-                    oh.setStyleSheet("font-weight:bold;")
-                    self._date_scroll_layout.insertWidget(self._date_scroll_layout.count() - 1, oh)
+                cont = QWidget()
+                cl = QVBoxLayout(cont)
+                tv_ungrouped_checkboxes: list[tuple[QCheckBox, Any]] = []
                 for t_label, content in ungrouped_tv:
                     cb = QCheckBox(t_label)
                     cb.setFont(QFont("Consolas", 11))
-                    self._date_scroll_layout.insertWidget(self._date_scroll_layout.count() - 1, cb)
+                    cl.addWidget(cb)
                     self._date_file_vars.append((cb, ("TV_DATA", t_label, content)))
+                    tv_ungrouped_checkboxes.append((cb, ("TV_DATA", t_label, content)))
+                gb = self._make_collapsible_group(
+                    f"未分組 ({len(ungrouped_tv)} tickers)", tv_ungrouped_checkboxes, cont
+                )
+                self._date_scroll_layout.insertWidget(self._date_scroll_layout.count() - 1, gb)
         except Exception as exc:
             err = QLabel(f"Error processing TV Code files: {exc}")
             err.setStyleSheet("color:red;")

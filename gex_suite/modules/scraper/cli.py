@@ -27,7 +27,7 @@ from gex_suite.shared.paths import (
 )
 
 from .runner import LietaScraper
-from .utils import DISPLAY_ONLY_GROUPS, load_tickers_with_groups
+from .utils import load_tickers_with_groups
 
 DEFAULT_SETTINGS = {
     "ticker_filepath": "",
@@ -93,12 +93,8 @@ def parse_args() -> argparse.Namespace:
 def get_tickers_for_groups(filepath: str, groups: list[str]) -> list[str]:
     all_groups = load_tickers_with_groups(filepath)
     if not groups:
-        # Display-only groups (未分組) hold retired tickers for the file
-        # viewer; scrape them only when named explicitly via --groups.
         out: list[str] = []
-        for name, v in all_groups.items():
-            if name in DISPLAY_ONLY_GROUPS:
-                continue
+        for v in all_groups.values():
             out.extend(v)
         return list(dict.fromkeys(out))
     out = []

@@ -35,24 +35,16 @@ def clean_filename(filename):
     """
     return re.sub(r'[<>:"/\\|?*]', '_', filename)
 
-# Groups that exist only to organize files in the scraped-file viewer
-# (retired/archived tickers). Excluded from every scrape run's flattened list.
-DISPLAY_ONLY_GROUPS = {"未分組"}
-
 def load_tickers_from_file(filepath):
     """
     Reads tickers from a file (txt or csv).
     Assumes one ticker per line or comma separated.
     For backward compatibility, flattens groups into a single list.
-    Display-only groups (e.g. 未分組) are excluded — they only group
-    historical files in the viewer and must not be scraped.
     """
     groups = load_tickers_with_groups(filepath)
     # Flatten all groups into a single list
     tickers = []
     for group_name, ticker_list in groups.items():
-        if group_name in DISPLAY_ONLY_GROUPS:
-            continue
         tickers.extend(ticker_list)
     return tickers
 
