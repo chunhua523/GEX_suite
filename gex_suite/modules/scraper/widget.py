@@ -133,9 +133,11 @@ class TickerSelectionDialog(QDialog):
         row_btn.addWidget(b_none)
         row_btn.addStretch(1)
         local: list[QCheckBox] = []
+        # 未分組 (display-only) tickers stay unchecked unless picked on purpose
+        default_checked = group not in utils.DISPLAY_ONLY_GROUPS
         for t in tickers:
             cb = QCheckBox(t)
-            cb.setChecked(True)
+            cb.setChecked(default_checked)
             v.addWidget(cb)
             local.append(cb)
             var_list.append((t, cb))
