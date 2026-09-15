@@ -444,17 +444,33 @@ class LietaScraper:
 
     async def _preflight_platform_access(self, context, target_url, label):
         """
-        Single-shot platform readiness check before launching model queues.
+        Platform readiness check before launching model queues.
+
+        暫時性失敗（載入超時、網路抖動）最多重試 2 次、第二次起 timeout 放寬到
+        30s；登入牆（LoginRequiredError）不在此重試，立即上拋走 SSO 自動重登。
         """
-        page = await context.new_page()
-        try:
-            page.set_default_timeout(15000)
-            await page.goto(target_url)
-            await page.wait_for_load_state("networkidle")
-            await self._assert_logged_in_for_platform(page, target_url)
-            self.log(f"[Preflight-{label}] Platform ready.")
-        finally:
-            await page.close()
+        attempts = 3
+        for attempt in range(1, attempts + 1):
+            page = await context.new_page()
+            try:
+                page.set_default_timeout(15000 if attempt == 1 else 30000)
+                await page.goto(target_url)
+                await page.wait_for_load_state("networkidle")
+                await self._assert_logged_in_for_platform(page, target_url)
+                self.log(f"[Preflight-{label}] Platform ready.")
+                return
+            except LoginRequiredError:
+                raise
+            except Exception as e:
+                if attempt == attempts:
+                    raise
+                self.log(
+                    f"[Preflight-{label}] Attempt {attempt}/{attempts} failed: {e} "
+                    "— retrying in 5s..."
+                )
+                await asyncio.sleep(5)
+            finally:
+                await page.close()
 
     async def _run_preflights(self, context, need_std, need_cme):
         if need_std:

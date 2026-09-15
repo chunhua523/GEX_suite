@@ -127,6 +127,7 @@ async def run_scraper(tickers, models, cme_tickers, cme_models, download_folder,
         "success_count": 0,
         "failed_count": 0,
     }
+    wholesale_precheck = False
     try:
         failed = await scraper.run_scraping_job(
             tickers=tickers,
@@ -141,9 +142,25 @@ async def run_scraper(tickers, models, cme_tickers, cme_models, download_folder,
         result["failed_count"] = len(result["initial_failed_tasks"])
         result["total_processed"] = result["success_count"] + result["failed_count"]
         if failed:
-            logger.warning(f"⚠️  {len(failed)} failed (no auto-retry).")
+            # 開場 preflight 全滅（一次也沒真的抓）＝暫時性平台問題，整批補跑
+            # 一次還有救；部分失敗維持不自動補跑（交給 /scraper retry-failed）。
+            wholesale_precheck = (
+                len(failed) == result["total_processed"]
+                and all(t.get("reason") == "Platform precheck failed" for t in failed)
+            )
+            if wholesale_precheck:
+                logger.warning(
+                    f"⚠️  All {len(failed)} task(s) failed at platform precheck "
+                    "— auto-retrying the whole batch once in 30s..."
+                )
+            else:
+                logger.warning(f"⚠️  {len(failed)} failed (no auto-retry).")
     finally:
         await scraper.close()
+    if wholesale_precheck:
+        await asyncio.sleep(30)
+        return await run_retry_only(
+            result["initial_failed_tasks"], download_folder, parallel, headless, logger)
     return result
 
 
