@@ -90,8 +90,13 @@ _FUTURES_ALIAS_MAP: dict[str, dict[str, str | None]] = {
     "NQ1!":  {"futures": "NQ1!",  "equity": "QQQ",  "index": "NDX"},
     "RTY1!": {"futures": "RTY1!", "equity": "IWM",  "index": "RUT"},
 
+    # Micro contracts Jeff charts instead of the full-size ones — paste the
+    # full-size contract's DB data (scrape/import side still NQ/GC).
+    "MNQ1!": {"futures": "NQ1!",  "equity": "QQQ",  "index": "NDX"},
+
     # Precious metals (no broadly-tracked option-bearing index → index=None)
     "GC1!":  {"futures": "GC1!",  "equity": "GLD",  "index": None},
+    "MGC1!": {"futures": "GC1!",  "equity": "GLD",  "index": None},
     "SI1!":  {"futures": "SI1!",  "equity": "SLV",  "index": None},
     "PL1!":  {"futures": "PL1!",  "equity": "PPLT", "index": None},
     "PA1!":  {"futures": "PA1!",  "equity": "PALL", "index": None},

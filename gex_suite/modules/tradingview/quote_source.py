@@ -36,6 +36,8 @@ class FuturesRule:
 RULES: dict[tuple[str, str], tuple[FuturesRule, str]] = {
     ("ES1!",  "index"):  (FuturesRule("ES=F",  "^GSPC", "CME_MINI:ES1!",  "FOREXCOM:SPX500", "diff"), "Offset"),
     ("NQ1!",  "equity"): (FuturesRule("NQ=F",  "QQQ",   "CME_MINI:NQ1!",  "BATS:QQQ",        "div"),  "Ratio"),
+    # Micro Nasdaq subchart — same quote legs as NQ1! (identical quoted price).
+    ("MNQ1!", "equity"): (FuturesRule("NQ=F",  "QQQ",   "CME_MINI:NQ1!",  "BATS:QQQ",        "div"),  "Ratio"),
     ("RTY1!", "equity"): (FuturesRule("RTY=F", "IWM",   "CME_MINI:RTY1!", "AMEX:IWM",        "div"),  "Ratio"),
 }
 
