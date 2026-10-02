@@ -255,7 +255,12 @@ class TradingViewPage(QWidget):
         self.chk_visibility_preset.stateChanged.connect(self._save_tv_prefs)
         go.addWidget(self.chk_visibility_preset)
 
-        self.chk_organize_indicators = QCheckBox("寫入前先刪除過期 GEX 指標（近四週視窗外）")
+        self.chk_organize_indicators = QCheckBox("寫入前先刪除過期 GEX 指標（近四週視窗外）並修正週期不符")
+        self.chk_organize_indicators.setToolTip(
+            "刪除週起始早於近四週視窗的 Daily & Weekly GEX、同週重複的指標；\n"
+            "既有指標起始日與目前規則不符（例：期貨應為週日卻是週一）時，"
+            "原地改成正確起始日再補缺的天（保留已填值與 TO FUTURE）。"
+        )
         self.chk_organize_indicators.setChecked(False)
         self.chk_organize_indicators.stateChanged.connect(self._save_tv_prefs)
         go.addWidget(self.chk_organize_indicators)
@@ -1201,7 +1206,7 @@ class TradingViewPage(QWidget):
             self._exec_log(
                 "── 批次執行 ──\n"
                 f"  ticker 範圍：{opts.ticker_scope}（由各子圖辨識）\n"
-                f"  版面範圍：{opts.layout_scope}｜寫入前先整理過期指標："
+                f"  版面範圍：{opts.layout_scope}｜寫入前先整理過期／週期不符指標："
                 f"{'是' if opts.organize_indicators else '否'}"
             )
             self.lbl_status.setText("批次執行中：各子圖辨識 ticker（版面／子圖）…")
@@ -1210,7 +1215,7 @@ class TradingViewPage(QWidget):
             self._exec_log(
                 "── 批次執行 ──\n"
                 f"  ticker 範圍：{opts.ticker_scope}（目標：{ticker_label}）\n"
-                f"  版面範圍：{opts.layout_scope}｜寫入前先整理過期指標："
+                f"  版面範圍：{opts.layout_scope}｜寫入前先整理過期／週期不符指標："
                 f"{'是' if opts.organize_indicators else '否'}"
             )
             self.lbl_status.setText(f"批次執行中：{ticker_label}（版面／子圖）…")
@@ -3054,12 +3059,94 @@ class TradingViewPage(QWidget):
                                 except Exception:
                                     got_date_raw = None
                                 got_date = (got_date_raw or "").strip()
+                                # 起始日被修正時記下原值（之後即使滿格也要 save）。
+                                reanchored_from: str | None = None
+                                fix_err: str | None = None
+                                if (
+                                    got_date
+                                    and got_date != expected_date_iso
+                                    and opts.organize_indicators
+                                    and opts.dry_run
+                                ):
+                                    await automator.close_settings(save=False)
+                                    self._log_event(
+                                        "preview",
+                                        "預覽｜週期不符",
+                                        f"週一起={row_monday} 起始 {got_date} → 將修正為 "
+                                        f"{expected_date_iso} {indicator_start_time}",
+                                        layout=layout.name,
+                                        subchart=sub.index,
+                                        ticker=target_ticker,
+                                        detail=(
+                                            f"URL={url_for_log}\n圖上={chosen}\nticker={target_ticker}\n"
+                                            f"週一起={row_monday}\n既有指標起始={got_date}\n"
+                                            f"執行時將改為：{expected_date_iso} {indicator_start_time}，再補缺的天"
+                                        ),
+                                    )
+                                    results.append(
+                                        BatchResultItem(
+                                            item=replace(
+                                                _build_item(row_monday),
+                                                preview_status=(
+                                                    f"預覽：週期不符，執行將修正起始為 "
+                                                    f"{expected_date_iso} {indicator_start_time}"
+                                                ),
+                                            ),
+                                            status="skipped",
+                                            message="preview_would_reanchor",
+                                        )
+                                    )
+                                    return False
+                                if got_date and got_date != expected_date_iso and org_cleanup:
+                                    # 「寫入前整理」勾選：把既有指標的起始日原地改成規則值
+                                    # （對話框已開著），保留已填的各天值與 TO FUTURE。
+                                    # 讀回不符才退回下面的「失敗｜週期不符」。
+                                    try:
+                                        await automator.set_weekly_start_date(
+                                            monday=indicator_date,
+                                            time_str=indicator_start_time,
+                                        )
+                                        fixed_date_raw, fixed_time_raw = (
+                                            await automator.read_weekly_start_datetime()
+                                        )
+                                        fixed_date = (fixed_date_raw or "").strip()
+                                        fixed_time = (fixed_time_raw or "").strip()
+                                        if (
+                                            fixed_date == expected_date_iso
+                                            and fixed_time == indicator_start_time.strip()
+                                        ):
+                                            reanchored_from = got_date
+                                        else:
+                                            fix_err = (
+                                                f"修正後讀回 {fixed_date or '-'} {fixed_time or '-'}"
+                                            )
+                                    except Exception as _fix_exc:  # noqa: BLE001
+                                        fix_err = str(_fix_exc).replace("\n", " ")[:200]
+                                    if reanchored_from is not None:
+                                        self._log_event(
+                                            "info",
+                                            "修正｜週期不符",
+                                            f"週一起={row_monday} 起始 {got_date} → "
+                                            f"{expected_date_iso} {indicator_start_time}",
+                                            layout=layout.name,
+                                            subchart=sub.index,
+                                            ticker=target_ticker,
+                                            detail=(
+                                                f"URL={url_for_log}\n圖上={chosen}\nticker={target_ticker}\n"
+                                                f"週一起={row_monday}\n原起始={got_date}\n"
+                                                f"已改為：{expected_date_iso} {indicator_start_time}"
+                                                "（保留既有各天值，接著補缺的天）"
+                                            ),
+                                        )
+                                        got_date = expected_date_iso
                                 if got_date and got_date != expected_date_iso:
                                     await automator.close_settings(save=False)
                                     msg = (
                                         "existing 指標週期不符，已中止以避免誤判 skip: "
                                         f"expected={expected_date_iso}, opened={got_date}"
                                     )
+                                    if fix_err:
+                                        msg += f"；自動修正失敗：{fix_err}"
                                     self._log_event(
                                         "error",
                                         "失敗｜週期不符",
@@ -3126,7 +3213,8 @@ class TradingViewPage(QWidget):
                                                 f"錯誤（WEEKLY GEX LEVELS 已是滿格）：{_tof_exc}"
                                             ),
                                         )
-                                    await automator.close_settings(save=to_future_wrote)
+                                    saved_any = to_future_wrote or reanchored_from is not None
+                                    await automator.close_settings(save=saved_any)
                                     self._log_event(
                                         "skip",
                                         "略過｜快取",
@@ -3138,16 +3226,25 @@ class TradingViewPage(QWidget):
                                             f"URL={url_for_log}\n圖上={chosen}\nticker={target_ticker}\n"
                                             f"週一起={row_monday}\n原因：該週可填欄位皆已有值（單次掃描內偵測）"
                                             + ("\nTO FUTURE：已同步寫入今日欄位" if to_future_wrote else "")
+                                            + (
+                                                f"\n起始日：已由 {reanchored_from} 修正為 {expected_date_iso}"
+                                                if reanchored_from is not None
+                                                else ""
+                                            )
                                         ),
                                     )
                                     results.append(
                                         BatchResultItem(
                                             item=item,
-                                            status="skipped",
-                                            message="該週可用天皆已有值",
+                                            status="done" if reanchored_from is not None else "skipped",
+                                            message=(
+                                                "起始日已修正（各天欄位已滿）"
+                                                if reanchored_from is not None
+                                                else "該週可用天皆已有值"
+                                            ),
                                         )
                                     )
-                                    return to_future_wrote
+                                    return saved_any
 
                                 if opts.dry_run:
                                     planned = [
@@ -3282,6 +3379,11 @@ class TradingViewPage(QWidget):
                                     detail=(
                                         f"URL={url_for_log}\n圖上商品：{chosen}  DB ticker：{target_ticker}\n"
                                         f"{start_line.strip()}"
+                                        + (
+                                            f"\n起始日：已由 {reanchored_from} 修正為 {expected_date_iso}"
+                                            if reanchored_from is not None
+                                            else ""
+                                        )
                                     ),
                                 )
                                 results.append(
@@ -3603,7 +3705,6 @@ class TradingViewPage(QWidget):
             opts,
             dry_run=True,
             apply_visibility_preset=False,
-            organize_indicators=False,
         )
         report = await self._phase_b_scan_flow(dry)
         return self._dedupe_phase_b_items(self._work_items_from_dry_run_report(report))

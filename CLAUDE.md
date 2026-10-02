@@ -123,6 +123,9 @@ Every silent `continue` in `_phase_b_scan_flow` should produce a log line. Curre
 | `【略過｜快取】` | Cache scan shows the week's fillable cells already have values |
 | `【預覽｜快取】` | Cache scan shows partial fill needed (dry-run only) |
 | `【預覽】` | Dry-run write would happen |
+| `【修正｜週期不符】` | 「寫入前整理」勾選（`organize_indicators`）時，sweep 掃到的既有週指標起始日 ≠ `_resolve_indicator_start` → 對話框內原地 `set_weekly_start_date`＋讀回驗證，再照常補缺的天（**不刪重建**：保留已填值與 TO FUTURE Ratio/Offset）。GUI 與 CLI 同一條 `_phase_b_scan_flow` |
+| `【預覽｜週期不符】` | Dry-run＋整理勾選：上一項執行時會發生 |
+| `【失敗｜週期不符】` | 沒勾整理，或自動修正讀回不符。單筆路徑 `_apply_work_item_with_automator` 一律不自動修正——那裡日期相等才回 existing，不符＝開錯別週的指標，改了會弄壞別週 |
 | `【略過｜指標配額】` | TradingView indicator quota exceeded |
 | `【更新 TO FUTURE】` | TO FUTURE Ratio/Offset written successfully for today |
 | `【預覽｜TO FUTURE】` | Dry-run: TO FUTURE write would happen |
