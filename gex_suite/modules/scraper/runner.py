@@ -22,6 +22,7 @@ class LoginRequiredError(Exception):
 
 
 LOGIN_REQUIRED_REASON = "Login required (session expired)"
+PRECHECK_FAILED_REASON = "Platform precheck failed"
 
 
 def acquire_state_lock(timeout_seconds: float = 120.0, log=print):
@@ -448,6 +449,11 @@ class LietaScraper:
 
         暫時性失敗（載入超時、網路抖動）最多重試 2 次、第二次起 timeout 放寬到
         30s；登入牆（LoginRequiredError）不在此重試，立即上拋走 SSO 自動重登。
+
+        networkidle 只是盡量等：Lieta 晚間（retry 時段 20–22 點）背景請求不停，
+        networkidle 常等不到但頁面其實可用（2026-10-02 查：precheck 的
+        「Timeout 15000ms exceeded.」全是 wait_for_load_state，不是 goto）。
+        真正的就緒判準是 _assert_logged_in_for_platform 的「Select model」。
         """
         attempts = 3
         for attempt in range(1, attempts + 1):
@@ -455,7 +461,11 @@ class LietaScraper:
             try:
                 page.set_default_timeout(15000 if attempt == 1 else 30000)
                 await page.goto(target_url)
-                await page.wait_for_load_state("networkidle")
+                try:
+                    await page.wait_for_load_state("networkidle")
+                except PlaywrightTimeoutError:
+                    self.log(f"[Preflight-{label}] networkidle not reached "
+                             "— checking platform UI anyway.")
                 await self._assert_logged_in_for_platform(page, target_url)
                 self.log(f"[Preflight-{label}] Platform ready.")
                 return
@@ -587,7 +597,7 @@ class LietaScraper:
         if preflight_error is not None:
             e = preflight_error
             self.log(f"Preflight failed: {e}")
-            reason = LOGIN_REQUIRED_REASON if isinstance(e, LoginRequiredError) else "Platform precheck failed"
+            reason = LOGIN_REQUIRED_REASON if isinstance(e, LoginRequiredError) else PRECHECK_FAILED_REASON
             if need_std:
                 for m in models:
                     for t in tickers:
@@ -718,7 +728,7 @@ class LietaScraper:
         if preflight_error is not None:
             e = preflight_error
             self.log(f"Preflight failed: {e}")
-            reason = LOGIN_REQUIRED_REASON if isinstance(e, LoginRequiredError) else "Platform precheck failed"
+            reason = LOGIN_REQUIRED_REASON if isinstance(e, LoginRequiredError) else PRECHECK_FAILED_REASON
             for task_info in grouped.values():
                 for t in task_info["tickers"]:
                     self.record_failure(task_info["platform"], task_info["model"], t, reason)

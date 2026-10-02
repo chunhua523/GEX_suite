@@ -26,7 +26,7 @@ from gex_suite.shared.paths import (
     ensure_dirs,
 )
 
-from .runner import LietaScraper
+from .runner import PRECHECK_FAILED_REASON, LietaScraper
 from .utils import load_tickers_with_groups
 
 DEFAULT_SETTINGS = {
@@ -144,10 +144,7 @@ async def run_scraper(tickers, models, cme_tickers, cme_models, download_folder,
         if failed:
             # 開場 preflight 全滅（一次也沒真的抓）＝暫時性平台問題，整批補跑
             # 一次還有救；部分失敗維持不自動補跑（交給 /scraper retry-failed）。
-            wholesale_precheck = (
-                len(failed) == result["total_processed"]
-                and all(t.get("reason") == "Platform precheck failed" for t in failed)
-            )
+            wholesale_precheck = _is_wholesale_precheck(failed, result["total_processed"])
             if wholesale_precheck:
                 logger.warning(
                     f"⚠️  All {len(failed)} task(s) failed at platform precheck "
@@ -159,12 +156,20 @@ async def run_scraper(tickers, models, cme_tickers, cme_models, download_folder,
         await scraper.close()
     if wholesale_precheck:
         await asyncio.sleep(30)
+        # 已經是全滅後的補跑，不再疊 run_retry_only 自己的全滅補跑（兩邊各補一次即可）。
         return await run_retry_only(
-            result["initial_failed_tasks"], download_folder, parallel, headless, logger)
+            result["initial_failed_tasks"], download_folder, parallel, headless, logger,
+            precheck_retry=False)
     return result
 
 
-async def run_retry_only(failed_tasks, download_folder, parallel, headless, logger):
+def _is_wholesale_precheck(failed, total) -> bool:
+    """整批都死在開場 preflight（一次也沒真的抓）＝暫時性平台問題。"""
+    return bool(failed) and len(failed) == total and all(
+        t.get("reason") == PRECHECK_FAILED_REASON for t in failed)
+
+
+async def _retry_once(failed_tasks, download_folder, parallel, headless, logger):
     def log_func(msg: str) -> None:
         logger.info(msg)
     scraper = LietaScraper(logger_func=log_func, browser_type="brave")
@@ -175,19 +180,35 @@ async def run_retry_only(failed_tasks, download_folder, parallel, headless, logg
             download_folder=download_folder,
             parallel_mode=parallel,
         )
-        success = int(getattr(scraper, "success_count", 0))
-        failed_count = len(remaining or [])
-        return {
-            "initial_failed_tasks": failed_tasks,
-            "retry_failed_tasks": remaining or [],
-            "retried": True,
-            "retry_only": True,
-            "total_processed": success + failed_count,
-            "success_count": success,
-            "failed_count": failed_count,
-        }
+        return remaining or [], int(getattr(scraper, "success_count", 0))
     finally:
         await scraper.close()
+
+
+async def run_retry_only(failed_tasks, download_folder, parallel, headless, logger,
+                         *, precheck_retry=True):
+    remaining, success = await _retry_once(
+        failed_tasks, download_folder, parallel, headless, logger)
+    # 跟 run_scraper 同一張外層網：retry 開場 preflight 全滅 → 30s 後整批再試一次。
+    # 之前 retry 沒有這層，precheck 3 次失敗就整批收工（09-23 20:26／20:46）。
+    if precheck_retry and _is_wholesale_precheck(remaining, success + len(remaining)):
+        logger.warning(
+            f"⚠️  All {len(remaining)} retry task(s) failed at platform precheck "
+            "— retrying the whole batch once more in 30s..."
+        )
+        await asyncio.sleep(30)
+        remaining, success = await _retry_once(
+            failed_tasks, download_folder, parallel, headless, logger)
+    failed_count = len(remaining)
+    return {
+        "initial_failed_tasks": failed_tasks,
+        "retry_failed_tasks": remaining,
+        "retried": True,
+        "retry_only": True,
+        "total_processed": success + failed_count,
+        "success_count": success,
+        "failed_count": failed_count,
+    }
 
 
 def main() -> int:
