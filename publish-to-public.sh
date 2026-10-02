@@ -26,9 +26,10 @@ if [ ! -d "$PREFIX" ]; then
     echo "✗ 找不到 $PREFIX/ — 請在 Jeff-Project monorepo 內執行。"; exit 1
 fi
 
-# subtree 只發布「已 commit」內容；先擋住未 commit 的變更，避免發布舊狀態而不自知
-if ! git diff --quiet || ! git diff --cached --quiet; then
-    echo "⚠️  工作區有未 commit 的變更。subtree 只會發布『已 commit』的內容。"
+# subtree 只發布「已 commit」內容；先擋住 $PREFIX/ 底下未 commit 的變更，避免發布舊狀態而不自知
+# （只看 $PREFIX/：monorepo 其他資料夾，例如 discord-bot/，有未 commit 改動不影響發布）
+if ! git diff --quiet -- "$PREFIX" || ! git diff --cached --quiet -- "$PREFIX"; then
+    echo "⚠️  $PREFIX/ 有未 commit 的變更。subtree 只會發布『已 commit』的內容。"
     echo "    請先 commit（並 push monorepo）後再發布。"; exit 1
 fi
 
