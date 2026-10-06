@@ -633,12 +633,11 @@ class LayoutGroupsTab(QWidget):
             return
         cfg = shared_config.load_tradingview_config()
         cdp_url = str(cfg.get("cdp_url") or "http://127.0.0.1:9222").strip()
-        kind = str(cfg.get("browser") or "chrome")
         self._scan_cancelled = False
         self.b_scan_stop.setEnabled(True)
         self._log("【版面分組｜掃描】開始（逐版面讀取子圖標題，版面多時需數分鐘）")
         self._start_thread(
-            lambda: self._scan_layouts_coro(cdp_url, kind),
+            lambda: self._scan_layouts_coro(cdp_url),
             self._on_scan_done,
             lambda exc: self._on_scan_failed(cdp_url, exc),
         )
@@ -665,17 +664,11 @@ class LayoutGroupsTab(QWidget):
                 titles.append(title)
         return titles
 
-    async def _scan_layouts_coro(self, cdp_url: str, kind: str):
-        # 9222 沒開 → 自動啟動瀏覽器（沿用登入 profile）。
+    async def _scan_layouts_coro(self, cdp_url: str):
+        # 9222 沒開／卡死 → automator.connect() 走共用 ensure_cdp_browser 自動
+        # 啟動（同 GUI 批次與 CLI：共用 profile、冷啟後等 hydration）。
         if not browser_paths.cdp_ready():
             self._log("【版面分組｜掃描】9222 瀏覽器未啟動，自動啟動中…")
-            if browser_paths.launch_cdp_browser(kind) is None:
-                raise RuntimeError(f"找不到 {kind} 瀏覽器執行檔")
-            if not await asyncio.to_thread(browser_paths.wait_cdp_ready, 9222, 20.0):
-                raise RuntimeError(
-                    "瀏覽器已啟動但 9222 未就緒（可能已有非 CDP instance 在跑，請全部關閉後重試）"
-                )
-            await asyncio.sleep(5)  # 落地頁 hydration
         automator = PlaywrightCDPAutomator(cdp_url=cdp_url)
         automator.set_logger(lambda _m: None)
         try:

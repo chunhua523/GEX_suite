@@ -386,9 +386,17 @@ def test_path_resolver_precedence(tmp_dir: Path) -> None:
 
 
 def main() -> int:
+    from gex_suite.shared import config as shared_config
+
     failures: list[str] = []
     with tempfile.TemporaryDirectory() as tmp:
         tmp_dir = Path(tmp)
+        # Isolate EVERY test from this machine's suite_config.json: with a
+        # configured layout_list_path the disk tests wrote their fixtures over
+        # the real list file (2026-10-06: ~/Documents/GEX Scraper/layout_list.json,
+        # 86 layouts → 3 test rows).
+        orig_cfg_path = shared_config.SUITE_CONFIG_PATH
+        shared_config.SUITE_CONFIG_PATH = tmp_dir / "suite_config.json"
         tests = [
             ("normalize_chart_url", test_normalize_chart_url),
             ("chart_id_from_url", test_chart_id_from_url),
@@ -403,14 +411,17 @@ def main() -> int:
             ("disk_flow_list_only", lambda: test_apply_scan_results_to_disk_writes_list_only(tmp_dir)),
             ("path_resolver_precedence", lambda: test_path_resolver_precedence(tmp_dir)),
         ]
-        for name, fn in tests:
-            try:
-                fn()
-                print(f"  [OK] {name}")
-            except Exception as exc:
-                traceback.print_exc()
-                failures.append(f"{name}: {exc}")
-                print(f"  [FAIL] {name}: {exc}")
+        try:
+            for name, fn in tests:
+                try:
+                    fn()
+                    print(f"  [OK] {name}")
+                except Exception as exc:
+                    traceback.print_exc()
+                    failures.append(f"{name}: {exc}")
+                    print(f"  [FAIL] {name}: {exc}")
+        finally:
+            shared_config.SUITE_CONFIG_PATH = orig_cfg_path
     if failures:
         print("\nFAILED:")
         for f in failures:

@@ -228,22 +228,30 @@ CLI 探測（不開 GUI）：`python -m gex_suite.modules.tradingview.app_launch
 
 ## GUI／CLI 同步原則（Jeff 2026-10-06 明確要求）
 
-**任何修正都要讓 GUI 與 CLI（每日排程）兩邊同步**——同一個行為只准有一份實作，
-兩邊呼叫它；不准只改一邊。
+**任何修正都要讓 GUI 與 CLI（每日排程）兩邊同步，並最大化共用函式**——同一個
+行為只准有一份實作，兩邊呼叫它；不准只改一邊、不准各做各的。新增功能先找既有
+共用點（下表），沒有就先建一個再讓兩邊呼叫。
 
-- **瀏覽器（9222 CDP）**：冷啟、持久 profile（Mac＝`~/Library/Application
-  Support/Google/Google-Chrome-CDP`，非 Mac＝`~/.gex_suite/<kind>-cdp-profile`）、
-  50% 縮放、滿螢幕視窗全在 `browser_paths.launch_cdp_browser`；GUI「啟動 9222」、
-  版面分組、`cli._launch_browser_cdp` 都走它。改瀏覽器設定只改 `browser_paths`。
-  `tools/gex_chain/preflight.py` 另抄一份 Mac profile 路徑（刻意不 import
-  gex_suite），改路徑要兩處一起改。
-- **批次流程**：CLI 本來就重用 widget 的 `_phase_b_scan_flow`，修 paste 邏輯改
-  widget／automator 即兩邊生效；不要在 cli.py 另寫分支。
-- **刻意只在一邊的**要在程式註解＋本檔寫明原因（現有：watchdog 半死瀏覽器防線
-  只在 CLI——GUI 有人看著；CLI 收尾關瀏覽器、GUI 不關）。
-- 驗收：改到瀏覽器設定時，兩條路各開一次 Chrome 比對 user-data-dir／視窗／
-  `devicePixelRatio`／TV `sessionid`（2026-10-06 做法見
-  `agent-memory/feedback_gui_cli_sync.md`）。
+| 行為 | 唯一實作 | 誰呼叫 |
+|---|---|---|
+| 9222 Chrome 冷啟（持久 profile、50% 縮放、滿螢幕、`--no-first-run`、`start_new_session`） | `browser_paths.launch_cdp_browser` | GUI「啟動 9222」、版面分組一組一視窗、`ensure_cdp_browser`、preflight 登入視窗 |
+| 確認 9222 可用：沒開就開、半死就砍掉重開 | `browser_paths.ensure_cdp_browser` | **`PlaywrightCDPAutomator.connect()`**（GUI 批次／預覽／整理／開網址／版面分組掃描、CLI 流程全經過）＋CLI 開場預檢 |
+| 半死判斷／砍瀏覽器／重啟 | `browser_paths.cdp_ws_responsive`／`kill_cdp_browser`／`respawn_cdp_browser` | ensure、CLI watchdog hook、CLI 整輪重試 |
+| profile 路徑、瀏覽器名正規化、CDP probe／開分頁／殭屍自癒 | `browser_paths.*` | 全部；`tools/gex_chain/preflight.py` 用**檔案路徑載入** browser_paths（不經 package `__init__`，那會載入 Qt）→ browser_paths 匯入期只准用標準函式庫 |
+| 設定 → BatchOptions | `engine.batch_options_from_config` | GUI `_build_batch_options`（GUI 欄位疊在設定檔上）、CLI `_build_options`（設定檔＋命令列） |
+| GUI 欄位 ↔ 設定檔 key | `widget._ui_tv_settings` | GUI 存設定、GUI 組參數 |
+| 讀／寫 auto_paste_config.json | `shared.config.load_tradingview_config`／`save_tradingview_config`（**合併到原檔**，不再從預設重建——舊版會洗掉 GUI 上沒有的 key） | GUI、CLI、automator |
+| 圖表網址正規化 | `layout_groups.normalize_chart_url` | 版面分組、CLI `--layout-url` |
+| 批次／預覽流程 | `widget._phase_b_scan_flow` | GUI、CLI（offscreen 建 widget 重用） |
+| 螢幕常亮 pulse | `browser_paths.start_display_keepawake` | 目前只有 CLI（見下） |
+
+**刻意只在 CLI 的**（無人值守才需要；要改成兩邊都開先問 Jeff）：watchdog 半死
+防線＋crash 整輪重試一次（GUI 有人看著、可按 Stop）、螢幕常亮 pulse、收尾關
+瀏覽器（GUI 跑完可能還要看圖）、寫 `last_scan_failed.json`（retry-failed 清單只
+認排程結果，手動 GUI 跑不覆蓋）。新增這類差異要在程式註解＋本表寫明原因。
+
+驗收：改到瀏覽器設定時，兩條路各開一次 Chrome 比對 user-data-dir／視窗／
+`devicePixelRatio`／TV `sessionid`（做法見 `agent-memory/feedback_gui_cli_sync.md`）。
 
 ## Stop button (Preview / Scan / Cleanup)
 
@@ -274,7 +282,7 @@ CLI 探測（不開 GUI）：`python -m gex_suite.modules.tradingview.app_launch
 - Don't add Chinese layout markers (the design is English-only now).
 - Don't migrate existing DB rows when changing the importer suffix logic — only new imports get the `1!` suffix; legacy rows stay as-is. (唯一例外：2026-07-29 Jeff 指名把 `TXO1!` 裸名化為 `TXO`，450 rows 已同步 UPDATE。)
 - Don't add a `merge equity into futures` fallback — the user wants strict separation between modes so they can compare side-by-side.
-- Don't fix GUI and CLI separately — one implementation, both call it (see 「GUI／CLI 同步原則」). Don't reintroduce a `$TMPDIR` CDP profile for the GUI: macOS cleans it → no TV login, and it diverged from the CLI's zoom/window (2026-10-06).
+- Don't fix GUI and CLI separately, and don't write a second copy of anything in the 「GUI／CLI 同步原則」 table — one implementation, both call it. Don't reintroduce a `$TMPDIR` CDP profile for the GUI: macOS cleans it → no TV login, and it diverged from the CLI's zoom/window (2026-10-06).
 - Don't reintroduce substring rules into `_symbols_compatible` / `_symbol_matches_ticker` — `"SOX" in "SOXX"` made the subchart drift guard pass on the wrong pane and SOXX data was pasted onto the SOX chart daily (2026-08-12). Tail-equality (`NASDAQ:SOXX` ≡ `SOXX`) is the only allowed loosening.
 
 ## Testing

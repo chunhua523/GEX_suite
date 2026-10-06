@@ -38,6 +38,34 @@ class BatchOptions:
         return self.ticker_scope
 
 
+def batch_options_from_config(
+    cfg: dict,
+    *,
+    layout_urls: Iterable[str] = (),
+    dry_run: bool = False,
+) -> BatchOptions:
+    """auto_paste_config.json-shaped dict → BatchOptions: the ONE mapping shared by
+    the GUI (its controls merged over the saved config) and the CLI (config +
+    command-line overrides), so a setting can't mean different things in each.
+    Non-empty ``layout_urls`` forces layout_scope="urls"."""
+    urls = tuple(layout_urls)
+    start_rules = cfg.get("start_time_rules") or {}
+    return BatchOptions(
+        layout_scope="urls" if urls else (cfg.get("layout_scope") or "all"),
+        layout_urls=urls,
+        ticker_scope=cfg.get("ticker_scope") or "all",
+        ticker=str(cfg.get("ticker") or "").strip().upper() or None,
+        weeks=cfg.get("weeks_mode") or "this_week",
+        skip_filled_days=bool(cfg.get("skip_filled_days", True)),
+        apply_visibility_preset=bool(cfg.get("apply_visibility_preset", True)),
+        organize_indicators=bool(cfg.get("organize_indicators", False)),
+        dry_run=dry_run,
+        market_open_time=str(start_rules.get("default", "04:00")),
+        futures_quote_source=str(cfg.get("futures_quote_source") or "yfinance").strip()
+        or "yfinance",
+    )
+
+
 @dataclass(frozen=True)
 class WorkItem:
     ticker: str

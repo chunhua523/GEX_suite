@@ -21,7 +21,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from gex_suite.shared import db
 from gex_suite.shared.paths import DATA_DIR
 
-from .browser_paths import cdp_page_count, revive_windowless_cdp
+from .browser_paths import cdp_page_count, ensure_cdp_browser, revive_windowless_cdp
 from . import session_backup
 
 # Chrome Aw Snap / renderer kill (error code 5 = RESULT_CODE_KILLED_BAD_MESSAGE).
@@ -276,12 +276,45 @@ class PlaywrightCDPAutomator(TVAutomator):
     async def connect(self) -> None:
         self._pw = await async_playwright().start()
         await self._revive_windowless_browser()
+        launched = await self._ensure_cdp_browser()
         self._browser = await self._pw.chromium.connect_over_cdp(self.cdp_url)
         self._context = self._pick_context(self._browser)
         self._page = await self._pick_or_open_page(self._context)
+        if launched:
+            # 冷啟後 chart 頁要幾秒 hydration，太早開版面對話框會降級成
+            # Current-only（同 _revive_windowless_browser 的等待）。
+            await asyncio.sleep(5.0)
         self._attach_crash_listener(self._page)
         self._remember_chart_url(self._page.url)
         await self._assert_logged_in()
+
+    async def _ensure_cdp_browser(self) -> bool:
+        """Every connect (GUI batch／preview／cleanup／版面分組／開網址 and CLI)
+        goes through the shared :func:`browser_paths.ensure_cdp_browser`: no
+        browser on the local port → cold-start the shared persistent profile;
+        half-dead → kill + relaunch. Returns True when it cold-started one.
+        Remote CDP hosts are left alone (we can't launch there)."""
+        try:
+            parts = urlsplit(self.cdp_url)
+            port = parts.port or 9222
+        except ValueError:
+            return False
+        if (parts.hostname or "127.0.0.1") not in ("127.0.0.1", "localhost"):
+            return False
+        from gex_suite.shared import config as shared_config
+
+        browser = str(shared_config.load_tradingview_config().get("browser") or "chrome")
+        status = await asyncio.to_thread(
+            ensure_cdp_browser, browser, port=port, log=self._log_or_print
+        )
+        if status is None:
+            raise RuntimeError(
+                f"127.0.0.1:{port} 沒有可用的 CDP 瀏覽器，自動啟動 {browser} 失敗"
+                "（找不到執行檔，或 port 被非自動化程式佔用）"
+            )
+        if status == "launched":
+            self._log_or_print(f"【CDP｜自動啟動】{port} 沒有瀏覽器 → 已開啟 {browser}（共用 profile）")
+        return status == "launched"
 
     def _attach_crash_listener(self, page: Page) -> None:
         """Best-effort: Playwright fires ``crash`` when the renderer dies."""

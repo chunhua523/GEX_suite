@@ -17,22 +17,15 @@ import argparse
 import asyncio
 import json
 import os
-import socket
-import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from gex_suite.modules.tradingview import browser_paths
-from gex_suite.shared.paths import (
-    TRADINGVIEW_AUTO_PASTE_CONFIG_PATH,
-    TRADINGVIEW_LAST_FAILED_PATH,
-)
+from gex_suite.shared.paths import TRADINGVIEW_LAST_FAILED_PATH
 
 DEFAULT_CDP_URL = "http://127.0.0.1:9222"
 
@@ -88,185 +81,26 @@ def parse_args() -> argparse.Namespace:
 
 
 def _load_config() -> dict:
-    if TRADINGVIEW_AUTO_PASTE_CONFIG_PATH.exists():
-        try:
-            return json.loads(TRADINGVIEW_AUTO_PASTE_CONFIG_PATH.read_text(encoding="utf-8"))
-        except Exception as exc:
-            print(f"⚠️  failed to read auto_paste_config.json: {exc}")
-    return {}
-
-
-def _probe_cdp(url: str, timeout: float = 2.0) -> bool:
-    """Return True if CDP /json/version responds."""
-    try:
-        with urllib.request.urlopen(f"{url}/json/version", timeout=timeout) as resp:
-            return resp.status == 200
-    except (urllib.error.URLError, socket.timeout):
-        return False
-    except Exception:
-        return False
-
-
-def _cdp_ws_responsive(cdp_url: str, timeout_ms: int = 15000) -> bool:
-    """HTTP /json/version 活著 ≠ CDP 可用：瀏覽器主行程卡死時 devtools 的 HTTP
-    thread 照常回應、ws 也能握手，但指令永遠沒人處理，Playwright connect 會吃滿
-    timeout（2026-08-06：隔夜 GUI 殘留 Chrome 就是這樣讓 asia＋main 兩場 paste
-    全滅）。唯一可靠的判別是真的走一次 connect_over_cdp。"""
-    try:
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as p:
-            p.chromium.connect_over_cdp(cdp_url, timeout=timeout_ms).close()
-        return True
-    except Exception:
-        return False
-
-
-def _start_display_keepawake():
-    """整段 paste 期間持續宣告使用者活動，鎖住螢幕常亮。
-
-    macOS 26 上 `caffeinate -dimsu <cmd>` 的 -u 只在啟動瞬間宣告一次使用者活動，
-    跑到一半螢幕照樣熄滅；而 Chrome 151 螢幕熄滅後主行程事件幫浦會永久卡死
-    （2026-08-06 兩度 wedge：19:30 熄屏 → 19:37 CDP 指令無人回應，醒屏也不會
-    恢復）。用 back-to-back 的 `caffeinate -u -t 60` 短 pulse 連續重置熄屏倒數。
-    回傳 stop Event；daemon thread 隨行程結束自動消滅。"""
-    import threading
-
-    stop = threading.Event()
-
-    def _pulse() -> None:
-        while not stop.is_set():
-            try:
-                subprocess.run(
-                    ["/usr/bin/caffeinate", "-u", "-t", "60"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    timeout=70,
-                )
-            except Exception:
-                stop.wait(30)
-
-    threading.Thread(target=_pulse, daemon=True, name="display-keepawake").start()
-    return stop
-
-
-def _kill_cdp_port_owner(port: int, wait_seconds: float = 10.0) -> bool:
-    """強制結束佔住 tcp:port 的瀏覽器行程，釋放 port 供冷啟。
-
-    只殺 argv 帶 --remote-debugging-port=<port> 的行程——自動化啟的瀏覽器才有
-    這個旗標，使用者日常瀏覽器沒有，絕不誤殺。回傳 port 是否已釋放。"""
-    import signal as _signal
-
-    flag = f"--remote-debugging-port={port}"
-
-    def _listeners() -> list[int]:
-        out = subprocess.run(
-            ["lsof", "-nP", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
-            capture_output=True, text=True,
-        ).stdout
-        return [int(x) for x in out.split()]
-
-    pids = _listeners()
-    if not pids:
-        return True
-    for pid in pids:
-        argv = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
-                              capture_output=True, text=True).stdout
-        if flag not in argv:
-            print(f"⚠️ port {port} 由非自動化行程 pid={pid} 佔用，拒絕強制結束")
-            return False
-    for sig in (_signal.SIGTERM, _signal.SIGKILL):
-        for pid in pids:
-            try:
-                os.kill(pid, sig)
-            except ProcessLookupError:
-                pass
-        deadline = time.monotonic() + wait_seconds / 2
-        while time.monotonic() < deadline:
-            if not _listeners():
-                return True
-            time.sleep(0.5)
-        pids = _listeners()
-    return not _listeners()
-
-
-def _launch_browser_cdp(browser: str, port: int) -> None:
-    """Cold-start the configured browser via the shared launcher (same persistent
-    CDP profile / 50% zoom / full-screen window as the GUI's "啟動 9222").
-
-    No landing URL — the batch navigates to each layout itself. The launcher
-    detaches the browser (start_new_session) so it outlives this CLI process
-    and is reusable across steps."""
-    browser = _normalize_browser(browser)
-    profile = browser_paths.cdp_profile_dir(browser)
-    print(f"🚀 launching {browser} (CDP profile {profile.name})")
-    if browser_paths.launch_cdp_browser(browser, urls=[], port=port) is None:
-        raise SystemExit(f"❌ {browser} binary not found")
-
-
-def _ensure_cdp(cdp_url: str, *, browser: str, auto_launch: bool,
-                timeout_seconds: int) -> bool:
-    """Probe CDP; optionally launch the configured browser and wait.
-    Return True if reachable AND responsive."""
-    try:
-        port = int(cdp_url.rsplit(":", 1)[1].split("/")[0])
-    except Exception:
-        port = 9222
-    if _probe_cdp(cdp_url):
-        if _cdp_ws_responsive(cdp_url):
-            return True
-        # 半死瀏覽器（HTTP 活著、CDP 指令無回應）：reuse 沒救，唯一解是砍掉重啟。
-        print("⚠️ CDP HTTP 有回應但指令無回應（瀏覽器行程卡死）→ 強制結束並重啟")
-        if not auto_launch or not _kill_cdp_port_owner(port):
-            return False
-    elif not auto_launch:
-        return False
-    _launch_browser_cdp(browser, port)
-    deadline = time.monotonic() + max(5, timeout_seconds)
-    while time.monotonic() < deadline:
-        if _probe_cdp(cdp_url):
-            print(f"✅ CDP reachable on {cdp_url}")
-            return True
-        time.sleep(1)
-    return False
-
-
-def _normalize_chart_url(raw: str) -> str:
-    """Accept a full TradingView chart URL or a bare /chart/<id> and return a
-    canonical 'https://www.tradingview.com/chart/<id>/' URL."""
-    s = (raw or "").strip()
-    if not s:
-        return ""
-    if s.startswith("http://") or s.startswith("https://"):
-        return s
-    cid = s.strip("/").split("/")[-1]
-    return f"https://www.tradingview.com/chart/{cid}/" if cid else ""
+    # Same loader as the GUI (defaults merged under the saved file).
+    from gex_suite.shared import config as shared_config
+    return shared_config.load_tradingview_config()
 
 
 def _build_options(config: dict, args: argparse.Namespace):
-    """Construct BatchOptions from config defaults + CLI overrides."""
-    from .engine import BatchOptions
-    weeks = args.weeks or config.get("weeks_mode") or "this_week"
-    layout_urls = tuple(
-        u for u in (_normalize_chart_url(x) for x in (args.layout_url or [])) if u
-    )
-    layout_scope = "urls" if layout_urls else (args.layout_scope or config.get("layout_scope") or "all")
-    ticker_scope = args.ticker_scope or config.get("ticker_scope") or "all"
-    ticker = args.ticker or config.get("ticker") or None
-    start_rules = config.get("start_time_rules") or {}
-    return BatchOptions(
-        layout_scope=layout_scope,  # type: ignore[arg-type]
-        layout_urls=layout_urls,
-        ticker_scope=ticker_scope,  # type: ignore[arg-type]
-        ticker=ticker,
-        weeks=weeks,  # type: ignore[arg-type]
-        skip_filled_days=bool(config.get("skip_filled_days", True)),
-        apply_visibility_preset=bool(config.get("apply_visibility_preset", True)),
-        organize_indicators=bool(config.get("organize_indicators", True)),
-        dry_run=args.dry_run,
-        market_open_time=str(start_rules.get("default", "04:00")),
-        futures_quote_source=(
-            str(config.get("futures_quote_source") or "yfinance").strip() or "yfinance"
-        ),  # type: ignore[arg-type]
-    )
+    """Config + CLI overrides → BatchOptions via the mapping the GUI also uses."""
+    from .engine import batch_options_from_config
+    from .layout_groups import normalize_chart_url
+    cfg = dict(config)
+    for key, val in (
+        ("weeks_mode", args.weeks),
+        ("layout_scope", args.layout_scope),
+        ("ticker_scope", args.ticker_scope),
+        ("ticker", args.ticker),
+    ):
+        if val:
+            cfg[key] = val
+    layout_urls = [u for u in (normalize_chart_url(x) for x in (args.layout_url or [])) if u]
+    return batch_options_from_config(cfg, layout_urls=layout_urls, dry_run=args.dry_run)
 
 
 def _make_offscreen_app():
@@ -430,22 +264,19 @@ def main() -> int:
 
     def _kill_browser() -> bool:
         """watchdog 用：只砍行程，讓阻塞中的 playwright 呼叫拋錯解除阻塞。"""
-        return _kill_cdp_port_owner(port)
+        return browser_paths.kill_cdp_browser(port)
 
     def _respawn_browser() -> bool:
-        """砍掉＋冷啟＋等到 ws 真的可回應（不是只看 HTTP probe）。"""
-        if not _kill_cdp_port_owner(port):
-            return False
-        _launch_browser_cdp(browser, port)
-        deadline = time.monotonic() + max(5, args.launch_timeout)
-        while time.monotonic() < deadline:
-            if _probe_cdp(cdp_url):
-                return _cdp_ws_responsive(cdp_url)
-            time.sleep(1)
-        return False
+        return browser_paths.respawn_cdp_browser(
+            browser, port=port, timeout_sec=args.launch_timeout
+        )
 
-    if not _ensure_cdp(cdp_url, browser=browser, auto_launch=args.auto_launch_brave,
-                       timeout_seconds=args.launch_timeout):
+    # Same gate the GUI hits inside automator.connect(); here it runs up front so
+    # "no browser and no --auto-launch-brave" exits 2 with a result-json error.
+    if not browser_paths.ensure_cdp_browser(
+        browser, port=port, auto_launch=args.auto_launch_brave,
+        timeout_sec=args.launch_timeout,
+    ):
         msg = f"CDP not reachable at {cdp_url}"
         print(f"❌ {msg}")
         if args.result_json:
@@ -502,7 +333,7 @@ def main() -> int:
     )
 
     start = time.monotonic()
-    keepawake = _start_display_keepawake()
+    keepawake = browser_paths.start_display_keepawake()
     try:
         # 整輪最多跑 2 次：第 1 次因 crash 類例外炸掉、或版面清單降級成
         # Current-only（開場就接到半死瀏覽器的典型症狀）時，重啟瀏覽器後
@@ -609,11 +440,11 @@ def main() -> int:
                 pass
         if args.auto_launch_brave and not args.keep_browser:
             # 兩輪 paste 之間不留常駐 CDP 瀏覽器：Chrome 151 熄屏／久駐 wedge
-            # 的暴露面直接歸零。_kill_cdp_port_owner 只殺帶 debug 旗標的行程，
+            # 的暴露面直接歸零。kill_cdp_browser 只殺帶 debug 旗標的行程，
             # 使用者日常瀏覽器不受影響。
             print("🧹 收掉 CDP 瀏覽器（--keep-browser 可保留）")
             try:
-                _kill_cdp_port_owner(port)
+                browser_paths.kill_cdp_browser(port)
             except Exception as exc:
                 print(f"⚠️ 收掉 CDP 瀏覽器失敗：{exc}")
 

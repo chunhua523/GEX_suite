@@ -93,8 +93,12 @@ def load_tradingview_config() -> dict[str, Any]:
 
 
 def save_tradingview_config(cfg: dict[str, Any]) -> None:
+    """Merge ``cfg`` onto the saved file. Keys the caller doesn't own (the GUI only
+    writes its own controls) keep their saved values — rebuilding from defaults
+    silently reset hand-edited start_time_rules／watchdog_stall_seconds that the
+    CLI (and the GUI's own runs) read."""
     ensure_dirs()
-    merged = dict(_TRADINGVIEW_DEFAULT)
+    merged = load_tradingview_config()
     merged.update(cfg or {})
     with TRADINGVIEW_AUTO_PASTE_CONFIG_PATH.open("w", encoding="utf-8") as f:
         json.dump(merged, f, indent=2, ensure_ascii=False)

@@ -15,7 +15,6 @@ import re
 import subprocess
 import sys
 import time
-from urllib import request
 
 from PySide6.QtCore import Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QFont
@@ -56,7 +55,7 @@ from .automator import (
     WeeklyGexSubchartCache,
 )
 from . import layout_groups as layout_groups_mod
-from .browser_paths import browser_candidates, launch_cdp_browser
+from .browser_paths import find_browser, launch_cdp_browser, wait_cdp_ready
 from .groups_tab import LayoutGroupsTab
 from .qt_async import AsyncCoroThread
 from .run_log import SEVERITY_CSS, TVRunLogWriter, latest_log_path, new_log_path
@@ -65,6 +64,7 @@ from .engine import (
     BatchReport,
     BatchResultItem,
     WorkItem,
+    batch_options_from_config,
     compute_target_mondays,
 )
 from . import quote_source as _quote_source
@@ -1091,22 +1091,25 @@ class TradingViewPage(QWidget):
             else:
                 self.cb_ticker.setEditText(pref_ticker)
 
+    def _ui_tv_settings(self) -> dict:
+        """The GUI controls as auto_paste_config.json keys — what gets saved, and
+        what a GUI run overlays on the saved config (same keys the CLI reads)."""
+        return {
+            "weeks_mode": str(self.cb_phase_weeks.currentData() or "this_week"),
+            "layout_scope": str(self.cb_layout_scope.currentData() or "all"),
+            "ticker_scope": str(self.cb_ticker_scope.currentData() or "all"),
+            "skip_filled_days": self.chk_skip_if_has_values.isChecked(),
+            "apply_visibility_preset": self.chk_visibility_preset.isChecked(),
+            "organize_indicators": self.chk_organize_indicators.isChecked(),
+            "browser": "brave" if self.radio_brave.isChecked() else "chrome",
+            "ticker": self.cb_ticker.currentText().strip().upper(),
+            "futures_quote_source": str(
+                self.cb_futures_quote_source.currentData() or "yfinance"
+            ),
+        }
+
     def _save_tv_prefs(self, *_args) -> None:
-        shared_config.save_tradingview_config(
-            {
-                "weeks_mode": str(self.cb_phase_weeks.currentData() or "this_week"),
-                "layout_scope": str(self.cb_layout_scope.currentData() or "all"),
-                "ticker_scope": str(self.cb_ticker_scope.currentData() or "all"),
-                "skip_filled_days": self.chk_skip_if_has_values.isChecked(),
-                "apply_visibility_preset": self.chk_visibility_preset.isChecked(),
-                "organize_indicators": self.chk_organize_indicators.isChecked(),
-                "browser": "brave" if self.radio_brave.isChecked() else "chrome",
-                "ticker": self.cb_ticker.currentText().strip().upper(),
-                "futures_quote_source": str(
-                    self.cb_futures_quote_source.currentData() or "yfinance"
-                ),
-            }
-        )
+        shared_config.save_tradingview_config(self._ui_tv_settings())
 
     def _is_specific_ticker_mode(self) -> bool:
         return str(self.cb_ticker_scope.currentData() or "all") == "ticker"
@@ -1126,8 +1129,7 @@ class TradingViewPage(QWidget):
         browser_type = "brave" if self.radio_brave.isChecked() else "chrome"
         app_name = "Brave" if browser_type == "brave" else "Chrome"
         target_url = "https://tw.tradingview.com/chart/"
-        candidates = self._browser_candidates(browser_type)
-        browser_path = next((p for p in candidates if p and Path(p).exists()), None)
+        browser_path = find_browser(browser_type)
         if not browser_path:
             manual_cmd = (
                 'open -na "Brave Browser" --args --remote-debugging-port=9222 '
@@ -1157,7 +1159,7 @@ class TradingViewPage(QWidget):
             self.lbl_status.setStyleSheet("color:#FF6B6B;")
             return
 
-        if self._wait_for_cdp_ready():
+        if wait_cdp_ready(timeout_sec=6.0):
             self.lbl_status.setText(f"已啟動 {app_name}（9222）並開啟 TradingView chart。")
             self.lbl_status.setStyleSheet("color:#2CC985;")
             return
@@ -1170,9 +1172,6 @@ class TradingViewPage(QWidget):
             "偵測到瀏覽器啟動，但 CDP 9222 尚未可連線。\n"
             "請先完全關閉所有 Chrome/Brave 視窗後，再按一次本按鈕。",
         )
-
-    def _browser_candidates(self, browser_type: str) -> list[str | None]:
-        return browser_candidates(browser_type)
 
     def _copy_to_clipboard(self) -> None:
         from PySide6.QtWidgets import QApplication
@@ -2191,23 +2190,14 @@ class TradingViewPage(QWidget):
         return True
 
     def _build_batch_options(self) -> BatchOptions | None:
-        weeks = str(self.cb_phase_weeks.currentData() or "this_week")
-        layout_scope = str(self.cb_layout_scope.currentData() or "all")
-        ticker_scope = str(self.cb_ticker_scope.currentData() or "all")
-        ticker = self.cb_ticker.currentText().strip().upper()
-        if ticker_scope == "ticker" and not ticker:
+        ui = self._ui_tv_settings()
+        if ui["ticker_scope"] == "ticker" and not ui["ticker"]:
             return None
-        quote_source = str(self.cb_futures_quote_source.currentData() or "yfinance").strip() or "yfinance"
-        return BatchOptions(
-            layout_scope=layout_scope,  # type: ignore[arg-type]
-            ticker_scope=ticker_scope,  # type: ignore[arg-type]
-            ticker=ticker or None,
-            weeks=weeks,  # type: ignore[arg-type]
-            skip_filled_days=self.chk_skip_if_has_values.isChecked(),
-            apply_visibility_preset=self.chk_visibility_preset.isChecked(),
-            organize_indicators=self.chk_organize_indicators.isChecked(),
-            futures_quote_source=quote_source,
-        )
+        # Controls over the saved config, then the mapping the CLI uses too —
+        # non-GUI keys (start_time_rules default open time …) come from the file.
+        cfg = shared_config.load_tradingview_config()
+        cfg.update(ui)
+        return batch_options_from_config(cfg)
 
     async def _resolve_target_layouts(
         self,
@@ -3895,17 +3885,3 @@ class TradingViewPage(QWidget):
         if fallback:
             return fallback
         return last
-
-    @staticmethod
-    def _wait_for_cdp_ready(timeout_sec: float = 6.0) -> bool:
-        endpoint = "http://127.0.0.1:9222/json/version"
-        start = time.monotonic()
-        while time.monotonic() - start < timeout_sec:
-            try:
-                with request.urlopen(endpoint, timeout=1.0) as resp:
-                    if resp.status == 200:
-                        return True
-            except Exception:
-                pass
-            time.sleep(0.25)
-        return False
