@@ -126,6 +126,7 @@ Every silent `continue` in `_phase_b_scan_flow` should produce a log line. Curre
 | `【修正｜週期不符】` | 「寫入前整理」勾選（`organize_indicators`）時，sweep 掃到的既有週指標起始日 ≠ `_resolve_indicator_start` → 對話框內原地 `set_weekly_start_date`＋讀回驗證，再照常補缺的天（**不刪重建**：保留已填值與 TO FUTURE Ratio/Offset）。GUI 與 CLI 同一條 `_phase_b_scan_flow` |
 | `【預覽｜週期不符】` | Dry-run＋整理勾選：上一項執行時會發生 |
 | `【失敗｜週期不符】` | 沒勾整理，或自動修正讀回不符。單筆路徑 `_apply_work_item_with_automator` 一律不自動修正——那裡日期相等才回 existing，不符＝開錯別週的指標，改了會弄壞別週 |
+| `【失敗｜指標清單溢出】` | 新增指標前，鎖定子圖的圖例出現 TV「+N」（`legend-collapsed-sources-counter` 可見）：被收進去的 row 是 display:none、所有 collector 都看不到，「目標週不存在」不可信、新 row 也會被藏 → 中止不新增、不重試。修法＝手動刪多餘指標／移走副圖後重跑 |
 | `【略過｜指標配額】` | TradingView indicator quota exceeded |
 | `【更新 TO FUTURE】` | TO FUTURE Ratio/Offset written successfully for today |
 | `【預覽｜TO FUTURE】` | Dry-run: TO FUTURE write would happen |

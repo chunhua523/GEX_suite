@@ -240,6 +240,43 @@ def _ensure_profile_zoom(profile: Path) -> None:
         print(f"⚠️ could not pre-seed 50% zoom in {pref}: {exc}")
 
 
+def _ensure_profile_window_fills_screen(profile: Path) -> None:
+    """Pre-seed the first window's bounds to the whole usable screen.
+
+    Chrome otherwise reopens at whatever size it was last closed (1280×720 on the
+    deploy Mac, ~2/3 of the screen). In a 6-pane layout each pane is then so
+    short that TV folds legend rows into "+N", which the paste can't read
+    (LITE 2026-10-05/06). Uses the work area Chrome itself recorded in
+    ``window_placement``; a fresh profile has none yet → skipped this run.
+    Same constraint as the zoom seed: Chrome must be closed. Best-effort."""
+    pref = profile / "Default" / "Preferences"
+    try:
+        if not pref.exists():
+            return
+        data = json.loads(pref.read_text(encoding="utf-8"))
+        wp = data.get("browser", {}).get("window_placement")
+        keys = ("work_area_left", "work_area_top", "work_area_right", "work_area_bottom")
+        if not isinstance(wp, dict) or not all(isinstance(wp.get(k), int) for k in keys):
+            return
+        target = {
+            "left": wp["work_area_left"],
+            "top": wp["work_area_top"],
+            "right": wp["work_area_right"],
+            "bottom": wp["work_area_bottom"],
+        }
+        if all(wp.get(k) == v for k, v in target.items()):
+            return
+        # maximized stays False: on macOS Chrome's "maximized" is the zoom
+        # toggle, which can flip a full-size window back to its smaller size.
+        wp.update(target, maximized=False)
+        tmp = pref.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, separators=(",", ":"), ensure_ascii=False),
+                       encoding="utf-8")
+        os.replace(tmp, pref)
+    except Exception as exc:
+        print(f"⚠️ could not pre-seed window bounds in {pref}: {exc}")
+
+
 def _launch_browser_cdp(browser: str, port: int) -> None:
     """Start the configured browser with remote debugging on a dedicated,
     persistent user-data-dir (so the TradingView login survives across runs).
@@ -253,6 +290,7 @@ def _launch_browser_cdp(browser: str, port: int) -> None:
     profile = _BROWSER_CDP_PROFILES[browser]
     profile.mkdir(parents=True, exist_ok=True)
     _ensure_profile_zoom(profile)  # Chrome is down here (probe failed) → safe to write Preferences
+    _ensure_profile_window_fills_screen(profile)
     if not Path(binary).exists():
         raise SystemExit(f"❌ {browser} binary not found at {binary}")
     cmd = [

@@ -118,6 +118,16 @@ class IndicatorQuotaExceededError(RuntimeError):
     """Raised when TradingView refuses a new indicator (plan / max indicators)."""
 
 
+class IndicatorLegendOverflowError(RuntimeError):
+    """Raised before an add when the scoped pane's legend shows TV's ``+N`` overflow.
+
+    Rows folded into ``+N`` are ``display:none`` (no bounding box), so every
+    visible/scoped collector misses them: existing weeks look absent and a fresh
+    row lands hidden too → strict-delta fails and the stray indicator piles up
+    run after run (LITE 2026-10-05/06). Abort instead of adding.
+    """
+
+
 class TVAutomator(ABC):
     """Contract every TradingView automator must implement."""
 
@@ -3631,6 +3641,27 @@ class PlaywrightCDPAutomator(TVAutomator):
         elif before_count > 0 and probe_complete:
             self._log("[open_or_create] pre-add skip_target_rescan probe_complete=1")
 
+        # Legend overflow: rows folded into TV's "+N" are invisible to every scan
+        # above, so "target absent" can't be trusted and the new row would land
+        # hidden too (strict-delta fail + stray indicator each run). Abort.
+        overflow = await self._scoped_legend_overflow()
+        if overflow:
+            hidden = [t.strip() for t in str(overflow.get("hidden") or "").split(",") if t.strip()]
+            hidden_target = sum(1 for t in hidden if self._indicator_title_matches_keyword(t, title_keyword))
+            self._log(
+                f"[open_or_create] legend_overflow count={overflow.get('count')} "
+                f"hidden_target={hidden_target} target={target}"
+            )
+            try:
+                await self.close_settings(save=False)
+            except Exception:
+                pass
+            raise IndicatorLegendOverflowError(
+                f"指標清單溢出（+{overflow.get('count')}，其中 {hidden_target} 個 {title_keyword} 被隱藏）："
+                "被收進「+N」的指標讀不到也點不到，已中止新增以免重複；"
+                "請刪掉多餘指標、移走副圖或放大視窗後重跑"
+            )
+
         if dry_run:
             self._log("[open_or_create] dry_run: would add indicator for week; skipping add_favorite")
             try:
@@ -3646,6 +3677,18 @@ class PlaywrightCDPAutomator(TVAutomator):
                 marker_attr=marker_attr,
                 allow_global_fallback=allow_global_fallback,
             )
+        # Document-wide (all panes, hidden rows too) snapshot so a failed add can
+        # be rolled back without guessing which row is new.
+        preadd_attr = f"data-gex-preadd-{secrets.token_hex(4)}"
+        preadd_total = int(
+            (
+                await self._keyword_rows_snapshot(
+                    title_keyword=title_keyword,
+                    marker_attr=preadd_attr,
+                    mark=True,
+                )
+            ).get("total", -1)
+        )
         await self.add_favorite_indicator(favorite_name)
         try:
             opened = False
@@ -3694,8 +3737,16 @@ class PlaywrightCDPAutomator(TVAutomator):
                 )
                 await self._dump_dom("open_or_create_new_row_delta_missing")
                 self._log(f"[open_or_create] targeting_fail {diag}")
+                # Otherwise the unconfigured indicator stays on the chart and
+                # piles up every run (LITE 2026-10-05/06: +6 stray rows).
+                rollback_note = await self._rollback_unconfirmed_add(
+                    title_keyword=title_keyword,
+                    preadd_attr=preadd_attr,
+                    preadd_total=preadd_total,
+                )
+                self._log(f"[open_or_create] rollback {rollback_note}")
                 raise RuntimeError(
-                    "新增未生效於當前子圖：strict-delta 未偵測到可確認的新 row；"
+                    f"新增未生效於當前子圖［{rollback_note}］：strict-delta 未偵測到可確認的新 row；"
                     "Could not deterministically open newly added indicator settings (strict delta mode); "
                     f"aborted to avoid editing the wrong indicator. ({diag})"
                 )
@@ -3761,6 +3812,7 @@ class PlaywrightCDPAutomator(TVAutomator):
             return "created"
         finally:
             await self._clear_indicator_row_marker(marker_attr)
+            await self._clear_indicator_row_marker(preadd_attr)
 
     async def cleanup_and_sort_weekly_gex_indicators(
         self,
@@ -4851,6 +4903,195 @@ class PlaywrightCDPAutomator(TVAutomator):
             f"scoped_visible_after={len(scoped_visible_after)} "
             f"scope_idx={self._scoped_subchart_index if self._scoped_subchart_index is not None else '-'}"
         )
+
+    async def _scoped_legend_overflow(self) -> dict | None:
+        """Return ``{"count", "hidden"}`` when the pinned pane's legend shows TV's
+        ``+N`` overflow counter (``legend-collapsed-sources-counter`` without its
+        ``blockHidden`` class), else None.
+
+        TV folds legend rows that don't fit the pane height into ``+N``; the
+        folded rows stay in the DOM but are ``display:none``. ``hidden`` is the
+        counter's tooltip (comma-separated titles of the folded rows).
+        Only checks a pinned scope — without one we can't tell which pane the
+        add would land in, so we never block.
+        """
+        if self._scoped_subchart_index is None:
+            return None
+        page = self._require_page()
+        try:
+            res = await page.evaluate(
+                """
+                (scopeAttr) => {
+                  const root = document.querySelector(`[${scopeAttr}='1']`);
+                  if (!root) return null;
+                  for (const el of root.querySelectorAll("[data-qa-id='legend-collapsed-sources-counter']")) {
+                    const r = el.getBoundingClientRect();
+                    const st = window.getComputedStyle(el);
+                    if (r.width <= 2 || r.height <= 2 || st.display === "none" || st.visibility === "hidden") continue;
+                    const text = (el.textContent || "").replace(/\\s+/g, "");
+                    const m = text.match(/\\d+/);
+                    const tipEl = el.querySelector("[title]");
+                    return {
+                      count: m ? parseInt(m[0], 10) : 0,
+                      hidden: (tipEl && tipEl.getAttribute("title")) || "",
+                    };
+                  }
+                  return null;
+                }
+                """,
+                self._scope_attr,
+            )
+        except Exception:
+            return None
+        return res if isinstance(res, dict) else None
+
+    async def _keyword_rows_snapshot(
+        self,
+        *,
+        title_keyword: str,
+        marker_attr: str,
+        mark: bool = False,
+        pick_attr: str = "",
+    ) -> dict:
+        """Document-wide count of legend rows matching ``title_keyword``, hidden
+        (``+N``-folded) rows and every pane included — unlike
+        :meth:`_collect_indicator_locators`, whose scope check is geometric and
+        drops rows without a bounding box.
+
+        ``mark=True`` tags every matching row with ``marker_attr`` (pre-add
+        snapshot). Otherwise counts rows lacking it; when exactly one is
+        unmarked, tags it ``pick_attr='1'`` and reports whether it is visible.
+        """
+        page = self._require_page()
+        try:
+            res = await page.evaluate(
+                """
+                ({markerAttr, mark, pickAttr, strictFamily, tokens, normKeyword}) => {
+                  const normalize = (s) => (s || "")
+                    .toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+                  const raw = document.querySelectorAll(
+                    "[data-name='legend-source-item'], [data-qa-id='legend-source-item'], " +
+                    "[class*='sourceItem'], " +
+                    "[class*='item'][class*='study']"
+                  );
+                  const seen = new Set();
+                  const rows = [];
+                  for (const el of raw) {
+                    const row = el.closest("[data-name='legend-source-item'], [data-qa-id='legend-source-item']")
+                      || el.closest("[class*='sourceItem']")
+                      || el.closest("[class*='item'][class*='study']")
+                      || el;
+                    if (!row || seen.has(row)) continue;
+                    seen.add(row);
+                    const titleNode = row.querySelector(
+                      "[data-name='legend-source-item-title'], [data-qa-id~='legend-source-title'], " +
+                      "[data-name*='legend-source-item-title'], " +
+                      "[class*='sourceTitle'], [class*='studyTitle']"
+                    );
+                    const ntitle = normalize(titleNode ? titleNode.textContent : "");
+                    if (!ntitle) continue;
+                    let ok;
+                    if (strictFamily) {
+                      ok = /\\bdaily\\b.*\\bweekly\\b.*\\bgex\\b/.test(ntitle);
+                    } else if (normKeyword && ntitle.indexOf(normKeyword) >= 0) {
+                      ok = true;
+                    } else {
+                      let cursor = 0;
+                      ok = true;
+                      for (const tok of tokens) {
+                        const pos = ntitle.indexOf(tok, cursor);
+                        if (pos < 0) { ok = false; break; }
+                        cursor = pos + tok.length;
+                      }
+                    }
+                    if (ok) rows.push(row);
+                  }
+                  if (mark) {
+                    rows.forEach((row) => row.setAttribute(markerAttr, "1"));
+                    return { total: rows.length, unmarked: 0, pickedVisible: false };
+                  }
+                  const unmarked = rows.filter((row) => !row.hasAttribute(markerAttr));
+                  let pickedVisible = false;
+                  if (unmarked.length === 1 && pickAttr) {
+                    const row = unmarked[0];
+                    row.setAttribute(pickAttr, "1");
+                    const r = row.getBoundingClientRect();
+                    const st = window.getComputedStyle(row);
+                    pickedVisible = r.width > 2 && r.height > 2
+                      && st.display !== "none" && st.visibility !== "hidden";
+                  }
+                  return { total: rows.length, unmarked: unmarked.length, pickedVisible };
+                }
+                """,
+                {
+                    "markerAttr": marker_attr,
+                    "mark": mark,
+                    "pickAttr": pick_attr,
+                    "strictFamily": self._is_weekly_gex_keyword(title_keyword),
+                    "tokens": list(self._title_keyword_tokens(title_keyword)),
+                    "normKeyword": self._normalize_keyword_text(title_keyword),
+                },
+            )
+        except Exception:
+            return {"total": -1, "unmarked": -1, "pickedVisible": False}
+        if not isinstance(res, dict):
+            return {"total": -1, "unmarked": -1, "pickedVisible": False}
+        return res
+
+    async def _rollback_unconfirmed_add(
+        self,
+        *,
+        title_keyword: str,
+        preadd_attr: str,
+        preadd_total: int,
+    ) -> str:
+        """Remove the indicator a failed add just created; return a short 中文 note.
+
+        Deletes only when it is unambiguous: document-wide count rose by exactly
+        one, exactly one matching row lacks the pre-add marker, and that row is
+        visible. A row folded into ``+N`` has no bounding box, so the row-click
+        removers can't reach it — reported for manual cleanup instead.
+        """
+        if preadd_total < 0:
+            return "新增前計數失敗，未自動移除，請手動檢查"
+        pick_attr = f"data-gex-rollback-{secrets.token_hex(4)}"
+        try:
+            probe = await self._keyword_rows_snapshot(
+                title_keyword=title_keyword,
+                marker_attr=preadd_attr,
+                pick_attr=pick_attr,
+            )
+            total = int(probe.get("total", -1))
+            unmarked = int(probe.get("unmarked", -1))
+            self._log(
+                f"[open_or_create] rollback probe before={preadd_total} after={total} "
+                f"unmarked={unmarked} picked_visible={int(bool(probe.get('pickedVisible')))}"
+            )
+            if total == preadd_total and unmarked == 0:
+                return "未偵測到新增的指標，不需移除"
+            if total != preadd_total + 1 or unmarked != 1:
+                return f"無法確定新增的是哪一個（前 {preadd_total} 後 {total}），未自動移除，請手動檢查"
+            if not probe.get("pickedVisible"):
+                return "新增的指標被收進清單「+N」，無法自動移除，請手動刪除"
+            page = self._require_page()
+            await self._remove_indicator_by_locator(
+                page.locator(f"[{pick_attr}='1']").first,
+                title_keyword,
+            )
+            await page.wait_for_timeout(250)
+            after = await self._keyword_rows_snapshot(
+                title_keyword=title_keyword,
+                marker_attr=preadd_attr,
+            )
+            after_total = int(after.get("total", -1))
+            self._log(f"[open_or_create] rollback remove after_total={after_total}")
+            if after_total == preadd_total:
+                return "已自動移除剛新增的指標"
+            return f"移除後數量未恢復（前 {preadd_total} 現 {after_total}），請手動檢查"
+        except Exception as exc:  # noqa: BLE001
+            return f"自動移除出錯（{exc}），請手動檢查"
+        finally:
+            await self._clear_indicator_row_marker(pick_attr)
 
     async def _clear_indicator_row_marker(self, marker_attr: str) -> None:
         page = self._require_page()

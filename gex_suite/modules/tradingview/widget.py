@@ -49,6 +49,7 @@ from gex_suite.shared import config as shared_config
 from gex_suite.shared import db
 from gex_suite.shared.paths import TRADINGVIEW_LOG_DIR
 from .automator import (
+    IndicatorLegendOverflowError,
     IndicatorQuotaExceededError,
     LayoutInfo,
     PlaywrightCDPAutomator,
@@ -1709,6 +1710,19 @@ class TradingViewPage(QWidget):
             )
             rit = replace(item, preview_status=f"略過：{exc}") if dry_run else item
             return BatchResultItem(item=rit, status="skipped", message=f"skip_quota: {exc}")
+        except IndicatorLegendOverflowError as exc:
+            u = await _page_url()
+            self._log_event(
+                "error",
+                "失敗｜指標清單溢出",
+                f"週一起={monday}",
+                layout=layout_label,
+                subchart=int(sub_txt) if str(sub_txt).isdigit() else None,
+                ticker=ticker,
+                detail=f"URL={u}\nticker={ticker}\n週一起={monday}\n原因：{exc}",
+            )
+            rit = replace(item, preview_status=f"失敗：{exc}") if dry_run else item
+            return BatchResultItem(item=rit, status="failed", message=str(exc))
         except Exception as exc:  # noqa: BLE001
             u = await _page_url()
             err = str(exc).replace("\n", " ")
@@ -1824,6 +1838,13 @@ class TradingViewPage(QWidget):
             # identically, so skip the retry and surface it for manual fix.
             self._exec_log(
                 f"【略過重試】ticker={item.ticker} 週一起={item.monday}：既有指標週期不符（需手動處理，非暫態）。"
+            )
+            return result
+        if "指標清單溢出" in (result.message or ""):
+            # Pane legend folds rows into "+N" — chart state, not a UI hiccup;
+            # retrying re-hits the same guard. Needs manual legend cleanup.
+            self._exec_log(
+                f"【略過重試】ticker={item.ticker} 週一起={item.monday}：指標清單溢出（需手動整理，非暫態）。"
             )
             return result
 
