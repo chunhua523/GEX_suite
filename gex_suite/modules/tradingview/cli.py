@@ -28,6 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from gex_suite.modules.tradingview import browser_paths
 from gex_suite.shared.paths import (
     TRADINGVIEW_AUTO_PASTE_CONFIG_PATH,
     TRADINGVIEW_LAST_FAILED_PATH,
@@ -35,38 +36,17 @@ from gex_suite.shared.paths import (
 
 DEFAULT_CDP_URL = "http://127.0.0.1:9222"
 
-# Per-browser app bundle + a DEDICATED persistent CDP profile. The chain runs
-# unattended, so it needs a profile whose TradingView login survives across runs
-# (unlike the GUI's throwaway $TMPDIR/gex_tv_cdp_profile). Which browser is used
-# is driven by auto_paste_config.json -> "browser" (chrome | brave), matching
-# the GUI. The headless path historically hard-coded Brave and ignored the
-# config, so a chrome-configured user got a Brave launch with no TV login.
-_HOME = Path(os.path.expanduser("~"))
-_BROWSER_APP_PATHS = {
-    "brave": "/Applications/Brave Browser.app",
-    "chrome": "/Applications/Google Chrome.app",
-}
-# The actual executable inside each bundle. We launch this directly (not via
-# `open -na`) so the --remote-debugging-port reliably binds even when the user's
-# normal browser instance is already running.
-_BROWSER_BINARIES = {
-    "brave": "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
-    "chrome": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-}
-_BROWSER_CDP_PROFILES = {
-    "brave": _HOME / "Library/Application Support/BraveSoftware/Brave-Browser-CDP",
-    "chrome": _HOME / "Library/Application Support/Google/Google-Chrome-CDP",
-}
-_DEFAULT_BROWSER = "chrome"
+# Which browser is used is driven by auto_paste_config.json -> "browser"
+# (chrome | brave), matching the GUI. Launch, persistent CDP profile (login
+# survives runs), 50% zoom and full-screen window all live in browser_paths —
+# shared with the GUI so the two can't drift apart.
 
-# Back-compat aliases (kept so any external import keeps working).
-BRAVE_APP_PATH = _BROWSER_APP_PATHS["brave"]
-BRAVE_CDP_USER_DATA_DIR = _BROWSER_CDP_PROFILES["brave"]
+# Back-compat alias (kept so any external import keeps working).
+BRAVE_CDP_USER_DATA_DIR = browser_paths.cdp_profile_dir("brave")
 
 
 def _normalize_browser(browser: str | None) -> str:
-    b = (browser or "").strip().lower()
-    return b if b in _BROWSER_APP_PATHS else _DEFAULT_BROWSER
+    return browser_paths.normalize_browser(browser)
 
 
 def parse_args() -> argparse.Namespace:
@@ -208,104 +188,18 @@ def _kill_cdp_port_owner(port: int, wait_seconds: float = 10.0) -> bool:
     return not _listeners()
 
 
-# Chrome zoom_level for exactly 50% page zoom == log(0.5)/log(1.2). Page zoom is
-# stored per exact host, so we seed both the partition default (catch-all) and
-# the specific TradingView hosts the automation loads, so dialogs (layout list /
-# indicator settings) aren't clipped/obscured at the default 100% zoom.
-_TV_ZOOM_LEVEL = -3.8017840169239308
-_TV_ZOOM_HOSTS = ("tw.tradingview.com", "www.tradingview.com")
-
-
-def _ensure_profile_zoom(profile: Path) -> None:
-    """Pre-seed the profile's default + per-host page zoom to 50%. Chrome must be
-    closed for this to stick, so only call right before launching (i.e. when the
-    CDP probe already failed). Best-effort — never blocks the launch."""
-    pref = profile / "Default" / "Preferences"
-    try:
-        data = json.loads(pref.read_text(encoding="utf-8")) if pref.exists() else {}
-        part = data.setdefault("partition", {})
-        part.setdefault("default_zoom_level", {})["x"] = _TV_ZOOM_LEVEL
-        hosts = part.setdefault("per_host_zoom_levels", {}).setdefault("x", {})
-        for h in _TV_ZOOM_HOSTS:
-            entry = hosts.get(h) or {}
-            entry["zoom_level"] = _TV_ZOOM_LEVEL
-            entry.setdefault("last_modified", "13426082877612834")
-            hosts[h] = entry
-        pref.parent.mkdir(parents=True, exist_ok=True)
-        tmp = pref.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, separators=(",", ":"), ensure_ascii=False),
-                       encoding="utf-8")
-        os.replace(tmp, pref)
-    except Exception as exc:
-        print(f"⚠️ could not pre-seed 50% zoom in {pref}: {exc}")
-
-
-def _ensure_profile_window_fills_screen(profile: Path) -> None:
-    """Pre-seed the first window's bounds to the whole usable screen.
-
-    Chrome otherwise reopens at whatever size it was last closed (1280×720 on the
-    deploy Mac, ~2/3 of the screen). In a 6-pane layout each pane is then so
-    short that TV folds legend rows into "+N", which the paste can't read
-    (LITE 2026-10-05/06). Uses the work area Chrome itself recorded in
-    ``window_placement``; a fresh profile has none yet → skipped this run.
-    Same constraint as the zoom seed: Chrome must be closed. Best-effort."""
-    pref = profile / "Default" / "Preferences"
-    try:
-        if not pref.exists():
-            return
-        data = json.loads(pref.read_text(encoding="utf-8"))
-        wp = data.get("browser", {}).get("window_placement")
-        keys = ("work_area_left", "work_area_top", "work_area_right", "work_area_bottom")
-        if not isinstance(wp, dict) or not all(isinstance(wp.get(k), int) for k in keys):
-            return
-        target = {
-            "left": wp["work_area_left"],
-            "top": wp["work_area_top"],
-            "right": wp["work_area_right"],
-            "bottom": wp["work_area_bottom"],
-        }
-        if all(wp.get(k) == v for k, v in target.items()):
-            return
-        # maximized stays False: on macOS Chrome's "maximized" is the zoom
-        # toggle, which can flip a full-size window back to its smaller size.
-        wp.update(target, maximized=False)
-        tmp = pref.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, separators=(",", ":"), ensure_ascii=False),
-                       encoding="utf-8")
-        os.replace(tmp, pref)
-    except Exception as exc:
-        print(f"⚠️ could not pre-seed window bounds in {pref}: {exc}")
-
-
 def _launch_browser_cdp(browser: str, port: int) -> None:
-    """Start the configured browser with remote debugging on a dedicated,
-    persistent user-data-dir (so the TradingView login survives across runs).
+    """Cold-start the configured browser via the shared launcher (same persistent
+    CDP profile / 50% zoom / full-screen window as the GUI's "啟動 9222").
 
-    Launches the binary directly (not ``open -na``) so the debug port reliably
-    binds even when the user's normal browser is already running — this is what
-    lets _ensure_cdp re-open a closed CDP browser on demand. start_new_session
-    detaches it so it outlives this CLI process and is reusable across steps."""
+    No landing URL — the batch navigates to each layout itself. The launcher
+    detaches the browser (start_new_session) so it outlives this CLI process
+    and is reusable across steps."""
     browser = _normalize_browser(browser)
-    binary = _BROWSER_BINARIES[browser]
-    profile = _BROWSER_CDP_PROFILES[browser]
-    profile.mkdir(parents=True, exist_ok=True)
-    _ensure_profile_zoom(profile)  # Chrome is down here (probe failed) → safe to write Preferences
-    _ensure_profile_window_fills_screen(profile)
-    if not Path(binary).exists():
-        raise SystemExit(f"❌ {browser} binary not found at {binary}")
-    cmd = [
-        binary,
-        f"--remote-debugging-port={port}",
-        "--remote-debugging-address=127.0.0.1",
-        f"--user-data-dir={profile}",
-    ]
+    profile = browser_paths.cdp_profile_dir(browser)
     print(f"🚀 launching {browser} (CDP profile {profile.name})")
-    subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    if browser_paths.launch_cdp_browser(browser, urls=[], port=port) is None:
+        raise SystemExit(f"❌ {browser} binary not found")
 
 
 def _ensure_cdp(cdp_url: str, *, browser: str, auto_launch: bool,
@@ -528,7 +422,7 @@ def main() -> int:
     config = _load_config()
     cdp_url = (args.cdp_url or config.get("cdp_url") or DEFAULT_CDP_URL).rstrip("/")
     browser = _normalize_browser(args.browser or config.get("browser"))
-    print(f"🌐 browser={browser} (CDP profile {_BROWSER_CDP_PROFILES[browser].name})")
+    print(f"🌐 browser={browser} (CDP profile {browser_paths.cdp_profile_dir(browser).name})")
     try:
         port = int(cdp_url.rsplit(":", 1)[1].split("/")[0])
     except Exception:

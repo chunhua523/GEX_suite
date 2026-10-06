@@ -215,8 +215,8 @@ widget.py 搬出的共用件）。一組＝一視窗、組內版面＝分頁；A
 - app 未帶 debug port 時 `ensure_app_cdp` 會自動 quit（Apple Event）＋
   `open -a … --args --remote-debugging-port=9333` 重啟；視窗分頁由 app 自行還原。
 
-**瀏覽器模式**：同 `--user-data-dir`（`$TMPDIR/gex_tv_cdp_profile`）argv
-forwarding —— `Popen([bin, --user-data-dir=…, --new-window, url1, url2…])` 由
+**瀏覽器模式**：同 `--user-data-dir`（`browser_paths.cdp_profile_dir(kind)`，
+與 CLI 共用的持久 profile）argv forwarding —— `Popen([bin, --user-data-dir=…, --new-window, url1, url2…])` 由
 既有 instance 開一個新視窗、URL 依序成分頁；冷啟補 9222 debug 旗標＋
 `--no-first-run`。不可用 Playwright `ctx.new_page()`（tab 會落在既有視窗）。
 **9222 已被別的 instance 佔住時，`launch_cdp_browser` 不會冷啟第二個**（第二
@@ -225,6 +225,25 @@ forwarding —— `Popen([bin, --user-data-dir=…, --new-window, url1, url2…]
 「分頁落在該 instance 最後使用的視窗」。
 
 CLI 探測（不開 GUI）：`python -m gex_suite.modules.tradingview.app_launcher <url>…`。
+
+## GUI／CLI 同步原則（Jeff 2026-10-06 明確要求）
+
+**任何修正都要讓 GUI 與 CLI（每日排程）兩邊同步**——同一個行為只准有一份實作，
+兩邊呼叫它；不准只改一邊。
+
+- **瀏覽器（9222 CDP）**：冷啟、持久 profile（Mac＝`~/Library/Application
+  Support/Google/Google-Chrome-CDP`，非 Mac＝`~/.gex_suite/<kind>-cdp-profile`）、
+  50% 縮放、滿螢幕視窗全在 `browser_paths.launch_cdp_browser`；GUI「啟動 9222」、
+  版面分組、`cli._launch_browser_cdp` 都走它。改瀏覽器設定只改 `browser_paths`。
+  `tools/gex_chain/preflight.py` 另抄一份 Mac profile 路徑（刻意不 import
+  gex_suite），改路徑要兩處一起改。
+- **批次流程**：CLI 本來就重用 widget 的 `_phase_b_scan_flow`，修 paste 邏輯改
+  widget／automator 即兩邊生效；不要在 cli.py 另寫分支。
+- **刻意只在一邊的**要在程式註解＋本檔寫明原因（現有：watchdog 半死瀏覽器防線
+  只在 CLI——GUI 有人看著；CLI 收尾關瀏覽器、GUI 不關）。
+- 驗收：改到瀏覽器設定時，兩條路各開一次 Chrome 比對 user-data-dir／視窗／
+  `devicePixelRatio`／TV `sessionid`（2026-10-06 做法見
+  `agent-memory/feedback_gui_cli_sync.md`）。
 
 ## Stop button (Preview / Scan / Cleanup)
 
@@ -255,6 +274,7 @@ CLI 探測（不開 GUI）：`python -m gex_suite.modules.tradingview.app_launch
 - Don't add Chinese layout markers (the design is English-only now).
 - Don't migrate existing DB rows when changing the importer suffix logic — only new imports get the `1!` suffix; legacy rows stay as-is. (唯一例外：2026-07-29 Jeff 指名把 `TXO1!` 裸名化為 `TXO`，450 rows 已同步 UPDATE。)
 - Don't add a `merge equity into futures` fallback — the user wants strict separation between modes so they can compare side-by-side.
+- Don't fix GUI and CLI separately — one implementation, both call it (see 「GUI／CLI 同步原則」). Don't reintroduce a `$TMPDIR` CDP profile for the GUI: macOS cleans it → no TV login, and it diverged from the CLI's zoom/window (2026-10-06).
 - Don't reintroduce substring rules into `_symbols_compatible` / `_symbol_matches_ticker` — `"SOX" in "SOXX"` made the subchart drift guard pass on the wrong pane and SOXX data was pasted onto the SOX chart daily (2026-08-12). Tail-equality (`NASDAQ:SOXX` ≡ `SOXX`) is the only allowed loosening.
 
 ## Testing

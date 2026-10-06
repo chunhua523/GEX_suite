@@ -1,4 +1,10 @@
-"""Chrome/Brave 定位與 9222 CDP 瀏覽器啟動（shared by paste + 版面分組）."""
+"""Chrome/Brave 定位與 9222 CDP 瀏覽器啟動 —— **唯一一份**。
+
+GUI（批次貼上「啟動 9222」、版面分組）與每日排程 CLI（``cli.py``）都從這裡
+冷啟同一個持久 profile，登入、50% 縮放、滿螢幕視窗兩邊一致。瀏覽器設定的任何
+修正只准改這裡；不要在 cli／widget／groups_tab 各自加（2026-10-06：GUI 原本用
+$TMPDIR 拋棄式 profile → 沒登入、100% 縮放、預設視窗大小，和 CLI 對不上）。
+"""
 from __future__ import annotations
 
 import json
@@ -6,14 +12,31 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 from urllib import request
 
-CDP_PROFILE_DIRNAME = "gex_tv_cdp_profile"
 DEFAULT_CDP_PORT = 9222
 _DEFAULT_LANDING_URL = "https://tw.tradingview.com/chart/"
+
+# Persistent CDP profile per browser (TradingView login survives runs/reboots).
+# tools/gex_chain/preflight.py keeps a duplicated copy of the macOS paths
+# (it stays gex_suite-free) — change both together.
+_DARWIN_CDP_PROFILES = {
+    "chrome": Path.home() / "Library/Application Support/Google/Google-Chrome-CDP",
+    "brave": Path.home() / "Library/Application Support/BraveSoftware/Brave-Browser-CDP",
+}
+
+# Chrome zoom_level for exactly 50% page zoom == log(0.5)/log(1.2). Page zoom is
+# stored per exact host, so we seed both the partition default (catch-all) and
+# the specific TradingView hosts the automation loads, so dialogs (layout list /
+# indicator settings) aren't clipped/obscured at the default 100% zoom.
+_TV_ZOOM_LEVEL = -3.8017840169239308
+_TV_ZOOM_HOSTS = ("tw.tradingview.com", "www.tradingview.com")
+
+
+def normalize_browser(browser_type: str | None) -> str:
+    return "brave" if str(browser_type or "").strip().lower() == "brave" else "chrome"
 
 
 def find_browser(browser_type: str) -> str | None:
@@ -22,10 +45,74 @@ def find_browser(browser_type: str) -> str | None:
     )
 
 
-def cdp_profile_dir() -> Path:
-    profile_dir = Path(tempfile.gettempdir()) / CDP_PROFILE_DIRNAME
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    return profile_dir
+def cdp_profile_dir(browser_type: str = "chrome") -> Path:
+    """The shared persistent CDP ``--user-data-dir`` (pure; doesn't create it)."""
+    kind = normalize_browser(browser_type)
+    if sys.platform == "darwin":
+        return _DARWIN_CDP_PROFILES[kind]
+    return Path.home() / ".gex_suite" / f"{kind}-cdp-profile"
+
+
+def _write_prefs(pref: Path, data: dict) -> None:
+    pref.parent.mkdir(parents=True, exist_ok=True)
+    tmp = pref.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, separators=(",", ":"), ensure_ascii=False),
+                   encoding="utf-8")
+    os.replace(tmp, pref)
+
+
+def seed_profile_zoom(profile: Path) -> None:
+    """Pre-seed the profile's default + per-host page zoom to 50%. Chrome must be
+    closed for this to stick, so only call right before a cold launch.
+    Best-effort — never blocks the launch."""
+    pref = profile / "Default" / "Preferences"
+    try:
+        data = json.loads(pref.read_text(encoding="utf-8")) if pref.exists() else {}
+        part = data.setdefault("partition", {})
+        part.setdefault("default_zoom_level", {})["x"] = _TV_ZOOM_LEVEL
+        hosts = part.setdefault("per_host_zoom_levels", {}).setdefault("x", {})
+        for h in _TV_ZOOM_HOSTS:
+            entry = hosts.get(h) or {}
+            entry["zoom_level"] = _TV_ZOOM_LEVEL
+            entry.setdefault("last_modified", "13426082877612834")
+            hosts[h] = entry
+        _write_prefs(pref, data)
+    except Exception as exc:
+        print(f"⚠️ could not pre-seed 50% zoom in {pref}: {exc}")
+
+
+def seed_profile_window_fills_screen(profile: Path) -> None:
+    """Pre-seed the first window's bounds to the whole usable screen.
+
+    Chrome otherwise reopens at whatever size it was last closed (1280×720 on the
+    deploy Mac, ~2/3 of the screen). In a 6-pane layout each pane is then so
+    short that TV folds legend rows into "+N", which the paste can't read
+    (LITE 2026-10-05/06). Uses the work area Chrome itself recorded in
+    ``window_placement``; a fresh profile has none yet → skipped this launch.
+    Same constraint as the zoom seed: Chrome must be closed. Best-effort."""
+    pref = profile / "Default" / "Preferences"
+    try:
+        if not pref.exists():
+            return
+        data = json.loads(pref.read_text(encoding="utf-8"))
+        wp = data.get("browser", {}).get("window_placement")
+        keys = ("work_area_left", "work_area_top", "work_area_right", "work_area_bottom")
+        if not isinstance(wp, dict) or not all(isinstance(wp.get(k), int) for k in keys):
+            return
+        target = {
+            "left": wp["work_area_left"],
+            "top": wp["work_area_top"],
+            "right": wp["work_area_right"],
+            "bottom": wp["work_area_bottom"],
+        }
+        if all(wp.get(k) == v for k, v in target.items()):
+            return
+        # maximized stays False: on macOS Chrome's "maximized" is the zoom
+        # toggle, which can flip a full-size window back to its smaller size.
+        wp.update(target, maximized=False)
+        _write_prefs(pref, data)
+    except Exception as exc:
+        print(f"⚠️ could not pre-seed window bounds in {pref}: {exc}")
 
 
 def launch_cdp_browser(
@@ -34,10 +121,15 @@ def launch_cdp_browser(
     urls: list[str] | None = None,
     port: int = DEFAULT_CDP_PORT,
 ) -> str | None:
-    """以持久 CDP profile 冷啟瀏覽器（帶 --no-first-run，供自動化情境）.
+    """以共用持久 CDP profile 冷啟瀏覽器（GUI 與 CLI 同一條）.
 
     Returns the binary path used, or ``None`` if no browser executable found.
     不等待 9222 就緒 — 呼叫端視需要接 :func:`wait_cdp_ready`。
+
+    ``urls=None`` 開 TradingView 落地頁；``urls=[]`` 不帶任何網址（CLI：之後
+    自己導航到版面）。冷啟前先寫入 50% 縮放＋滿螢幕視窗（Chrome 關著才寫得進）。
+    ``start_new_session``：脫離呼叫端的 process group，chain 收尾 killpg 時
+    不會連瀏覽器一起殺（CLI 原本就這樣，GUI 一併比照）。
 
     port 已被佔用時**不冷啟第二個 instance**：第二個綁不到 127.0.0.1:port，
     Chrome 會默默改綁 [::1]:port —— 看起來是 CDP 瀏覽器、也能登入，但 paste
@@ -45,7 +137,7 @@ def launch_cdp_browser(
     真 9222 仍未登入）。改為在既有 instance 逐一開分頁（URL 會落在該 instance
     最後使用的視窗，不另開新視窗）。
     """
-    targets = list(urls) if urls else [_DEFAULT_LANDING_URL]
+    targets = [_DEFAULT_LANDING_URL] if urls is None else list(urls)
     if cdp_ready(port):
         for url in targets:
             cdp_open_tab(url, port)
@@ -53,17 +145,26 @@ def launch_cdp_browser(
     path = find_browser(browser_type)
     if not path:
         return None
+    profile = cdp_profile_dir(browser_type)
+    profile.mkdir(parents=True, exist_ok=True)
+    seed_profile_zoom(profile)
+    seed_profile_window_fills_screen(profile)
     args = [
         path,
         f"--remote-debugging-port={port}",
         "--remote-debugging-address=127.0.0.1",
-        f"--user-data-dir={cdp_profile_dir()}",
+        f"--user-data-dir={profile}",
         "--no-first-run",
         "--no-default-browser-check",
         "--new-window",
         *targets,
     ]
-    subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.Popen(
+        args,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
     return path
 
 

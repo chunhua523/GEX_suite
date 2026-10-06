@@ -876,7 +876,7 @@ class LayoutGroupsTab(QWidget):
                 subprocess.Popen(
                     [
                         browser_path,
-                        f"--user-data-dir={browser_paths.cdp_profile_dir()}",
+                        f"--user-data-dir={browser_paths.cdp_profile_dir(kind)}",
                         "--new-window",
                         *urls,
                     ],
