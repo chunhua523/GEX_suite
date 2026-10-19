@@ -47,6 +47,11 @@ class AliasLookupTests(unittest.TestCase):
         self.assertEqual(sr.alias_lookup(""), (None, None))
         self.assertEqual(sr.alias_lookup(None), (None, None))
 
+    def test_mym1_micro_maps_to_full_size_like_mnq(self) -> None:
+        self.assertEqual(sr.resolve_target_ticker("CBOT_MINI:MYM1!", layout_mode="futures"), ("YM1!", True))
+        self.assertEqual(sr.resolve_target_ticker("CBOT_MINI:MYM1!", layout_mode="equity"), ("DIA", True))
+        self.assertEqual(sr.candidate_db_tickers("CBOT_MINI:MYM1!"), {"YM1!", "DIA"})
+
     def test_ym1_is_now_explicit_with_dia(self) -> None:
         entry, source = sr.alias_lookup("CBOT_MINI:YM1!")
         self.assertEqual(source, "explicit")
@@ -132,6 +137,30 @@ class ChainCandidateTests(unittest.TestCase):
         self.assertEqual(sr.candidate_db_tickers("ES1!-SPX500"), set())
         self.assertEqual(sr.candidate_db_tickers(""), set())
         self.assertEqual(sr.candidate_db_tickers(None), set())
+
+
+class SubchartRosterTests(unittest.TestCase):
+    """【子圖清單】文字：列舉結果 vs 快取（2026-10-19 FDBJmrgA #2 案例）。"""
+
+    def test_roster_reports_mismatch_and_suspect(self) -> None:
+        from gex_suite.modules.tradingview.automator import SubChartInfo
+        from gex_suite.modules.tradingview.widget import TradingViewPage
+
+        subs = [
+            SubChartInfo(0, "ZN1!"),
+            SubChartInfo(1, "ZT1!"),
+            SubChartInfo(2, "ZN1!", suspect_duplicate=True),
+            SubChartInfo(3, "ZB1!"),
+        ]
+        text = TradingViewPage._subchart_roster_text(subs, ["ZN1!", "ZT1!", "ZF1!", "ZB1!"])
+        self.assertIn("#2 ZN1!（可疑重複）", text)
+        self.assertIn("與快取不一致（#2 快取=ZF1!）", text)
+        ok = TradingViewPage._subchart_roster_text(
+            [SubChartInfo(0, "CBOT:ZN1!"), SubChartInfo(1, "ZT1!")], ["ZN1!", "ZT1!"]
+        )
+        self.assertTrue(ok.endswith("｜與快取一致"))
+        self.assertTrue(TradingViewPage._subchart_roster_text(subs, []).endswith("｜無快取可比對"))
+        self.assertIn("數量不同", TradingViewPage._subchart_roster_text(subs[:2], ["ZN1!", "ZT1!", "ZF1!"]))
 
 
 class WidgetDelegationTests(unittest.TestCase):

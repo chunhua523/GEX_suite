@@ -69,6 +69,8 @@ DB lookup still uses `item.monday` (the trading week's Monday). Only the TV-side
 
 `matched_keys_in_layout` stores `(chosen.upper(), layout_mode)`. This allows the same symbol to be processed multiple times in a single layout under different modes (e.g. `ES1! [equity] + ES1! [index]` runs both). Don't revert this to a plain symbol set.
 
+**Duplicate read ≠ duplicate pane (2026-10-19, FDBJmrgA #2 read as #0's ZN1!)**: `activate_subchart` used to dispatch a synthetic MouseEvent with no coordinates (clientX/Y = 0,0), so when TradingView resolves the active chart by position the click lands on the top-left pane #0 — root cause of 06-23 "every pane read AAPL", 08-12 SOX/SOXX swap and 10-19. Now: `activate_subchart` does a **real `page.mouse.click`** at 45%/62% of the pane rect (synthetic + locator click are fallbacks); `automator.reactivate_and_read(idx, baseline=…, attempts=…)` is the single re-activate-and-re-read entry used by enumeration (`SubChartInfo.suspect_duplicate`) and the paste loop; a `(symbol, mode)` already read in this layout triggers up to 3 re-reads, then the **layout cache (`layout_list.json`, loaded once per run via `_load_cached_subcharts`) arbitrates**: cache says same → `【略過｜重複】`, cache differs/absent → `【失敗｜子圖讀取】` + `cache_entry["suspect"]=True` (layout not written back). `_read_subchart_symbol_with_retry` no longer returns the enumeration value when the header is *stable* on another symbol (that pasted onto the wrong active pane); it re-activates once and then trusts the header (`【子圖｜與列舉不符】`).
+
 There is no cross-layout dedup. A previous version had `seen_runtime_keys` that prevented the same `(ticker, monday, symbol)` from being processed in a second layout. **This was a bug** and has been removed — each layout's subcharts must be processed independently because TV-side state (the indicator on that particular chart) is per-layout.
 
 ### CME importer suffix logic ([importers.py](gex_suite/modules/chart/importers.py))
@@ -123,7 +125,11 @@ Every silent `continue` in `_phase_b_scan_flow` should produce a log line. Curre
 | `【alias｜隱含】` | info, not a skip — `1!` symbol not in `FUTURES_ALIAS_MAP`, futures mode uses its own tail as DB ticker |
 | `【略過｜alias 缺項】` | Symbol is in `FUTURES_ALIAS_MAP` (or an implicit `1!` futures symbol) but the resolved mode has no mapping; implicit → reason says 補表 |
 | `【略過｜未匹配】` | Symbol can't be parsed to a ticker (or scope=ticker mismatch and not an alias) |
-| `【略過｜重複】` | `(chosen, layout_mode)` already processed in this layout |
+| `【略過｜重複】` | `(chosen, layout_mode)` already processed in this layout **and the layout cache says this pane really is the same symbol** (GLD×2) |
+| `【失敗｜子圖讀取】` | (error, counts as failed → `last_scan_failed` → chain auto-retry) pane read a symbol already processed in this layout, 3 real-click re-reads didn't change it, and the cache says the pane should differ (or no cache); the layout's subchart list is **not** written to the cache |
+| `【子圖清單】` | (info) per-layout enumeration result `#0 ZN1! #1 ZT1! …` + `與快取一致／不一致（#2 快取=ZF1!）／無快取可比對`; tells enumeration-time vs paste-time misreads apart |
+| `【子圖｜重讀】` | (info) duplicate read corrected by a real-click re-activation |
+| `【子圖｜與列舉不符】` | (info) header stayed on a different symbol than the enumeration said; the header (= active chart) wins instead of silently trusting the enumeration |
 | `【略過｜資料庫】` | `db.fetch_tv_codes_for_week()` returned all-None (DB missing ticker or week) |
 | `【略過｜快取】` | Cache scan shows the week's fillable cells already have values |
 | `【預覽｜快取】` | Cache scan shows partial fill needed (dry-run only) |
@@ -244,6 +250,7 @@ CLI 探測（不開 GUI）：`python -m gex_suite.modules.tradingview.app_launch
 | 半死判斷／砍瀏覽器／重啟 | `browser_paths.cdp_ws_responsive`／`kill_cdp_browser`／`respawn_cdp_browser` | ensure、CLI watchdog hook、CLI 整輪重試 |
 | profile 路徑、瀏覽器名正規化、CDP probe／開分頁／殭屍自癒 | `browser_paths.*` | 全部；`tools/gex_chain/preflight.py` 用**檔案路徑載入** browser_paths（不經 package `__init__`，那會載入 Qt）→ browser_paths 匯入期只准用標準函式庫 |
 | 子圖 symbol → DB ticker（明確 alias 表、「1!」隱含 alias、ticker 抽取、公式圖判斷、scope=ticker 比對） | `symbol_resolve.*`（`resolve_target_ticker`／`alias_lookup`／`candidate_db_tickers`） | GUI／CLI 批次掃描（`TradingViewPage` 轉呼叫）、`tools/gex_chain/run.py` 挑補貼版面 |
+| 子圖 activation（真實座標點擊）＋重新 activate 重讀 | `automator.activate_subchart`／`reactivate_and_read` | 列舉 `_enumerate_subcharts_once`、widget 三個貼圖前讀取、重複重讀、整理流程 |
 | 設定 → BatchOptions | `engine.batch_options_from_config` | GUI `_build_batch_options`（GUI 欄位疊在設定檔上）、CLI `_build_options`（設定檔＋命令列） |
 | GUI 欄位 ↔ 設定檔 key | `widget._ui_tv_settings` | GUI 存設定、GUI 組參數 |
 | 讀／寫 auto_paste_config.json | `shared.config.load_tradingview_config`／`save_tradingview_config`（**合併到原檔**，不再從預設重建——舊版會洗掉 GUI 上沒有的 key） | GUI、CLI、automator |
@@ -289,6 +296,7 @@ CLI 探測（不開 GUI）：`python -m gex_suite.modules.tradingview.app_launch
 - Don't migrate existing DB rows when changing the importer suffix logic — only new imports get the `1!` suffix; legacy rows stay as-is. (唯一例外：2026-07-29 Jeff 指名把 `TXO1!` 裸名化為 `TXO`，450 rows 已同步 UPDATE。)
 - Don't add a `merge equity into futures` fallback — the user wants strict separation between modes so they can compare side-by-side.
 - Don't fix GUI and CLI separately, and don't write a second copy of anything in the 「GUI／CLI 同步原則」 table — one implementation, both call it. Don't reintroduce a `$TMPDIR` CDP profile for the GUI: macOS cleans it → no TV login, and it diverged from the CLI's zoom/window (2026-10-06).
+- Don't go back to synthetic-MouseEvent-only activation in `activate_subchart`, and don't make `_read_subchart_symbol_with_retry` silently return the enumeration value when the header is stable on another symbol — both pasted onto the wrong pane (2026-10-19). Don't resolve a duplicate read by stripping/renaming; the layout cache is the arbiter.
 - Don't reintroduce substring rules into `_symbols_compatible` / `_symbol_matches_ticker` — `"SOX" in "SOXX"` made the subchart drift guard pass on the wrong pane and SOXX data was pasted onto the SOX chart daily (2026-08-12). Tail-equality (`NASDAQ:SOXX` ≡ `SOXX`) is the only allowed loosening.
 
 ## Testing

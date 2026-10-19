@@ -2505,6 +2505,7 @@ class TradingViewPage(QWidget):
                     search_symbol = await self._read_subchart_symbol_with_retry(
                         automator,
                         expected_symbol=sub.symbol,
+                        subchart_index=sub.index,
                     )
                     if self._is_formula_symbol(search_symbol):
                         continue
@@ -2618,6 +2619,8 @@ class TradingViewPage(QWidget):
 
             # 版面分組快取：url -> {name, subcharts, complete}，流程結尾 flush。
             cache_entries: dict[str, dict] = {}
+            # 上次掃描的子圖清單（layout_list.json）：子圖讀取重複時的裁判（2026-10-19）
+            cached_subcharts_by_url = self._load_cached_subcharts()
 
             for layout_idx, layout in enumerate(layouts):
                 try:
@@ -2717,6 +2720,14 @@ class TradingViewPage(QWidget):
                             ),
                         )
                     matched_keys_in_layout: set[tuple[str, str]] = set()
+                    read_keys_in_layout: set[tuple[str, str]] = set()
+                    cached_list = cached_subcharts_by_url.get(
+                        layout_groups_mod.normalize_chart_url(
+                            layout.url or str(post.get("url") or "") or ""
+                        )
+                        or "",
+                        [],
+                    )
                     subcharts = await self._enumerate_subcharts_with_retry(
                         automator,
                         label=layout.name,
@@ -2734,6 +2745,9 @@ class TradingViewPage(QWidget):
                             url=str(post.get("url") or "—"),
                             subchart_count=len(subcharts),
                         )
+                    if subcharts:
+                        # 列舉結果直接進 log：下次出事能分辨是列舉錯還是貼圖時讀錯（2026-10-19）
+                        self._exec_log(self._subchart_roster_text(subcharts, cached_list))
                     if not subcharts:
                         self._exec_log(
                             f"【警告】版面「{layout.name}」無法取得子圖清單"
@@ -2755,11 +2769,75 @@ class TradingViewPage(QWidget):
                                 "【中止】偵測到版面已變更（預期與實際不符），停止此版面後續子圖。"
                             )
                             break
+                        layout_mode = self._resolve_layout_mode_for_subchart(
+                            layout.name, sub.index
+                        )
                         await automator.activate_subchart(sub.index)
                         search_symbol = await self._read_subchart_symbol_with_retry(
                             automator,
                             expected_symbol=sub.symbol,
+                            subchart_index=sub.index,
                         )
+                        # 同版面同模式已讀過同一 symbol＝多半 activation 沒落在這格（2026-10-19
+                        # FDBJmrgA #2 讀成 #0 的 ZN1!）。真實點擊重讀最多 3 次；仍重複 → 由上次掃描
+                        # 的快取裁判：快取說這格本來就是同一個 → 走後面【略過｜重複】；快取說不同
+                        #（或沒快取）→ 記【失敗｜子圖讀取】進失敗清單（chain 會補掃）、不寫快取。
+                        read_key = (search_symbol.upper(), layout_mode) if search_symbol else None
+                        if read_key and read_key in read_keys_in_layout:
+                            reread = await automator.reactivate_and_read(
+                                sub.index, baseline=search_symbol, attempts=3
+                            )
+                            if reread and reread.upper() != search_symbol.upper():
+                                self._exec_log(
+                                    f"【子圖｜重讀】#{sub.index} 原讀 {search_symbol} → {reread}"
+                                    "（真實點擊重新 activate 後工具列已變）"
+                                )
+                                search_symbol = reread
+                                read_key = (search_symbol.upper(), layout_mode)
+                        if read_key and read_key in read_keys_in_layout:
+                            cached_sym = cached_list[sub.index] if sub.index < len(cached_list) else ""
+                            if not (cached_sym and self._symbols_compatible(cached_sym, search_symbol)):
+                                u = str(post.get("url") or "—")
+                                reason = f"快取記錄此格為 {cached_sym}" if cached_sym else "無快取可比對"
+                                self._log_event(
+                                    "error",
+                                    "失敗｜子圖讀取",
+                                    f"#{sub.index} 讀到 {search_symbol}，與同版面前面子圖重複（{reason}）",
+                                    layout=layout.name,
+                                    subchart=sub.index,
+                                    ticker=search_symbol,
+                                    detail=(
+                                        f"URL={u}\n圖上={search_symbol}\n模式={layout_mode}\n"
+                                        f"列舉={sub.symbol or '—'}\n快取={cached_sym or '—'}\n"
+                                        "原因：真實點擊重讀 3 次，工具列仍是同版面已處理過的 symbol——"
+                                        "activation 沒落在這格或列舉錯格；此版面子圖清單不寫入快取，"
+                                        "整輪以失敗計（chain auto-retry 會補掃此版面）"
+                                    ),
+                                )
+                                results.append(
+                                    BatchResultItem(
+                                        item=WorkItem(
+                                            ticker=search_symbol,
+                                            monday=mondays[0],
+                                            codes={},
+                                            available_days=[],
+                                            layout_id=layout.id,
+                                            layout_name=layout.name,
+                                            subchart_index=sub.index,
+                                            subchart_symbol=search_symbol,
+                                            chart_url=str(post.get("url") or "") or None,
+                                        ),
+                                        status="failed",
+                                        message=(
+                                            f"失敗｜子圖讀取：#{sub.index} 重複讀到 {search_symbol}（{reason}）"
+                                        ),
+                                    )
+                                )
+                                if cache_entry is not None:
+                                    cache_entry["suspect"] = True
+                                continue
+                        if read_key:
+                            read_keys_in_layout.add(read_key)
                         if search_symbol:
                             seen_symbols.add(search_symbol)
                         if cache_entry is not None:
@@ -2781,9 +2859,6 @@ class TradingViewPage(QWidget):
                                 ),
                             )
                             continue
-                        layout_mode = self._resolve_layout_mode_for_subchart(
-                            layout.name, sub.index
-                        )
                         target_ticker, is_futures_alias = self._resolve_target_ticker_for_subchart(
                             search_symbol, opts, layout_mode=layout_mode
                         )
@@ -3535,6 +3610,39 @@ class TradingViewPage(QWidget):
         return entry
 
     @staticmethod
+    def _load_cached_subcharts() -> dict[str, list[str]]:
+        """layout_list.json 的 url → 子圖標題清單（讀失敗回空 dict，不擋流程）."""
+        try:
+            state = layout_groups_mod.load_layout_groups()
+        except Exception:
+            return {}
+        return {l.url: list(l.subcharts or []) for l in state.scanned_layouts if l.url}
+
+    @classmethod
+    def _subchart_roster_text(cls, subcharts: list, cached: list[str]) -> str:
+        """【子圖清單】一行：本輪列舉結果＋與上次快取的比對（純函式，可測）."""
+        parts = [
+            f"#{s.index} {s.symbol or '—'}"
+            + ("（可疑重複）" if getattr(s, "suspect_duplicate", False) else "")
+            for s in subcharts
+        ]
+        if not cached:
+            verdict = "無快取可比對"
+        else:
+            mism = [
+                f"#{i} 快取={c}"
+                for i, (s, c) in enumerate(zip(subcharts, cached))
+                if s.symbol and c and not cls._symbols_compatible(c, s.symbol)
+            ]
+            if mism:
+                verdict = "與快取不一致（" + "；".join(mism) + "）"
+            elif len(cached) == len(subcharts):
+                verdict = "與快取一致"
+            else:
+                verdict = f"與快取數量不同（快取 {len(cached)}、本輪 {len(subcharts)}）"
+        return "【子圖清單】" + "  ".join(parts) + f"｜{verdict}"
+
+    @staticmethod
     def _subchart_title(search_symbol: str | None, fallback: str | None) -> str:
         return layout_groups_mod.subchart_title(search_symbol or fallback or "")
 
@@ -3558,8 +3666,13 @@ class TradingViewPage(QWidget):
                     url=url,
                     layout_id=layout_groups_mod.chart_id_from_url(url),
                     source="scan",
-                    # 子圖迴圈沒跑完的版面不覆蓋舊子圖清單（留空 → 沿用快取）。
-                    subcharts=list(entry["subcharts"]) if entry["complete"] else [],
+                    # 子圖迴圈沒跑完、或有子圖讀取可疑（重複且與快取不符）的版面，不覆蓋
+                    # 舊子圖清單（留空 → 沿用快取）。
+                    subcharts=(
+                        list(entry["subcharts"])
+                        if entry["complete"] and not entry.get("suspect")
+                        else []
+                    ),
                 )
                 for url, entry in cache_entries.items()
             ]
@@ -3673,6 +3786,7 @@ class TradingViewPage(QWidget):
                 search_symbol = await self._read_subchart_symbol_with_retry(
                     automator,
                     expected_symbol=sub.symbol,
+                    subchart_index=sub.index,
                 )
                 if search_symbol:
                     seen_symbols.add(search_symbol)
@@ -3744,20 +3858,42 @@ class TradingViewPage(QWidget):
         expected_symbol: str | None,
         retries: int = 3,
         delay_sec: float = 0.18,
+        subchart_index: int | None = None,
     ) -> str | None:
-        """Read symbol after subchart activation with hydration retries."""
+        """Read symbol after subchart activation with hydration retries.
+
+        工具列值跟列舉值（``expected_symbol``）相容 → 回工具列值。
+        工具列穩定顯示另一個 symbol（每次都一樣）→ 不再直接相信列舉值（舊版會回列舉值，
+        等於把指標貼到別格還以為是對的，2026-10-19）：有 ``subchart_index`` 就真實點擊
+        重新 activate 一次再讀，仍穩定不同 → 相信工具列（它才代表 active chart），並印
+        【子圖｜與列舉不符】。工具列空白／跳動 → 退回列舉值（原行為）。
+        """
         fallback = (expected_symbol or "").strip()
-        last: str | None = None
+        reads: list[str] = []
         for _ in range(retries + 1):
             current = (await automator.get_symbol_search_value() or "").strip()
             if current:
-                if fallback and self._symbols_compatible(fallback, current):
+                if not fallback or self._symbols_compatible(fallback, current):
                     return current
-                if not fallback:
-                    return current
-                last = current
+                reads.append(current)
             await asyncio.sleep(delay_sec)
+        if len(reads) >= max(2, retries) and len(set(reads)) == 1:
+            stable = reads[0]
+            final = stable
+            if subchart_index is not None:
+                reread = await automator.reactivate_and_read(
+                    subchart_index, baseline=stable, attempts=1
+                )
+                if reread and self._symbols_compatible(fallback, reread):
+                    return reread
+                final = reread or stable
+            self._exec_log(
+                f"【子圖｜與列舉不符】#{subchart_index if subchart_index is not None else '?'} "
+                f"列舉={fallback} 工具列={final}，以工具列（active chart）為準"
+            )
+            return final
         # If header symbol is still unstable/blank, trust subchart enumeration value.
         if fallback:
             return fallback
-        return last
+        return reads[-1] if reads else None
+

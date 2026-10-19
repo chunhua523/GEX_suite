@@ -46,6 +46,7 @@ FUTURES_ALIAS_MAP: dict[str, AliasEntry] = {
     # Micro contracts Jeff charts instead of the full-size ones — paste the
     # full-size contract's DB data (scrape/import side still NQ/GC).
     "MNQ1!": {"futures": "NQ1!",  "equity": "QQQ",  "index": "NDX"},
+    "MYM1!": {"futures": "YM1!",  "equity": "DIA",  "index": None},  # Jeff 10-19 把 YM1! 圖換成 Micro Dow
 
     # Precious metals (no broadly-tracked option-bearing index → index=None)
     "GC1!":  {"futures": "GC1!",  "equity": "GLD",  "index": None},

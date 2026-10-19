@@ -68,6 +68,9 @@ class LayoutInfo:
 class SubChartInfo:
     index: int
     symbol: str | None = None
+    # 列舉時與前面子圖讀到同一 symbol、真實點擊重讀仍不變（2026-10-19）：widget 貼圖前
+    # 會再重讀並由版面快取裁判是真重複（GLD 兩格）還是 activation 沒落在這格。
+    suspect_duplicate: bool = False
 
 
 @dataclass
@@ -1741,16 +1744,28 @@ class PlaywrightCDPAutomator(TVAutomator):
             waited += interval_ms
 
     async def _reread_symbol_settled(self, idx: int, *, fallback: str | None) -> str | None:
-        """Re-activate pane ``idx`` and re-read its symbol change-aware.
+        """舊名保留：等同 ``reactivate_and_read(idx, baseline=fallback, attempts=1)``。"""
+        return await self.reactivate_and_read(idx, baseline=fallback, attempts=1)
 
-        Used to disambiguate a *suspicious duplicate* — a pane that read the
-        same symbol as an earlier pane, which may be a stale header read (the
-        active-chart switch hadn't propagated yet). A genuine duplicate settles
-        back to ``fallback`` unchanged; a stale one corrects to the pane's true
-        symbol once the re-activation lands.
+    async def reactivate_and_read(
+        self, idx: int, *, baseline: str | None, attempts: int = 3
+    ) -> str | None:
+        """Re-activate pane ``idx``（真實滑鼠點擊）並 change-aware 重讀工具列 symbol。
+
+        用在「讀到的 symbol 跟同版面前面子圖一樣」或「工具列穩定顯示跟列舉不同的值」：
+        每次重新點擊後等工具列離開 ``baseline``；一變就回傳新值。``attempts`` 次都沒變
+        → 回傳 ``baseline``（這格真的就是它：GLD 兩格那種真重複，或列舉值本來就錯）。
+        列舉（``_enumerate_subcharts_once``）與 widget 貼圖前讀取共用這一個入口。
         """
-        await self.activate_subchart(idx)
-        return await self._read_symbol_change_aware(fallback)
+        page = self._require_page()
+        for attempt in range(max(1, int(attempts))):
+            await self.activate_subchart(idx)
+            cur = await self._read_symbol_change_aware(baseline)
+            if cur and cur != baseline:
+                return cur
+            if attempt + 1 < attempts:
+                await page.wait_for_timeout(300)
+        return baseline
 
     async def _enumerate_subcharts_once(self, widget_count: int) -> list[SubChartInfo]:
         out: list[SubChartInfo] = []
@@ -1769,11 +1784,16 @@ class PlaywrightCDPAutomator(TVAutomator):
             # A symbol already seen on an earlier pane is still suspicious
             # (e.g. the baseline itself was stale). Pay for a settle re-read;
             # genuine duplicates survive it unchanged.
+            suspect = False
             if sym and sym in seen:
-                sym = await self._reread_symbol_settled(idx, fallback=sym)
+                reread = await self.reactivate_and_read(idx, baseline=sym, attempts=2)
+                if reread and reread != sym:
+                    sym = reread
+                else:
+                    suspect = True
             if sym:
                 seen.add(sym)
-            out.append(SubChartInfo(index=idx, symbol=sym))
+            out.append(SubChartInfo(index=idx, symbol=sym, suspect_duplicate=suspect))
         return out
 
     async def _wait_pane_count_stable(
@@ -1837,33 +1857,78 @@ class PlaywrightCDPAutomator(TVAutomator):
                 return retry
         return out
 
+    async def _subchart_rect(self, idx: int) -> dict | None:
+        """第 idx 個可見 chart-widget 的 viewport 座標（與列舉／scope 釘選同一套節點過濾）。"""
+        page = self._require_page()
+        try:
+            rect = await page.evaluate(
+                """
+                (targetIdx) => {
+                  const nodes = Array.from(
+                    document.querySelectorAll("[data-name='chart-widget'], [class*='chart-widget']")
+                  ).filter((el) => {
+                    const r = el.getBoundingClientRect();
+                    const st = window.getComputedStyle(el);
+                    return r.width > 20 && r.height > 20 && st.display !== "none" && st.visibility !== "hidden";
+                  });
+                  if (targetIdx < 0 || targetIdx >= nodes.length) return null;
+                  const r = nodes[targetIdx].getBoundingClientRect();
+                  return { x: r.left, y: r.top, width: r.width, height: r.height };
+                }
+                """,
+                idx,
+            )
+        except Exception:
+            return None
+        return rect if isinstance(rect, dict) else None
+
     async def activate_subchart(self, idx: int) -> None:
+        """讓第 idx 個子圖成為 active chart（全域工具列 symbol、新增指標都跟著 active chart）。
+
+        2026-10-19：原本用合成 MouseEvent 點 chart-widget 容器，事件沒帶座標
+        （clientX/Y＝0,0），TradingView 以座標決定 active chart 時就點到左上角的 #0——
+        FDBJmrgA #2 讀成 #0 的 ZN1!、06-23 mag7 全讀 AAPL、08-12 SOX/SOXX 錯位同一根因。
+        改成真實滑鼠座標點在子圖本體（x 45%、y 62%：避開左上圖例與底部時間軸），
+        合成事件與 locator click 只當備援。
+        """
         page = self._require_page()
         await page.bring_to_front()
         if idx < 0:
             return
-        clicked = await page.evaluate(
-            """
-            (targetIdx) => {
-              const nodes = Array.from(
-                document.querySelectorAll("[data-name='chart-widget'], [class*='chart-widget']")
-              ).filter((el) => {
-                const r = el.getBoundingClientRect();
-                const st = window.getComputedStyle(el);
-                return r.width > 20 && r.height > 20 && st.display !== "none" && st.visibility !== "hidden";
-              });
-              if (targetIdx < 0 || targetIdx >= nodes.length) {
-                return false;
-              }
-              const el = nodes[targetIdx];
-              el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-              el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
-              el.click();
-              return true;
-            }
-            """,
-            idx,
-        )
+        clicked = False
+        rect = await self._subchart_rect(idx)
+        if rect and rect.get("width", 0) > 20 and rect.get("height", 0) > 20:
+            try:
+                await page.mouse.click(
+                    rect["x"] + rect["width"] * 0.45,
+                    rect["y"] + rect["height"] * 0.62,
+                )
+                clicked = True
+            except Exception:
+                clicked = False
+        if not clicked:
+            clicked = await page.evaluate(
+                """
+                (targetIdx) => {
+                  const nodes = Array.from(
+                    document.querySelectorAll("[data-name='chart-widget'], [class*='chart-widget']")
+                  ).filter((el) => {
+                    const r = el.getBoundingClientRect();
+                    const st = window.getComputedStyle(el);
+                    return r.width > 20 && r.height > 20 && st.display !== "none" && st.visibility !== "hidden";
+                  });
+                  if (targetIdx < 0 || targetIdx >= nodes.length) {
+                    return false;
+                  }
+                  const el = nodes[targetIdx];
+                  el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+                  el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+                  el.click();
+                  return true;
+                }
+                """,
+                idx,
+            )
         if clicked:
             await page.wait_for_timeout(220)
         else:
