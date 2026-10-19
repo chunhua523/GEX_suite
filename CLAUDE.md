@@ -17,7 +17,9 @@ Project-level guidance for Claude when working in this repo. Read this file befo
 
 Most non-trivial work in this repo recently has been in `widget.py`. The mental model:
 
-### Alias map structure ([`_FUTURES_ALIAS_MAP` in widget.py](gex_suite/modules/tradingview/widget.py))
+### Alias map structure ([`FUTURES_ALIAS_MAP` in symbol_resolve.py](gex_suite/modules/tradingview/symbol_resolve.py))
+
+Symbol → DB ticker 解析正本在 `symbol_resolve.py`（純函式、不依賴 Qt）；`widget.py` 的 `TradingViewPage._resolve_target_ticker_for_subchart` / `_futures_alias_lookup` / `_extract_ticker_from_symbol` / `_symbol_matches_ticker` / `_is_formula_symbol` 都只是轉呼叫，`tools/gex_chain/run.py` 挑補貼版面用 `symbol_resolve.candidate_db_tickers`。`widget._FUTURES_ALIAS_MAP` 仍可 import（同一個 dict）。
 
 ```python
 "ES1!": {"futures": "ES1!", "equity": "SPY", "index": "SPX"}
@@ -30,6 +32,8 @@ Each TradingView continuous-futures symbol (tail after `:` in subchart symbol) m
 - `index` — the underlying index.
 
 A `None` entry means "no DB ticker exists for this mode" → strict skip. **Adding new entries does not require those tickers to be in DB**; the `db.fetch_tv_codes_for_week()` empty-return path will handle missing tickers and log `【略過｜資料庫】`. So fill the alias map forward-looking when adding new futures roots.
+
+**Implicit futures alias（2026-10-19，YM1! 案例）**: a tail that matches the TradingView continuous-futures pattern `<ROOT><n>!` (`CONTINUOUS_FUTURES_RE`, e.g. `YM1!`, `6E1!`) but is **not** in the map resolves as `{"futures": tail, "equity": None, "index": None}` — the importer stores CME roots as `<ROOT>1!` (`importers._suffix_futures_ticker`), so futures mode needs no table entry (info line `【alias｜隱含】`). equity/index cannot be derived from the symbol (YM1! → DIA) → `【略過｜alias 缺項】` whose reason says 補表. **Never strip `1!` and look up the bare root**: bare names in DB are absent (ES/YM), pre-2026-05-11 legacy rows (cleaned 2026-10-19), or a different product (`ZS` = Zscaler vs `ZS1!` = soybeans). `alias_lookup()` returns `(entry, "explicit"|"implicit"|None)`; explicit always wins (MNQ1!→NQ1!, K2I1!→KOSPI200). scope=ticker accepts `YM1!`/`YM1`/`YM` for a futures DB ticker.
 
 Default mode is `equity` (configurable via `_FUTURES_DEFAULT_MODE`).
 
@@ -51,7 +55,7 @@ This rule is intentional: single-marker = "whole layout in this mode" matches us
 
 Returns `(target_ticker, is_futures_alias)`. Strict mode: when the symbol matches an alias entry (`_futures_alias_lookup` returns non-None) but the requested mode has no mapping, returns `(None, False)`. **Does not** silently fall through to `_extract_ticker_from_symbol`, because the user has been clear about wanting silent skips to surface as log entries.
 
-The caller distinguishes "alias known, mode unmapped" (strict skip log `【略過｜alias 缺項】`) from "symbol unknown" (`【略過｜未匹配】`) by re-checking `_futures_alias_lookup` after the resolver returns None.
+The caller distinguishes "alias known, mode unmapped" (strict skip log `【略過｜alias 缺項】`) from "symbol unknown" (`【略過｜未匹配】`) by re-checking `symbol_resolve.alias_lookup` (which also says explicit vs implicit) after the resolver returns None.
 
 ### `is_futures_alias` flag → indicator anchor shift
 
@@ -116,7 +120,8 @@ Every silent `continue` in `_phase_b_scan_flow` should produce a log line. Curre
 | `【略過版面】無法載入` | `automator.load_layout()` returned False (non-first layout) |
 | `【警告】版面…無法取得子圖清單` | `_enumerate_subcharts_with_retry` returned empty |
 | `【略過｜公式圖】` | Subchart symbol is a TV formula (e.g. `ES1!-SPX500`) — multi-ticker arithmetic combo, not a single instrument |
-| `【略過｜alias 缺項】` | Symbol is in `_FUTURES_ALIAS_MAP` but the resolved mode has no mapping |
+| `【alias｜隱含】` | info, not a skip — `1!` symbol not in `FUTURES_ALIAS_MAP`, futures mode uses its own tail as DB ticker |
+| `【略過｜alias 缺項】` | Symbol is in `FUTURES_ALIAS_MAP` (or an implicit `1!` futures symbol) but the resolved mode has no mapping; implicit → reason says 補表 |
 | `【略過｜未匹配】` | Symbol can't be parsed to a ticker (or scope=ticker mismatch and not an alias) |
 | `【略過｜重複】` | `(chosen, layout_mode)` already processed in this layout |
 | `【略過｜資料庫】` | `db.fetch_tv_codes_for_week()` returned all-None (DB missing ticker or week) |
@@ -238,6 +243,7 @@ CLI 探測（不開 GUI）：`python -m gex_suite.modules.tradingview.app_launch
 | 確認 9222 可用：沒開就開、半死就砍掉重開 | `browser_paths.ensure_cdp_browser` | **`PlaywrightCDPAutomator.connect()`**（GUI 批次／預覽／整理／開網址／版面分組掃描、CLI 流程全經過）＋CLI 開場預檢 |
 | 半死判斷／砍瀏覽器／重啟 | `browser_paths.cdp_ws_responsive`／`kill_cdp_browser`／`respawn_cdp_browser` | ensure、CLI watchdog hook、CLI 整輪重試 |
 | profile 路徑、瀏覽器名正規化、CDP probe／開分頁／殭屍自癒 | `browser_paths.*` | 全部；`tools/gex_chain/preflight.py` 用**檔案路徑載入** browser_paths（不經 package `__init__`，那會載入 Qt）→ browser_paths 匯入期只准用標準函式庫 |
+| 子圖 symbol → DB ticker（明確 alias 表、「1!」隱含 alias、ticker 抽取、公式圖判斷、scope=ticker 比對） | `symbol_resolve.*`（`resolve_target_ticker`／`alias_lookup`／`candidate_db_tickers`） | GUI／CLI 批次掃描（`TradingViewPage` 轉呼叫）、`tools/gex_chain/run.py` 挑補貼版面 |
 | 設定 → BatchOptions | `engine.batch_options_from_config` | GUI `_build_batch_options`（GUI 欄位疊在設定檔上）、CLI `_build_options`（設定檔＋命令列） |
 | GUI 欄位 ↔ 設定檔 key | `widget._ui_tv_settings` | GUI 存設定、GUI 組參數 |
 | 讀／寫 auto_paste_config.json | `shared.config.load_tradingview_config`／`save_tradingview_config`（**合併到原檔**，不再從預設重建——舊版會洗掉 GUI 上沒有的 key） | GUI、CLI、automator |
@@ -291,4 +297,4 @@ CLI 探測（不開 GUI）：`python -m gex_suite.modules.tradingview.app_launch
 python tests/smoke_test.py
 ```
 
-Runs with `QT_QPA_PLATFORM=offscreen`; verifies modules import and widgets construct. There are no unit tests for the alias resolver or marker parser yet — when adding logic, consider adding cases under `tests/` (the smoke test won't catch routing bugs).
+Runs with `QT_QPA_PLATFORM=offscreen`; verifies modules import and widgets construct. Alias resolver cases live in `tests/test_tradingview_symbol_resolve.py` (`QT_QPA_PLATFORM=offscreen .venv/bin/python -m unittest tests.test_tradingview_symbol_resolve`); the marker parser still has none — add cases under `tests/` when touching routing (the smoke test won't catch routing bugs).

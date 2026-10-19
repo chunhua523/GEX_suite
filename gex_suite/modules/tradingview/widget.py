@@ -68,6 +68,11 @@ from .engine import (
     compute_target_mondays,
 )
 from . import quote_source as _quote_source
+from . import symbol_resolve as _symbol_resolve
+from .symbol_resolve import (  # 正本在 symbol_resolve.py；舊名供既有引用
+    FUTURES_ALIAS_MAP as _FUTURES_ALIAS_MAP,
+    FUTURES_DEFAULT_MODE as _FUTURES_DEFAULT_MODE,
+)
 
 _DAY_ORDER = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday")
 _DAY_ABBR = {
@@ -78,72 +83,10 @@ _DAY_ABBR = {
     "Friday": "五",
 }
 
-# TradingView continuous-futures symbols → DB ticker (per layout mode).
-#   "futures" : feed the chart with the actual futures TV codes (CME-imported, suffixed with 1!).
-#   "equity"  : feed the chart with the related ETF / equity ticker (e.g. SPY for ES1!).
-#   "index"   : feed the chart with the underlying index (e.g. SPX for ES1!).
-# All three modes shift the indicator's "Start date" to Sunday 18:00, because the
-# X-axis bar anchor depends on the chart symbol (always futures), not the data source.
-# A None entry means "no DB ticker exists for this mode" → strict skip with a clear log.
-_FUTURES_ALIAS_MAP: dict[str, dict[str, str | None]] = {
-    # E-mini equity index futures (all 3 modes have a real counterpart)
-    "ES1!":  {"futures": "ES1!",  "equity": "SPY",  "index": "SPX"},
-    "NQ1!":  {"futures": "NQ1!",  "equity": "QQQ",  "index": "NDX"},
-    "RTY1!": {"futures": "RTY1!", "equity": "IWM",  "index": "RUT"},
-
-    # Micro contracts Jeff charts instead of the full-size ones — paste the
-    # full-size contract's DB data (scrape/import side still NQ/GC).
-    "MNQ1!": {"futures": "NQ1!",  "equity": "QQQ",  "index": "NDX"},
-
-    # Precious metals (no broadly-tracked option-bearing index → index=None)
-    "GC1!":  {"futures": "GC1!",  "equity": "GLD",  "index": None},
-    "MGC1!": {"futures": "GC1!",  "equity": "GLD",  "index": None},
-    "SI1!":  {"futures": "SI1!",  "equity": "SLV",  "index": None},
-    "PL1!":  {"futures": "PL1!",  "equity": "PPLT", "index": None},
-    "PA1!":  {"futures": "PA1!",  "equity": "PALL", "index": None},
-
-    # Industrial metals
-    "HG1!":  {"futures": "HG1!",  "equity": "CPER", "index": None},
-
-    # Energy
-    "CL1!":  {"futures": "CL1!",  "equity": "USO",  "index": None},
-
-    # Grains
-    "ZC1!":  {"futures": "ZC1!",  "equity": "CORN", "index": None},
-    "ZS1!":  {"futures": "ZS1!",  "equity": "SOYB", "index": None},
-    "ZW1!":  {"futures": "ZW1!",  "equity": "WEAT", "index": None},
-
-    # Treasury futures (each maturity bucket → matching ETF)
-    "ZT1!":  {"futures": "ZT1!",  "equity": "SHY",  "index": None},  # 2Y
-    "ZF1!":  {"futures": "ZF1!",  "equity": "IEI",  "index": None},  # 5Y
-    "ZN1!":  {"futures": "ZN1!",  "equity": "IEF",  "index": None},  # 10Y
-    "TN1!":  {"futures": "TN1!",  "equity": "IEF",  "index": None},  # 10Y ultra → 同 IEF
-    "ZB1!":  {"futures": "ZB1!",  "equity": "TLT",  "index": None},  # 30Y
-    "UB1!":  {"futures": "UB1!",  "equity": "TLT",  "index": None},  # Ultra bond → 同 TLT
-
-    # Crypto
-    "BTC1!": {"futures": "BTC1!", "equity": "IBIT", "index": None},
-
-    # Nikkei 225 — TV chart is OSE continuous (NK2251!); DB rows come from the
-    # Lieta CME platform import (NK225 + "1!" suffix), so the names coincide.
-    "NK2251!": {"futures": "NK2251!", "equity": None, "index": None},
-
-    # KOSPI 200 — the subchart watches the KRX futures continuous K2I1!
-    # (switched from the KOSPI200 spot symbol 2026-07); DB rows are still the
-    # Lieta CME import "KOSPI200" (index-product exception, no "1!" suffix).
-    # Start anchor comes from the start_time_tz_rules "KOSPI200" entry.
-    "K2I1!": {"futures": "KOSPI200", "equity": "EWY", "index": None},
-
-    # 台指選擇權（TXO，TAIFEX）— 貼在 TWSE 加權指數現貨圖（IX0001）或台指期連續
-    # （TXF1!）上；DB ticker 為裸名 TXO（選擇權 root 非期貨，免 "1!" 後綴，見
-    # importers._CME_NO_SUFFIX_TICKERS）。只有一份 TXO 資料 → 三模式同指 TXO。
-    # start anchor 走 start_time_tz_rules 的 "TXO"。
-    "IX0001": {"futures": "TXO", "equity": "TXO", "index": "TXO"},
-    "TXF1!":  {"futures": "TXO", "equity": "TXO", "index": "TXO"},
-}
+# _FUTURES_ALIAS_MAP／_FUTURES_DEFAULT_MODE 正本已搬到 symbol_resolve.py（GUI／CLI／
+# gex-chain 共用的 symbol → DB ticker 解析規則，含「1!」尾碼隱含 alias）。
 
 _FUTURES_START_TIME = "18:00"
-_FUTURES_DEFAULT_MODE = "equity"
 
 # Layout-name markers (English, case-insensitive substring match).
 # Multiple aliases per mode supported — pick whichever feels natural in your layout name.
@@ -2289,45 +2232,18 @@ class TradingViewPage(QWidget):
         opts: BatchOptions,
         layout_mode: str = _FUTURES_DEFAULT_MODE,
     ) -> tuple[str | None, bool]:
-        """Resolve subchart symbol → (DB ticker, is_futures_alias) under a layout mode.
-
-        Strict: if the symbol matches a futures alias entry but the requested
-        ``layout_mode`` has no DB ticker for it (e.g. RTY1! in index mode →
-        RUT not imported), returns ``(None, False)`` so the caller can emit a
-        clear strict-skip log. The caller distinguishes "alias known but mode
-        unmapped" from "symbol unknown" by calling :meth:`_futures_alias_lookup`.
-        """
-        entry = self._futures_alias_lookup(symbol)
-        aliased = entry.get(layout_mode) if entry else None
-        if opts.ticker_scope == "ticker":
-            target = (opts.ticker or "").strip().upper()
-            if not target:
-                return (None, False)
-            if aliased and aliased == target:
-                return (target, True)
-            # Known futures alias: do NOT fall through to plain symbol match.
-            # User must use the alias-mode router (or change mode/target).
-            if entry is not None:
-                return (None, False)
-            if self._symbol_matches_ticker(symbol, target):
-                return (target, False)
-            return (None, False)
-        # scope == "all"
-        if aliased:
-            return (aliased, True)
-        if entry is not None:
-            # Known futures alias but this mode has no DB mapping → strict skip.
-            return (None, False)
-        return (self._extract_ticker_from_symbol(symbol), False)
+        """Resolve subchart symbol → (DB ticker, is_futures_alias)；規則正本見 symbol_resolve.py。"""
+        return _symbol_resolve.resolve_target_ticker(
+            symbol,
+            layout_mode=layout_mode,
+            ticker_scope=opts.ticker_scope,
+            ticker=opts.ticker,
+        )
 
     @staticmethod
     def _futures_alias_lookup(symbol: str | None) -> dict[str, str | None] | None:
-        """Return the alias entry dict if symbol's tail matches the alias map, else None."""
-        text = str(symbol or "").strip().upper()
-        if not text:
-            return None
-        tail = text.split(":")[-1]
-        return _FUTURES_ALIAS_MAP.get(tail)
+        """Alias entry（明確表或「1!」尾碼隱含）或 None；要分辨來源用 symbol_resolve.alias_lookup。"""
+        return _symbol_resolve.alias_lookup(symbol)[0]
 
     @classmethod
     def _futures_alias_for_symbol(
@@ -2336,10 +2252,7 @@ class TradingViewPage(QWidget):
         mode: str = _FUTURES_DEFAULT_MODE,
     ) -> str | None:
         """Strict: return DB ticker for symbol+mode, or None if no mapping."""
-        entry = cls._futures_alias_lookup(symbol)
-        if not entry:
-            return None
-        return entry.get(mode)
+        return _symbol_resolve.alias_for_symbol(symbol, mode)
 
     @staticmethod
     def _parse_layout_marker_sequence(name: str | None) -> list[str]:
@@ -2392,15 +2305,7 @@ class TradingViewPage(QWidget):
 
     @staticmethod
     def _extract_ticker_from_symbol(symbol: str | None) -> str | None:
-        text = str(symbol or "").strip().upper()
-        if not text:
-            return None
-        tail = text.split(":")[-1]
-        match = re.search(r"[A-Z][A-Z0-9._-]{0,14}", tail)
-        if match:
-            return match.group(0)
-        fallback = re.search(r"[A-Z][A-Z0-9._-]{0,14}", text)
-        return fallback.group(0) if fallback else None
+        return _symbol_resolve.extract_ticker_from_symbol(symbol)
 
     @staticmethod
     def _futures_root_from_symbol(symbol: str | None) -> str | None:
@@ -2415,23 +2320,8 @@ class TradingViewPage(QWidget):
 
     @staticmethod
     def _is_formula_symbol(symbol: str | None) -> bool:
-        """True if symbol looks like a TradingView formula (e.g. ``ES1!-SPX500``).
-
-        Formula charts join multiple tickers with arithmetic operators and
-        cannot host a single-ticker indicator, so we skip them upstream.
-
-        Heuristic: any of ``+ * /`` between two ticker-like tokens, or ``-``
-        between two tokens that are both 2+ chars (so real tickers like
-        ``BRK-B`` / ``BF-A`` with a single-letter right side are not flagged).
-        """
-        text = str(symbol or "").strip().upper()
-        if not text:
-            return False
-        if re.search(r"[A-Z0-9!._:][\s]*[+*/][\s]*[A-Z0-9!._:]", text):
-            return True
-        if re.search(r"[A-Z0-9!._:]{2,}[\s]*-[\s]*[A-Z0-9!._:]{2,}", text):
-            return True
-        return False
+        """True if symbol looks like a TradingView formula（規則見 symbol_resolve.is_formula_symbol）。"""
+        return _symbol_resolve.is_formula_symbol(symbol)
 
     @staticmethod
     def _resolve_start_time_for_ticker(ticker: str) -> str:
@@ -2898,8 +2788,13 @@ class TradingViewPage(QWidget):
                             search_symbol, opts, layout_mode=layout_mode
                         )
                         chosen = search_symbol if target_ticker else None
+                        if chosen and _symbol_resolve.alias_lookup(search_symbol)[1] == "implicit":
+                            self._exec_log(
+                                f"【alias｜隱含】 {search_symbol} 未登錄 alias map，依「1!」尾碼視為期貨連續合約"
+                                f" → DB ticker {target_ticker}（{layout_mode} 模式）"
+                            )
                         if not chosen:
-                            alias_entry = self._futures_alias_lookup(search_symbol)
+                            alias_entry, alias_source = _symbol_resolve.alias_lookup(search_symbol)
                             u = str(post.get("url") or "—")
                             if alias_entry is not None:
                                 available = sorted(k for k, v in alias_entry.items() if v)
@@ -2908,6 +2803,13 @@ class TradingViewPage(QWidget):
                                     reason = (
                                         f"alias[{layout_mode}]={mapped or '—'}, "
                                         f"與目標 ticker={opts.ticker or '—'} 不符"
+                                    )
+                                elif alias_source == "implicit":
+                                    reason = (
+                                        f"「1!」尾碼視為期貨連續合約（隱含 alias，未登錄 FUTURES_ALIAS_MAP）；"
+                                        f"{layout_mode} 模式的 DB ticker 從 symbol 推不出來，請在 symbol_resolve.py 的"
+                                        f" FUTURES_ALIAS_MAP 補 equity／index 對應"
+                                        f"（futures 模式可直接貼 {alias_entry.get('futures') or '—'}）"
                                     )
                                 else:
                                     reason = (
@@ -3815,33 +3717,7 @@ class TradingViewPage(QWidget):
 
     @staticmethod
     def _symbol_matches_ticker(symbol: str | None, ticker: str) -> bool:
-        if not symbol:
-            return False
-        token = ticker.strip().upper()
-        if not token:
-            return False
-        text = symbol.upper()
-        if token == text.split(":")[-1].strip():
-            return True
-        # Standalone-token match only — a ticker must not match as a prefix of
-        # a longer one (SOX must not hit SOXX). ``\b`` breaks on tokens ending
-        # in "!" (ES1!), so bound with alphanumeric lookarounds instead.
-        if re.search(rf"(?<![A-Z0-9]){re.escape(token)}(?![A-Z0-9])", text):
-            return True
-
-        # Alias fallback for common index naming differences.
-        alias_map: dict[str, tuple[str, ...]] = {
-            "VIX": ("VOLATILITY S&P 500 INDEX", "CBOE VOLATILITY INDEX"),
-        }
-        aliases = alias_map.get(token, ())
-        if any(alias in text for alias in aliases):
-            return True
-
-        # Acronym fallback: e.g., "Advanced Micro Devices" -> AMD.
-        words = re.findall(r"[A-Z]+", text)
-        stop = {"INC", "CORP", "CORPORATION", "INDEX", "LTD", "PLC", "CO", "CLASS", "THE", "AND"}
-        initials = "".join(w[0] for w in words if len(w) > 1 and w not in stop)
-        return token == initials[: len(token)]
+        return _symbol_resolve.symbol_matches_ticker(symbol, ticker)
 
     @staticmethod
     def _dedupe_phase_b_items(items: list[WorkItem]) -> list[WorkItem]:
