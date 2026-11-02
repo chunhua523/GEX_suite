@@ -180,8 +180,8 @@ def _fmt_ts(raw: Any) -> str:
     s = str(raw).strip()
     try:
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+        # naive（舊版 scraper cli 寫的 datetime.now()）＝本機時間，不是 UTC；
+        # astimezone() 對 naive 本來就當本機時間換算（11-02 Discord 摘要 +8h）。
         return dt.astimezone(TW_TZ).strftime("%Y-%m-%d %H:%M:%S") + " TW"
     except Exception:
         return s

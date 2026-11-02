@@ -16,7 +16,7 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 from gex_suite.shared.paths import (
     SCRAPER_DATA_DIR,
@@ -311,7 +311,8 @@ def main() -> int:
         "failed_tasks": final_failed,
         "retried": bool(result.get("retried")),
         "retry_only": bool(result.get("retry_only")),
-        "finished_at": datetime.now().isoformat(),
+        # 帶時區的 UTC（同 API 路徑）；naive 本機時間會被摘要當 UTC 再 +8h。
+        "finished_at": datetime.now(timezone.utc).isoformat(),
     }
     if args.result_json:
         with open(args.result_json, "w", encoding="utf-8") as f:
