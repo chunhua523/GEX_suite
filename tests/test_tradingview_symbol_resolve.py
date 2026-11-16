@@ -52,6 +52,13 @@ class AliasLookupTests(unittest.TestCase):
         self.assertEqual(sr.resolve_target_ticker("CBOT_MINI:MYM1!", layout_mode="equity"), ("DIA", True))
         self.assertEqual(sr.candidate_db_tickers("CBOT_MINI:MYM1!"), {"YM1!", "DIA"})
 
+    def test_mcl1_micro_maps_to_full_size_cl(self) -> None:
+        # 2026-11-13 Jeff 把 Z7BaqFDZ #0 從 CL1! 換成 MCL1! → 隱含 alias 查 MCL1! 默默略過
+        self.assertEqual(sr.alias_lookup("NYMEX:MCL1!")[1], "explicit")
+        self.assertEqual(sr.resolve_target_ticker("NYMEX:MCL1!", layout_mode="futures"), ("CL1!", True))
+        self.assertEqual(sr.resolve_target_ticker("NYMEX:MCL1!", layout_mode="equity"), ("USO", True))
+        self.assertEqual(sr.candidate_db_tickers("NYMEX:MCL1!"), {"CL1!", "USO"})
+
     def test_ym1_is_now_explicit_with_dia(self) -> None:
         entry, source = sr.alias_lookup("CBOT_MINI:YM1!")
         self.assertEqual(source, "explicit")

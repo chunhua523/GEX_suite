@@ -60,6 +60,7 @@ FUTURES_ALIAS_MAP: dict[str, AliasEntry] = {
 
     # Energy
     "CL1!":  {"futures": "CL1!",  "equity": "USO",  "index": None},
+    "MCL1!": {"futures": "CL1!",  "equity": "USO",  "index": None},  # Jeff 11-13 把 CL1! 圖換成 Micro WTI
 
     # Grains
     "ZC1!":  {"futures": "ZC1!",  "equity": "CORN", "index": None},
